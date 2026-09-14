@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']   # every branch; the job-level gate below decides what runs
+  pull_request:
+    branches: [develop, main]
+    types: [opened, synchronize, reopened]
+
+# ---------------------------------------------------------------------------
+# CI policy: "fork shift-left" (memory `fork-shift-left-ci-policy`, and the
+# same gate fc-shared/fc-backend/scraper/fc-mobile use). Developers work on
+# forks and open PRs to FigureCollecting/*. Every push event is gated per entry
+# job by ONE expression; pull_request behaves normally. The four push cases:
+#   owner == FigureCollecting, ref develop|main -> RUN  (upstream integration branches)
+#   owner == FigureCollecting, any other ref    -> SKIP (gets CI via its PR)
+#   owner != FigureCollecting, ref develop|main -> SKIP (fork mirrors of upstream)
+#   owner != FigureCollecting, any other ref    -> RUN  (shift-left on fork features)
+#
+# Package auth: `npm ci` reads the PRIVATE @figurecollecting/fc-shared from
+# GitHub Packages via the repo .npmrc's ${NODE_AUTH_TOKEN} placeholder. A fork
+# run supplies a fork-held PAT (read:packages only) as secrets.NODE_AUTH_TOKEN;
+# on the org, GITHUB_TOKEN reads the same-org private package.
+# ---------------------------------------------------------------------------
+
+jobs:
+  build-and-test:
+    name: Lint, typecheck, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: >-
+      github.event_name != 'push'
+      || (github.repository_owner == 'FigureCollecting' && (github.ref_name == 'develop' || github.ref_name == 'main'))
+      || (github.repository_owner != 'FigureCollecting' && github.ref_name != 'develop' && github.ref_name != 'main')
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          # 24 matches the fc-shared BOM engines (>=24.15.0) AND the runtime in
+          # the Dockerfile, so CI tests the version production runs.
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: npm ci
+
+      # `lint` is `tsc --noEmit`, the fc-shared convention: the type checker is
+      # the linter for this toolchain. One invocation, not two identical ones.
+      - name: Lint and typecheck
+        run: npm run lint
+
+      - name: Test with coverage
+        # The 85% line AND branch gate lives in vitest.config.ts, so it fails
+        # here and locally on the same thresholds. Testcontainers boots a real
+        # postgres:17-alpine for the migration suite; ubuntu-latest ships Docker.
+        run: npm run test:coverage
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload coverage to Codecov
+        # org-only: no Codecov token is configured for forks, so an upload from
+        # a fork push has nothing to authenticate with and only logs an error.
+        if: github.repository_owner == 'FigureCollecting'
+        uses: codecov/codecov-action@v7
+        with:
+          files: ./coverage/lcov.info
+          flags: coordinator
+          fail_ci_if_error: false
+
+  image:
+    name: Build container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build-and-test
+    # ORG ONLY. Forks cannot read the private package with GITHUB_TOKEN and
+    # nothing is ever published from a fork.
+    if: github.repository_owner == 'FigureCollecting'
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Read service version from package.json
+        id: service-version
+        run: echo "version=$(node -pe "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build production image
+        # Build only. Pushing to GHCR, SBOM generation and the Grype/Trivy gate
+        # land with the deploy manifests (slice 1, item 7).
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: production
+          push: false
+          load: true
+          tags: fc-coordinator:ci
+          build-args: |
+            SERVICE_VERSION=${{ steps.service-version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          secrets: |
+            node_auth_token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify the image runs as a non-root user
+        run: |
+          user=$(docker inspect fc-coordinator:ci --format '{{.Config.User}}')
+          echo "image user: ${user}"
+          if [ -z "$user" ] || [ "$user" = "root" ] || [ "$user" = "0" ]; then
+            echo "::error::fc-coordinator image runs as root"
+            exit 1
+          fi
