@@ -46,6 +46,47 @@ npm start        # node dist/server.js
 | `PGSSLROOTCERT` | unset | path to the CA PEM for `verify-full` (contents are read, not the path) |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | collector endpoint; falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` |
 
+### Edge authentication (OIDC + DPoP)
+
+Four variables are **required and have no default**. The process refuses to
+start without them, which is deliberate: every plausible default is wrong in a
+way that only shows up as an accepted token that should have been refused.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OIDC_ISSUER` | **required** | Authentik issuer, pinned on every access token |
+| `OIDC_AUDIENCE` | **required** | audience, pinned on every access token |
+| `OIDC_JWKS_URI` | **required** | JWKS endpoint; must be `https` unless it is loopback |
+| `COORDINATOR_PUBLIC_ORIGIN` | **required** | the origin every DPoP `htu` is compared against — never the `Host` header, which the caller controls |
+| `OIDC_ALGORITHMS` | `RS256,ES256,PS256` | accepted access-token algorithms |
+| `DPOP_ALGORITHMS` | `ES256,ES384,PS256,RS256` | accepted proof algorithms; symmetric and `none` are refused at startup |
+| `DPOP_PROOF_MAX_AGE_SECONDS` | `30` | how old a proof's `iat` may be |
+| `DPOP_CLOCK_SKEW_SECONDS` | `5` | how far into the future a proof's `iat` may be |
+| `DPOP_NONCE_PERIOD_SECONDS` | `300` | nonce bucket rotation; the current and previous bucket are accepted |
+| `DPOP_JTI_MAX_ENTRIES` | `100000` | hard cap on the in-memory replay window |
+| `DPOP_REQUIRE_NONCE` | `true` | whether a proof must carry a nonce |
+| `DEVICE_CACHE_TTL_SECONDS` | `5` | in-process cache of the device binding |
+
+The `jti` replay window's TTL is **derived**, not configured: it is always
+`DPOP_PROOF_MAX_AGE_SECONDS + DPOP_CLOCK_SKEW_SECONDS`. Letting an operator set
+it independently invites a configuration where an evicted `jti` still names a
+proof the `iat` check would accept.
+
+**Routes.** `POST /auth/devices` enrols the key that signed the proof (first
+sign-in) and is idempotent; `POST /auth/devices/:deviceId/revoke` sets
+`revoked_at` and never deletes; `GET /auth/session` returns the verified
+identity. Any other route opts in with `{ preHandler: app.dpopGuard }`, after
+which `request.identity` carries `{ userId, deviceId, jkt }`.
+
+**The `use_dpop_nonce` round trip.** Every guarded response carries a fresh
+`DPoP-Nonce`, success or failure. A client with no nonce gets one `401` with
+`WWW-Authenticate: DPoP error="use_dpop_nonce"` and retries the same request
+once with the supplied nonce **and a fresh `jti`**. A client that refreshes the
+nonce from every response never sees that 401 again, including across a bucket
+roll. A coordinator restart invalidates every outstanding nonce by design — that
+is what makes the empty replay cache after a restart unexploitable — so each
+client pays exactly one extra round trip.
+
 The port follows the estate scheme: the middle digit encodes the stage, so
 test, dev and local-container are `5072`, `5092` and `5082`.
 
@@ -55,13 +96,16 @@ and fc-shared treats an all-zero id as "no span" — so every log line would
 silently lose its trace tag. With no collector configured the service uses a
 real span processor and a no-op *exporter* instead, which keeps trace ids real.
 
-### Known gap: no trace tag on live log lines yet
+### Tracing
 
-The logger stamps `trace=<id> span=<id>` on every line **that is emitted inside
-an active span**, and a unit test proves it. In slice 1a nothing starts a span
-for an inbound request, so a running server's log lines carry no tag. This is
-tracked as open for slice 1b, which adds the `traceparent` interceptors and a
-Fastify `onRequest` hook that opens a server span.
+Inbound HTTP **is** instrumented (slice 1b closed the slice-1a gap). An
+`onRequest` hook opens a `SERVER` span from the incoming `traceparent` and keeps
+it active for the whole request, so every log line a handler emits carries
+`trace=<id> span=<id>` joined to the caller's trace. Spans are named by route
+TEMPLATE, never by concrete path, and `/healthz` opens no span at all.
+
+Still open: the `traceparent` Connect **interceptors** (§A.5 rule 3), which
+arrive with the first Connect hop.
 
 ## Health
 
