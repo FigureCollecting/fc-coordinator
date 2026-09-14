@@ -33,9 +33,12 @@
 //
 // SECRETS: the rule is never to SET a secret attribute; RedactingSpanExporter
 // is the second line of defence, running fc-shared's redactAttributes over
-// every span's attributes just before export. The existing value patterns
-// already cover our two new secret shapes — the entitlement assertion and the
-// DPoP proof are both compact JWS (/eyJ[A-Za-z0-9._-]{10,}/).
+// every span's attributes just before export. The shared VALUE patterns cover
+// the compact-JWS shapes — the entitlement assertion and the DPoP proof are
+// both /eyJ[A-Za-z0-9._-]{10,}/ — but NOT the DPoP nonce, which is opaque
+// base64url and indistinguishable from an ordinary id. That one is caught by
+// KEY name, which is why the redaction here passes COORDINATOR_REDACT_OPTIONS
+// (platform/shared.ts) rather than relying on fc-shared's defaults.
 // ============================================================================
 import { context, propagation, trace, type ContextManager } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
@@ -51,7 +54,7 @@ import {
 } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { ATTR_SERVICE_NAME } from '@opentelemetry/semantic-conventions';
-import { redactAttributes, type AttributeValue } from './shared.js';
+import { COORDINATOR_REDACT_OPTIONS, redactAttributes, type AttributeValue } from './shared.js';
 
 export const DEFAULT_SERVICE_NAME = 'fc-coordinator';
 
@@ -129,7 +132,10 @@ export class NoopSpanExporter implements SpanExporter {
  * events, status, resource) survive — a spread would silently drop them.
  */
 export function redactSpan(span: ReadableSpan): ReadableSpan {
-  const redacted = redactAttributes(span.attributes as unknown as Record<string, AttributeValue>);
+  const redacted = redactAttributes(
+    span.attributes as unknown as Record<string, AttributeValue>,
+    COORDINATOR_REDACT_OPTIONS,
+  );
   return Object.create(span as object, {
     attributes: { value: redacted, enumerable: true, configurable: true },
   }) as ReadableSpan;

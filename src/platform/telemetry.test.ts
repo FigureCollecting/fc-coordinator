@@ -171,6 +171,20 @@ describe('telemetry — span attributes are redacted before export', () => {
     expect(capture.spans[0]?.name).toBe('dpop.verify');
   });
 
+  it('redacts an OPAQUE dpop nonce attribute, which the value patterns cannot see', async () => {
+    const capture = new CaptureExporter();
+    started = startTelemetry({ exporter: new RedactingSpanExporter(capture), env: {} });
+    const nonce = 'q8Zr3kVn1xMpLb7TfGhQaWcEdRyUiOpAsDfGhJkLzXcVbNm0';
+
+    trace.getTracer('test').startActiveSpan('dpop.verify', (span) => {
+      span.setAttribute('app.dpop_nonce', nonce);
+      span.end();
+    });
+    await started.forceFlush();
+
+    expect(capture.spans[0]?.attributes['app.dpop_nonce']).toBe('[REDACTED]');
+  });
+
   it('wraps the PRODUCTION exporter, with nothing injected', async () => {
     // The other redaction tests construct RedactingSpanExporter themselves and
     // inject it, so they pass even if startTelemetry stops wrapping. This one

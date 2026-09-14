@@ -201,3 +201,18 @@ describe('platform/logger — serializers keep a log line bounded', () => {
     expect(entry['res']).toBeNull();
   });
 });
+
+describe('logger — DPoP secrets', () => {
+  it('redacts an opaque dpop_nonce field, which only the local KEY pattern catches', () => {
+    const lines: string[] = [];
+    const log = createStructuredLogger({ sink: (line) => lines.push(line), level: 'info' });
+    const nonce = 'q8Zr3kVn1xMpLb7TfGhQaWcEdRyUiOpAsDfGhJkLzXcVbNm0';
+
+    log.info({ dpop_nonce: nonce, auth_outcome: 'nonce_missing' }, 'rejected dpop proof');
+
+    expect(lines[0]).not.toContain(nonce);
+    expect(JSON.parse(lines[0]!)['dpop_nonce']).toBe('[REDACTED]');
+    // the OUTCOME is deliberately still legible: an operator needs it
+    expect(JSON.parse(lines[0]!)['auth_outcome']).toBe('nonce_missing');
+  });
+});
