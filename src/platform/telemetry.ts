@@ -8,13 +8,23 @@
 //         manager today, but it is passed EXPLICITLY here so the requirement
 //         survives an upgrade that changes the default.
 //
-// RULE 2  NEVER `OTEL_TRACES_EXPORTER=none`. It makes the SDK register a no-op
+// RULE 2  NEVER `OTEL_TRACES_EXPORTER=none`. It makes NodeSDK register a no-op
 //         provider whose trace id is all zeroes, and fc-shared treats an
 //         all-zero id as "no span" — so logs silently lose their trace tag
 //         rather than failing loudly. This bug already shipped once in
-//         fc-backend. scrubDisabledExporterEnv() removes the variable, and the
-//         no-collector case uses a REAL SimpleSpanProcessor wrapping a
-//         NoopSpanExporter, which keeps trace ids real.
+//         fc-backend. Two separate defences, and it is worth being precise
+//         about which one is load-bearing HERE:
+//           (a) STRUCTURAL, and the one that actually holds today: this module
+//               builds a NodeTracerProvider with a real SimpleSpanProcessor
+//               wrapping a NoopSpanExporter, and NEVER uses NodeSDK.
+//               NodeTracerProvider does not read OTEL_TRACES_EXPORTER at all,
+//               so the variable cannot produce a no-op provider on this path.
+//               The test asserts spans RECORD, which is that property directly.
+//           (b) DEFENCE IN DEPTH: scrubDisabledExporterEnv() deletes the
+//               variable anyway, so the day someone swaps in NodeSDK — which
+//               DOES read it — the bug cannot come back with it. Removing the
+//               scrub would not fail the behavioural tests today; that is
+//               expected, not a gap in them.
 //
 // RULE 3  W3C `traceparent` on every Connect hop, via interceptors. The W3C
 //         propagator is registered here (NodeTracerProvider.register installs
@@ -27,7 +37,7 @@
 // already cover our two new secret shapes — the entitlement assertion and the
 // DPoP proof are both compact JWS (/eyJ[A-Za-z0-9._-]{10,}/).
 // ============================================================================
-import { context, propagation, trace } from '@opentelemetry/api';
+import { context, propagation, trace, type ContextManager } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
@@ -61,6 +71,13 @@ export interface TelemetryState {
 
 export interface Telemetry {
   readonly state: TelemetryState;
+  /**
+   * The context manager actually registered. Exposed so §A.5 rule 1 is
+   * ASSERTABLE: NodeTracerProvider.register() would default to the same class,
+   * so "it survives an await" alone cannot tell an explicit choice from a lucky
+   * default, and a future change to that default would go unnoticed.
+   */
+  readonly contextManager: ContextManager;
   forceFlush(): Promise<void>;
   shutdown(): Promise<void>;
 }
@@ -164,6 +181,7 @@ export function startTelemetry(options: StartTelemetryOptions = {}): Telemetry {
 
   return {
     state: { registered: true, exporter: choice.kind, serviceName },
+    contextManager,
     forceFlush: () => provider.forceFlush(),
     shutdown: async () => {
       await provider.shutdown();

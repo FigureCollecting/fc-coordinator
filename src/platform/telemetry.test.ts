@@ -1,7 +1,8 @@
 import { trace } from '@opentelemetry/api';
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
 import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createStructuredLogger } from './logger.js';
 import { getActiveTraceIds } from './shared.js';
 import {
@@ -57,6 +58,15 @@ describe('telemetry — §A.5 rule 1: an async context manager is registered', (
     expect(afterAwait).toBe(inside);
   });
 
+  it('registers the AsyncLocalStorage context manager explicitly, not by default', () => {
+    // Surviving an await is already asserted above, but NodeTracerProvider's own
+    // default would satisfy that too. This pins the §A.5 rule-1 INTENT: the
+    // manager is chosen here, so a future change to that default cannot quietly
+    // swap in a synchronous one.
+    started = startTelemetry({ exporter: new CaptureExporter(), env: {} });
+    expect(started.contextManager).toBeInstanceOf(AsyncLocalStorageContextManager);
+  });
+
   it('puts the canonical trace tag on a log line emitted inside the span', async () => {
     const lines: string[] = [];
     started = startTelemetry({ exporter: new CaptureExporter(), env: {} });
@@ -104,8 +114,10 @@ describe('telemetry — §A.5 rule 2: never a no-op provider', () => {
     started = startTelemetry({ exporter: new CaptureExporter(), env });
 
     let traceId: string | undefined;
+    let recording: boolean | undefined;
     trace.getTracer('test').startActiveSpan('unit', (span) => {
       traceId = getActiveTraceIds()?.traceId;
+      recording = span.isRecording();
       span.end();
     });
 
@@ -113,6 +125,10 @@ describe('telemetry — §A.5 rule 2: never a no-op provider', () => {
     // "no span", and every log line silently loses its trace tag.
     expect(traceId).toMatch(/^[0-9a-f]{32}$/);
     expect(traceId).not.toMatch(/^0+$/);
+    // A no-op provider hands out NonRecordingSpan. Asserting the span RECORDS
+    // proves a real SDK is registered, which is the property rule 2 protects —
+    // the env scrub alone proves nothing here (see the module header).
+    expect(recording).toBe(true);
     expect(started.state.exporter).toBe('noop');
   });
 
@@ -142,6 +158,30 @@ describe('telemetry — span attributes are redacted before export', () => {
     expect(capture.spans[0]?.attributes['app.dpop.proof']).toBe('[REDACTED]');
     expect(capture.spans[0]?.attributes['app.dpop.attempts']).toBe(2);
     expect(capture.spans[0]?.name).toBe('dpop.verify');
+  });
+
+  it('wraps the PRODUCTION exporter, with nothing injected', async () => {
+    // The other redaction tests construct RedactingSpanExporter themselves and
+    // inject it, so they pass even if startTelemetry stops wrapping. This one
+    // injects NOTHING and asserts what the real exporter is handed. Dropping the
+    // wrapper makes it fail printing the raw JWS — the leak the rule prevents.
+    const shipped = vi.spyOn(NoopSpanExporter.prototype, 'export');
+    try {
+      started = startTelemetry({ env: {} });
+      trace.getTracer('test').startActiveSpan('dpop.verify', (span) => {
+        span.setAttribute('app.dpop.proof', JWS);
+        span.setAttribute('app.dpop.attempts', 1);
+        span.end();
+      });
+      await started.forceFlush();
+
+      const spans = shipped.mock.calls[0]?.[0];
+      expect(spans).toHaveLength(1);
+      expect(spans?.[0]?.attributes['app.dpop.proof']).toBe('[REDACTED]');
+      expect(spans?.[0]?.attributes['app.dpop.attempts']).toBe(1);
+    } finally {
+      shipped.mockRestore();
+    }
   });
 
   it('redacts by key name as well as by value shape', () => {
