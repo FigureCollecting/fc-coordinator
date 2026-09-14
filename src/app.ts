@@ -8,17 +8,17 @@
 // health contract can be tested — including its failure branch — without a
 // database, a collector or a socket.
 //
-// OPEN FOR SLICE 1b — no log line from the RUNNING service carries a trace tag
-// yet. The logger is correct and stamps `trace=<id> span=<id>` whenever a span
-// is active (platform/logger.ts), and telemetry registers a real SDK, but
-// nothing here starts a span: inbound HTTP is not instrumented and the
-// traceparent Connect interceptors (§A.5 rule 3) arrive with the first Connect
-// hop. Until then every request is logged outside any span, so the tag is
-// correctly absent rather than zeroed. The close is an onRequest hook that
-// starts a server span from the incoming `traceparent`, registered right here.
+// CLOSED IN SLICE 1b (was N3): inbound HTTP IS instrumented now.
+// registerHttpTracing adds the onRequest hook that opens a server span from the
+// incoming `traceparent` and keeps it active for the rest of the lifecycle, so
+// every log line from a running request carries `trace=<id> span=<id>`.
+// /healthz is excluded: a liveness probe every second is noise, not a trace.
+// Still open: the traceparent Connect INTERCEPTORS (§A.5 rule 3), which arrive
+// with the first Connect hop.
 // ============================================================================
 import Fastify, { type FastifyInstance } from 'fastify';
 import { probeDatabase, type QueryableDb } from './db/pool.js';
+import { registerHttpTracing } from './platform/http-trace.js';
 import { createStructuredLogger, type LogLevel, type LogSink } from './platform/logger.js';
 import type { TelemetryState } from './platform/telemetry.js';
 
@@ -49,6 +49,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
       ...(options.logSink !== undefined ? { sink: options.logSink } : {}),
     }),
   });
+
+  registerHttpTracing(app, { ignorePaths: ['/healthz'] });
 
   app.get('/healthz', async (_request, reply) => {
     const probe = await probeDatabase(options.db);
