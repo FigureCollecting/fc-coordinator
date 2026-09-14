@@ -1,19 +1,22 @@
 {
-  // TODO(fc-shared 1.7.0): replace these compilerOptions with
-  //   "extends": "@figurecollecting/fc-shared/tsconfig.base.json"
-  // once 1.7.0 ships the toolchain baseline as a real file (§A.5). Until then
-  // the BOM is honoured by hand: TS 6, ESM, Node >=24.15, strict.
+  // The fc-shared BOM, inherited MECHANICALLY rather than by convention:
+  // target, strictness and the compiler flags come from the package itself
+  // (1.7.0 ships tsconfig.base.json and exports it).
+  "extends": "@figurecollecting/fc-shared/tsconfig.base.json",
   "compilerOptions": {
-    "target": "es2023",
-    "lib": ["es2023"],
+    // ONE deliberate override. The base ships module "ESNext" +
+    // moduleResolution "bundler", which suits fc-shared (a library bundled by
+    // esbuild for browsers). fc-coordinator is a Node ESM SERVICE: it is run by
+    // node straight from dist/, so it must resolve the way Node does —
+    // honouring exports maps and requiring explicit .js specifiers. "bundler"
+    // would type-check imports that Node then fails to resolve at runtime.
     "module": "nodenext",
     "moduleResolution": "nodenext",
-    "strict": true,
+
+    // Local strictness ON TOP of the baseline, not instead of it.
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
+
     "noEmit": true,
     "types": ["node"]
   },

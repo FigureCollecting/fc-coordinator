@@ -118,10 +118,28 @@ transaction control in a pending file, `6` out-of-order file.
 redaction and logging surface and deliberately omits the legacy axios client,
 fc-mobile's zustand stores and the Mongo-shaped `Figure`/`User` types.
 
-fc-shared **1.7.0** adds stateless subpath exports and a shippable
-`tsconfig.base.json`; switching to them is then a one-file change plus a
-`tsconfig.json` `extends`. Both TODOs are marked in the source. Until then the
-barrel pulls axios, zustand and react into the dependency tree.
+It imports the **1.7.0 stateless subpaths** (`utils/trace`, `utils/sanitize`,
+`utils/logger`), never the barrel. The barrel is a single bundle that also holds
+the axios client for legacy fc-backend and fc-mobile's zustand stores, so taking
+`getTraceContext` from it would load axios, zustand and react into a
+Postgres-only service. `test/import-graph.test.ts` measures the real module
+graph of the built output in a child process, using Node's own resolver, and
+fails if any of the three is ever resolved again.
+
+Those three packages are still **installed** — they remain fc-shared's declared
+dependencies, so `npm ci` fetches them and they sit in the runtime image. What
+1.7.0 buys is that nothing ever *loads* them. Removing them from the tree would
+need fc-shared to make them optional or peer dependencies, which is a change to
+that package, not to this one.
+
+`tsconfig.json` `extends` the shipped `@figurecollecting/fc-shared/tsconfig.base.json`,
+so the toolchain baseline is inherited mechanically rather than by convention.
+**One field is overridden**: the base ships `module: ESNext` with
+`moduleResolution: bundler`, which suits a library bundled by esbuild for
+browsers. This is a Node ESM service run straight from `dist/`, so it uses
+`nodenext` for both — `bundler` would type-check imports that Node then fails to
+resolve at runtime. Everything else (target, strict, `esModuleInterop`,
+`skipLibCheck`, `forceConsistentCasingInFileNames`) comes from the base.
 
 ## CI
 

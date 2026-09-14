@@ -2,36 +2,42 @@
 // The ONE seam onto @figurecollecting/fc-shared (plan §A.5).
 //
 // Every other module in src/ imports the shared baseline FROM HERE, never from
-// the package directly — enforced by a test in shared.test.ts. Two reasons:
+// the package directly — enforced by a test in shared.test.ts.
 //
-//   1. fc-shared 1.6.0 exports only the barrel ("." and "./package.json"), so
-//      importing `getTraceContext` from it drags in axios, zustand and — via
-//      zustand — react, none of which belong in a Postgres-only service. Today
-//      that cost is paid once, here.
-//   2. fc-shared 1.7.0 adds the stateless subpaths ./utils/trace,
-//      ./utils/sanitize, ./utils/logger and ./types. Switching to them is then
-//      a one-file change with no call sites to chase.
+// The imports below are the 1.7.0 STATELESS SUBPATHS, not the barrel. The
+// barrel is one esbuild bundle that also contains the axios client for legacy
+// fc-backend and fc-mobile's zustand stores, so importing `getTraceContext`
+// from it pulls axios, zustand and react into a Postgres-only service.
+// test/import-graph.test.ts measures the real module graph of the built output
+// in a child process and fails if any of the three is ever resolved again.
 //
-// TODO(fc-shared 1.7.0): replace the single barrel import below with the four
-// subpath imports, and replace tsconfig.json's inlined compilerOptions with
-// "extends": "@figurecollecting/fc-shared/tsconfig.base.json".
+// Only stateless modules have subpaths in 1.7.0, and that is deliberate: the
+// zustand stores hold module state, so a subpath for them could hand two
+// importers two separate store instances. Nothing here holds state, except the
+// logger's module-level config — which fc-shared tests for instance identity
+// across both import paths.
 //
-// DELIBERATELY NOT RE-EXPORTED (§A.5, "what it must NOT import"):
-//   api/client, api/figures, api/scraper, api/transforms — the axios client for
-//     calling LEGACY fc-backend. The coordinator serves; it never calls that.
-//   stores/auth, stores/sync — fc-mobile's client-side zustand singletons.
-//   Figure, User — Mongo-shaped (`_id`, "Schema v3.0"); never served from here.
+// DELIBERATELY NOT IMPORTED (§A.5, "what it must NOT import"):
+//   ./api/*    — the axios client for calling LEGACY fc-backend. The
+//                coordinator serves; it never calls that. (No subpath exists.)
+//   ./stores/* — fc-mobile's client-side zustand singletons. (No subpath.)
+//   ./types    — a real 1.7.0 subpath, but nothing here needs it yet:
+//                PaginatedResponse and friends arrive with slice 2, and
+//                Figure/User are Mongo-shaped and never served from here.
 // ============================================================================
+export { getActiveTraceIds, getTraceContext } from '@figurecollecting/fc-shared/utils/trace';
+
 export {
-  configureLogger,
   DEFAULT_SECRET_VALUE_PATTERNS,
   DEFAULT_SENSITIVE_KEY_PATTERN,
-  getActiveTraceIds,
-  getTraceContext,
   redactAttributes,
   redactString,
   redactValue,
-  sanitizeLogValue,
-} from '@figurecollecting/fc-shared';
+} from '@figurecollecting/fc-shared/utils/sanitize';
 
-export type { AttributeValue, RedactOptions } from '@figurecollecting/fc-shared';
+export { configureLogger, sanitizeLogValue } from '@figurecollecting/fc-shared/utils/logger';
+
+export type {
+  AttributeValue,
+  RedactOptions,
+} from '@figurecollecting/fc-shared/utils/sanitize';

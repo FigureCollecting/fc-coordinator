@@ -19,7 +19,7 @@
     "migrate": "sh scripts/migrate.sh"
   },
   "dependencies": {
-    "@figurecollecting/fc-shared": "^1.6.0",
+    "@figurecollecting/fc-shared": "^1.7.0",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/context-async-hooks": "^2.11.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",
