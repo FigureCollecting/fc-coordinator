@@ -38,7 +38,6 @@ const authConfig = resolveAuthConfig();
 
 const app = buildApp({
   db: pool,
-  dbTarget: describeTarget(),
   telemetry: telemetry.state,
   logLevel: (process.env['LOG_LEVEL'] as LogLevel | undefined) ?? 'info',
   auth: {
@@ -52,6 +51,14 @@ const app = buildApp({
     }),
   },
 });
+
+// /healthz no longer reports the database target: it is the one unauthenticated
+// route, and host:port/dbname is a map of the estate. Operators still get it,
+// once, here — the log is behind the same boundary as the process itself.
+app.log.info(
+  { db_target: describeTarget(), otel_exporter: telemetry.state.exporter },
+  'coordinator starting',
+);
 
 let shuttingDown = false;
 const shutdown = (signal: string): void => {
