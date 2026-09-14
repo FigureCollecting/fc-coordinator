@@ -1,4 +1,4 @@
-import { trace } from '@opentelemetry/api';
+import { context, trace, type ContextManager } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
 import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
@@ -64,6 +64,17 @@ describe('telemetry — §A.5 rule 1: an async context manager is registered', (
     // manager is chosen here, so a future change to that default cannot quietly
     // swap in a synchronous one.
     started = startTelemetry({ exporter: new CaptureExporter(), env: {} });
+
+    // IDENTITY, not class. A bare provider.register() installs its OWN
+    // AsyncLocalStorageContextManager, so an instanceof check passes either
+    // way. Asserting the globally installed manager IS the instance this
+    // module constructed is what makes the explicit registration load-bearing.
+    // `_getContextManager` is marked private on ContextAPI; it is the only way
+    // to read what is actually registered, and identity is the property here.
+    const installed = (
+      context as unknown as { _getContextManager(): ContextManager }
+    )._getContextManager();
+    expect(installed).toBe(started.contextManager);
     expect(started.contextManager).toBeInstanceOf(AsyncLocalStorageContextManager);
   });
 

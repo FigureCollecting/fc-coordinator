@@ -1,7 +1,7 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import {
   createCoordinatorPool,
   describeTarget,
@@ -14,8 +14,15 @@ const PASSWORD = 'hunter2';
 const URL_WITH_SECRET = `postgres://fc_coordinator:${PASSWORD}@pg-coord-rw.fc:5432/fccoord`;
 
 const CA_PEM = '-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n';
-const caPath = path.join(mkdtempSync(path.join(tmpdir(), 'fc-coordinator-ca-')), 'ca.crt');
+// A real file, because sslFromEnv reads the CA's CONTENTS rather than its path.
+const caDir = mkdtempSync(path.join(tmpdir(), 'fc-coordinator-ca-'));
+const caPath = path.join(caDir, 'ca.crt');
 writeFileSync(caPath, CA_PEM);
+
+// Without this the suite leaves one temp directory behind on every run.
+afterAll(() => {
+  rmSync(caDir, { recursive: true, force: true });
+});
 
 describe('db/pool — configuration from the environment', () => {
   it('prefers DATABASE_URL when it is set', () => {
