@@ -194,6 +194,30 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     expect(run.output).toMatch(/maintenance database/i);
   });
 
+  it('refuses a directory holding a .sql file the NNNN_ glob would silently ignore', async () => {
+    // The enumerate glob is [0-9][0-9][0-9][0-9]_*.sql. Without this refusal a
+    // misnamed migration is not an error, it is INVISIBLE: the run reports
+    // success while the schema is missing whatever that file created.
+    await pg.exec([
+      'sh',
+      '-c',
+      'rm -rf /tmp/misnamed && cp -r /repo/migrations /tmp/misnamed' +
+        ' && cp /repo/migrations/0001_identity.sql /tmp/misnamed/0003a_suffix.sql' +
+        ' && cp /repo/migrations/0001_identity.sql /tmp/misnamed/003_threedigit.sql',
+    ]);
+
+    const run = await migrate({}, '/tmp/misnamed');
+    expect(run.exitCode).toBe(2);
+    expect(run.output).toMatch(/SILENTLY IGNORED/i);
+    expect(run.output).toMatch(/0003a_suffix\.sql|003_threedigit\.sql/);
+  });
+
+  it('still exits 0 on a correctly named directory', async () => {
+    const run = await migrate();
+    expect(run.exitCode).toBe(0);
+    expect(run.output).toContain('applied=0 skipped=2');
+  });
+
   it('refuses the whole run when an applied migration has been edited on disk', async () => {
     await pg.exec([
       'sh',

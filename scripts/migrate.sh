@@ -151,6 +151,21 @@ fi
 # --- enumerate: numeric-prefix order, safe names, unambiguous ---------------
 set -- "$MIG_DIR"/[0-9][0-9][0-9][0-9]_*.sql
 [ -e "$1" ] || die 2 "no NNNN_*.sql migration files in $MIG_DIR"
+
+# Refuse ANY .sql that the glob above would not pick up. Without this a
+# misnamed file (0003a_suffix.sql, 003_threedigit.sql) is not an error, it is
+# INVISIBLE: the run reports applied=N and exits 0 while the schema is missing
+# whatever that file created — a green migration Job over a broken database.
+# Checked BEFORE anything is applied, like every other refusal here.
+for f in "$MIG_DIR"/*.sql; do
+  [ -e "$f" ] || continue
+  b=$(basename "$f")
+  case $b in
+    [0-9][0-9][0-9][0-9]_*.sql) ;;
+    *) die 2 "migration filename does not match NNNN_*.sql and would be SILENTLY IGNORED: $b" ;;
+  esac
+done
+
 for f in "$@"; do
   b=$(basename "$f")
   case $b in
