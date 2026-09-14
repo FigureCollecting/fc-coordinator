@@ -67,15 +67,21 @@ describe('the coverage gate is per file, not a repo-wide average', () => {
     expect(output).toContain('coverage-gate-probe.ts');
     expect(output).toMatch(/threshold/i);
 
-    // Prove it was the PER-FILE rule that bit: every global measure the child
-    // reported is at or above the 85 gate, so a global-only threshold would
-    // have passed this exact run.
-    for (const measure of ['Statements', 'Branches', 'Functions', 'Lines']) {
-      const reported = new RegExp(`${measure}\\s+:\\s+([\\d.]+)%`).exec(output);
-      expect({ measure, found: reported !== null }).toEqual({ measure, found: true });
-      expect({ measure, atLeast85: Number(reported?.[1]) >= 85 }).toEqual({
-        measure,
-        atLeast85: true,
+    // Prove it was the PER-FILE rule that bit, by reading the threshold
+    // failures themselves rather than the summary table — which vitest prints
+    // on a TTY but not in CI, so parsing it made this test pass locally and
+    // fail on the runner.
+    //
+    // A per-file failure ends with "for <path>"; a repo-wide failure carries no
+    // such suffix. So: at least one failure, and EVERY failure names the probe.
+    // The absence of an unsuffixed line is the proof that the global numbers
+    // were fine and only the per-file rule objected.
+    const failures = output.split('\n').filter((line) => line.includes('does not meet'));
+    expect(failures.length).toBeGreaterThan(0);
+    for (const line of failures) {
+      expect({ line: line.trim(), namesProbe: line.trimEnd().endsWith(PROBE) }).toEqual({
+        line: line.trim(),
+        namesProbe: true,
       });
     }
   }, 300_000);
