@@ -12,7 +12,10 @@
 //      OTEL_EXPORTER_OTLP_(TRACES_)ENDPOINT to ship spans,
 //      OIDC_ISSUER / OIDC_AUDIENCE / OIDC_JWKS_URI / COORDINATOR_PUBLIC_ORIGIN
 //      (all REQUIRED, no defaults — see auth/config.ts for why) plus the
-//      optional DPOP_* and DEVICE_CACHE_TTL_SECONDS tuning knobs.
+//      optional DPOP_* and DEVICE_CACHE_TTL_SECONDS tuning knobs,
+//      SPINE_READ_URL (+ SPINE_READ_TIMEOUT_MS) for the mesh hop, OPENFGA_* for
+//      the entitlement Check and ENTITLEMENT_SIGNING_* for the mint — each of
+//      which, left unset, degrades to a redacted read rather than an outage.
 //
 // Transport security is the substrate's job: the Linkerd sidecar (mTLS +
 // AuthorizationPolicy) fronts this port, and the Postgres hop is secured by
@@ -25,6 +28,7 @@ import { createDeviceStore } from './auth/plugin.js';
 import { createCoordinatorPool, describeTarget } from './db/pool.js';
 import type { LogLevel } from './platform/logger.js';
 import { startTelemetry } from './platform/telemetry.js';
+import { createSpineReadClientFromEnv } from './spine/spineReadClient.js';
 
 const port = Number(process.env['COORDINATOR_PORT'] ?? '5052');
 const host = process.env['COORDINATOR_HOST'] ?? '0.0.0.0';
@@ -50,6 +54,15 @@ const app = buildApp({
       algorithms: authConfig.oidcAlgorithms,
     }),
   },
+  // The coordinator.v1 Connect surface. `spineRead` is null when SPINE_READ_URL
+  // is unset — the degraded-mode seam: Compare then answers UNAVAILABLE rather
+  // than constructing a transport to nowhere, and /healthz is unaffected.
+  //
+  // No `resolveIdentity`: the default reads the decorator the edge above sets,
+  // which is the whole point of the shared declaration in src/identity.ts. The
+  // subject a caller is entitled AS is therefore the subject the DPoP proof was
+  // verified for, and there is no path by which a client can name its own.
+  compare: { spineRead: createSpineReadClientFromEnv() },
 });
 
 // /healthz no longer reports the database target: it is the one unauthenticated

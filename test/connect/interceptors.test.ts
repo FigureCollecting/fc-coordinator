@@ -29,6 +29,7 @@ import {
   type CompareResponse,
 } from '@figurecollecting/ingest-contract/read';
 import { startTelemetry, type Telemetry } from '../../src/platform/telemetry.js';
+import { getActiveTraceIds } from '../../src/platform/shared.js';
 import {
   TRACER_NAME,
   traceparentClientInterceptor,
@@ -190,6 +191,48 @@ describe('what the interceptors record', () => {
 
     // Both spans reached the exporter at all, which only ended spans do.
     expect(exporter.spans.filter((s) => s.ended)).toHaveLength(2);
+  });
+});
+
+describe('the tag fc-shared reads is live inside the handler', () => {
+  // This is the half of the slice-1a "no trace tag on live log lines" gap that
+  // rule 3 actually closes. getActiveTraceIds() reads the ACTIVE span, so any
+  // line the HANDLER logs is tagged with the caller's trace from here on.
+  //
+  // WHAT IT DOES NOT CLOSE, stated so nobody reads more into it: Fastify's own
+  // "incoming request" / "request completed" lines are written in Fastify's
+  // lifecycle hooks, which run outside this interceptor. Tagging those needs an
+  // onRequest hook, and that is being built on feat/oidc-dpop-edge.
+  it('exposes the INBOUND trace id to handler code, not a fresh one', async () => {
+    let seen: { traceId: string; spanId: string } | undefined;
+    // SERVER interceptor only. With the client interceptor in front it would
+    // open its own span and inject THAT, overwriting the traceparent this test
+    // supplies — correct behaviour for the pair, but it would leave the server
+    // half asserted against a header our own code wrote.
+    const transport = createRouterTransport(
+      ({ service }) => {
+        service(SpineRead, {
+          compare: () => {
+            seen = getActiveTraceIds();
+            return ok();
+          },
+        });
+      },
+      { router: { interceptors: [traceparentServerInterceptor()] } },
+    );
+    const client = createClient(SpineRead, transport);
+
+    await client.compare(
+      { seed: { case: 'gtin14', value: '04573102591234' }, nowIso: NOW_ISO },
+      { headers: { traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' } },
+    );
+
+    expect(seen?.traceId).toBe('4bf92f3577b34da6a3ce929d0e0e4736');
+    // A real span of this service's own, not the caller's and not the all-zero
+    // id fc-shared treats as "no span".
+    expect(seen?.spanId).toMatch(/^[0-9a-f]{16}$/);
+    expect(seen?.spanId).not.toBe('00f067aa0ba902b7');
+    expect(seen?.spanId).not.toBe('0'.repeat(16));
   });
 });
 

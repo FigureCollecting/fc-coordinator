@@ -11,10 +11,18 @@
 // interceptors are the close.
 //
 //   SERVER  extracts `traceparent` from the incoming request headers into
-//           context, then opens a SERVER span under it. Every log line the
-//           handler writes now carries `trace=<id> span=<id>`, and the id is
-//           the CALLER's trace, so fc-mobile, the coordinator and the spine all
-//           join on one value.
+//           context, then opens a SERVER span under it. Every line the HANDLER
+//           logs now carries `trace=<id> span=<id>`, and the id is the CALLER's
+//           trace, so fc-mobile, the coordinator and the spine all join on one
+//           value.
+//
+//           WHAT THIS DOES NOT COVER, said plainly so nobody reads the slice-1a
+//           gap as fully closed: Fastify's own "incoming request" and "request
+//           completed" lines are written in Fastify's lifecycle hooks, which run
+//           OUTSIDE this interceptor — it wraps the RPC invocation, not the HTTP
+//           request. Those lines are still untagged. Tagging them needs an
+//           onRequest hook, which is being built on feat/oidc-dpop-edge; this
+//           file deliberately does not duplicate it.
 //
 //   CLIENT  opens a CLIENT span and injects `traceparent` from it into the
 //           outgoing headers. It opens a span rather than merely copying the
