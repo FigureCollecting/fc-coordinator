@@ -57,6 +57,7 @@ const ENV_KEYS = [
   'OPENFGA_API_TOKEN',
   'ENTITLEMENT_SIGNING_KEY_PEM',
   'ENTITLEMENT_SIGNING_KID',
+  'ENTITLEMENT_SIGNING_ISSUER',
 ] as const;
 
 /** /healthz needs a db; nothing in this file touches one. */
@@ -98,6 +99,8 @@ interface HarnessOptions {
   noSpine?: boolean;
   /** Withhold the signing key, leaving the mint disabled. */
   noSigningKey?: boolean;
+  /** Mint under an issuer the spine's verifier does not expect. */
+  issuer?: string;
 }
 
 async function start(options: HarnessOptions): Promise<Harness> {
@@ -105,6 +108,7 @@ async function start(options: HarnessOptions): Promise<Harness> {
   if (!options.noSigningKey) {
     process.env['ENTITLEMENT_SIGNING_KEY_PEM'] = kp.privatePem;
     process.env['ENTITLEMENT_SIGNING_KID'] = KID;
+    if (options.issuer !== undefined) process.env['ENTITLEMENT_SIGNING_ISSUER'] = options.issuer;
   }
 
   let fga: FakeOpenFga | null = null;
@@ -568,5 +572,80 @@ describe('an unliftable spine response is refused, never quietly emptied', () =>
     } catch (err) {
       expect((err as ConnectError).rawMessage).not.toContain('s3cr3t-do-not-echo');
     }
+  });
+});
+
+// ===========================================================================
+// THE ISSUER PIN, END TO END — from the image-track architecture review.
+//
+// fc-aggregation's verifier pins `iss` and rejects a mismatch SILENTLY: empty
+// grants, normal 200. So a coordinator minting under an issuer the deployed
+// verifier does not accept looks EXACTLY like a coordinator whose users have no
+// grants — same status code, same shape, nothing in any log at the spine.
+//
+// It is still fail-closed, which is the right direction, but it is the kind of
+// fail-closed that can sit in production for weeks looking like a product
+// decision. The one place the failure can be made visible is a test, so here it
+// is, at the surface a client actually reads.
+// ===========================================================================
+describe('a mismatched issuer fails closed, visibly', () => {
+  it('redacts, with coverage.redacted naming the entitlement — even though everything else is right', async () => {
+    // OpenFGA ALLOWS, the key is good, the subject is a real uuid, the
+    // signature verifies. The ONLY thing wrong is the issuer.
+    harness = await start({ allow: true, issuer: 'fc-coordinator' });
+
+    const res = await harness.client.compare({
+      seed: { case: 'gtin14', value: GTIN },
+      nowIso: NOW_ISO,
+    });
+
+    expect(res.coverage?.redacted).toEqual([INVENTORY_LEVELS]);
+    expect(JSON.parse(res.resultJson).heads[0].perStore[0].offers[0].stockOnHand).toBeUndefined();
+
+    // And this is the diagnostic that matters: the spine REJECTED a header it
+    // received, rather than never receiving one. `absent` would mean the mint
+    // declined; `wrong_issuer` means the mint worked and the verifier refused.
+    expect(harness.spine.calls[0]?.entitlementOutcome).toBe('wrong_issuer');
+    // The Check really did allow — so nothing upstream of the issuer explains it.
+    expect(harness.fga?.calls).toHaveLength(1);
+  });
+
+  it('is indistinguishable from an ordinary denial at the wire, which is why it needs this test', async () => {
+    harness = await start({ allow: true, issuer: 'fc-coordinator' });
+    const mismatched = await harness.client.compare({
+      seed: { case: 'gtin14', value: GTIN },
+      nowIso: NOW_ISO,
+    });
+
+    await harness.app.close();
+    await harness.spine.close();
+    if (harness.fga) await harness.fga.close();
+    harness = null;
+    resetEntitlementGrantsForTest();
+    resetEntitlementSigningForTest();
+    for (const k of ENV_KEYS) delete process.env[k];
+
+    harness = await start({ allow: false });
+    const denied = await harness.client.compare({
+      seed: { case: 'gtin14', value: GTIN },
+      nowIso: NOW_ISO,
+    });
+
+    // Byte for byte the same answer, from two completely different causes. A
+    // client cannot tell them apart and neither can an operator reading the
+    // response — only the spine-side outcome separates them, and the spine does
+    // not log it. That is the whole argument for pinning it here.
+    expect(mismatched.resultJson).toBe(denied.resultJson);
+    expect(mismatched.coverage?.redacted).toEqual(denied.coverage?.redacted);
+  });
+
+  it('the DEFAULT issuer still passes the entitled path, so this is opt-in breakage only', async () => {
+    harness = await start({ allow: true });
+    const res = await harness.client.compare({
+      seed: { case: 'gtin14', value: GTIN },
+      nowIso: NOW_ISO,
+    });
+    expect(harness.spine.calls[0]?.entitlementOutcome).toBe('granted');
+    expect(res.coverage?.redacted).toEqual([]);
   });
 });

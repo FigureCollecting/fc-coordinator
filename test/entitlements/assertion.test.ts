@@ -43,6 +43,7 @@ const ENV_KEYS = [
   'ENTITLEMENT_SIGNING_KEY_PEM',
   'ENTITLEMENT_SIGNING_KEY_FILE',
   'ENTITLEMENT_SIGNING_KID',
+  'ENTITLEMENT_SIGNING_ISSUER',
 ] as const;
 
 let saved: Record<string, string | undefined> = {};
@@ -432,5 +433,107 @@ describe('counters', () => {
   it('counts the disabled path', () => {
     mintEntitlementAssertion({ sub: SUB, ent: [INVENTORY_LEVELS] });
     expect(entitlementMintCounters()['disabled']).toBe(1);
+  });
+});
+
+// ===========================================================================
+// THE ISSUER PIN — added by the slice-1b port, from the image-track review.
+//
+// fc-aggregation's verifier pins `iss` and rejects a mismatch the way it
+// rejects everything else: SILENTLY, with empty grants and a normal 200. That
+// makes a wrong issuer indistinguishable from a user with no grant, so the
+// failure mode has to be visible SOMEWHERE, and the only place left is here.
+// ===========================================================================
+describe('the iss claim', () => {
+  it('defaults to the contract issuer, which is what the deployed verifier expects', () => {
+    const kp = generateTestSigningKey(KID);
+    process.env['ENTITLEMENT_SIGNING_KEY_PEM'] = kp.privatePem;
+    process.env['ENTITLEMENT_SIGNING_KID'] = KID;
+
+    const token = mintEntitlementAssertion({ sub: SUB, ent: [INVENTORY_LEVELS] }) as string;
+    expect(decodePart(token, 1)['iss']).toBe(ENTITLEMENT_ISSUER);
+    // The whole point of the default: it verifies today, unchanged.
+    expect(verifyEntitlementHeader(token, kp.keys).outcome).toBe('granted');
+    // And it is not a change anyone has to be told about.
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['unset', undefined],
+    ['empty', ''],
+    ['blank', '   '],
+  ])('falls back to the contract issuer when the variable is %s', (_label, value) => {
+    const kp = generateTestSigningKey(KID);
+    process.env['ENTITLEMENT_SIGNING_KEY_PEM'] = kp.privatePem;
+    process.env['ENTITLEMENT_SIGNING_KID'] = KID;
+    if (value !== undefined) process.env['ENTITLEMENT_SIGNING_ISSUER'] = value;
+
+    const token = mintEntitlementAssertion({ sub: SUB, ent: [INVENTORY_LEVELS] }) as string;
+    expect(decodePart(token, 1)['iss']).toBe(ENTITLEMENT_ISSUER);
+  });
+
+  it('mints under a configured issuer when one is set', () => {
+    const kp = generateTestSigningKey(KID);
+    process.env['ENTITLEMENT_SIGNING_KEY_PEM'] = kp.privatePem;
+    process.env['ENTITLEMENT_SIGNING_KID'] = KID;
+    process.env['ENTITLEMENT_SIGNING_ISSUER'] = 'fc-coordinator';
+
+    expect(
+      decodePart(mintEntitlementAssertion({ sub: SUB, ent: [INVENTORY_LEVELS] }) as string, 1)[
+        'iss'
+      ],
+    ).toBe('fc-coordinator');
+  });
+
+  it('a mismatched issuer is REJECTED BY THE VERIFIER, silently, with no grants', () => {
+    // THE FAILURE THIS FILE EXISTS TO MAKE VISIBLE. The token is perfectly well
+    // formed and correctly signed; the verifier still hands back nothing, and
+    // says so only as `wrong_issuer` — which at the spine is a normal 200.
+    const kp = generateTestSigningKey(KID);
+    process.env['ENTITLEMENT_SIGNING_KEY_PEM'] = kp.privatePem;
+    process.env['ENTITLEMENT_SIGNING_KID'] = KID;
+    process.env['ENTITLEMENT_SIGNING_ISSUER'] = 'fc-coordinator';
+
+    const token = mintEntitlementAssertion({ sub: SUB, ent: [INVENTORY_LEVELS] }) as string;
+    const verified = verifyEntitlementHeader(token, kp.keys);
+
+    expect(verified.outcome).toBe('wrong_issuer');
+    expect([...verified.grants]).toEqual([]);
+    // Not an error, not a throw — the read still succeeds, redacted.
+    expect(verified.sub).toBeUndefined();
+  });
+
+  it('warns ONCE when the issuer is not the contract default, naming the consequence', () => {
+    const kp = generateTestSigningKey(KID);
+    process.env['ENTITLEMENT_SIGNING_KEY_PEM'] = kp.privatePem;
+    process.env['ENTITLEMENT_SIGNING_KID'] = KID;
+    process.env['ENTITLEMENT_SIGNING_ISSUER'] = 'fc-coordinator';
+
+    for (let i = 0; i < 5; i++) mintEntitlementAssertion({ sub: SUB, ent: [INVENTORY_LEVELS] });
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const text = String(warnSpy.mock.calls[0]?.[0]).toLowerCase();
+    expect(text).toContain('fc-coordinator');
+    // The symptom, not just the setting: an operator chasing missing numbers
+    // has to be able to find this line by what they are seeing.
+    expect(text).toContain('redact');
+    expect(text).toContain('silent');
+  });
+
+  it('does not warn about the issuer when minting is disabled anyway', () => {
+    // No key: the mint is off, so an issuer it will never use is not news.
+    process.env['ENTITLEMENT_SIGNING_ISSUER'] = 'fc-coordinator';
+    expect(initEntitlementSigning()).toBe(false);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0]?.[0])).toContain('no signing key configured');
+  });
+
+  it('names the issuer in the boot line, so the deployed value is observable', () => {
+    const kp = generateTestSigningKey(KID);
+    process.env['ENTITLEMENT_SIGNING_KEY_PEM'] = kp.privatePem;
+    process.env['ENTITLEMENT_SIGNING_KID'] = KID;
+
+    expect(initEntitlementSigning()).toBe(true);
+    expect(allLoggedText()).toContain(`iss=${ENTITLEMENT_ISSUER}`);
   });
 });

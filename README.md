@@ -52,6 +52,7 @@ npm start        # node dist/server.js
 | `OPENFGA_API_TOKEN` `OPENFGA_MODEL_ID` `OPENFGA_APP_OBJECT` `OPENFGA_TIMEOUT_MS` | unset / `app:figurecollecting` / `2000` | optional Check settings |
 | `ENTITLEMENT_SIGNING_KEY_PEM` or `ENTITLEMENT_SIGNING_KEY_FILE` | unset | the Ed25519 PKCS#8 signing key; **unset means no assertion is ever sent** |
 | `ENTITLEMENT_SIGNING_KID` | unset (derived from a key FILE's basename) | the JOSE `kid`; production mints under `ent-2026-09` or the spine silently redacts |
+| `ENTITLEMENT_SIGNING_ISSUER` | the contract's `ENTITLEMENT_ISSUER` | the `iss` claim. **Do not set this until ingest-server's verifier has been taught the new value** — see below |
 | `ENTITLEMENT_GRANT_CACHE_TTL_MS` `ENTITLEMENT_GRANT_ERROR_TTL_MS` `ENTITLEMENT_GRANT_CACHE_MAX` | `30000` / `5000` / `10000` | grant cache bounds; a value that is not a positive number falls back to the default |
 
 ### Edge authentication (OIDC + DPoP)
@@ -276,6 +277,36 @@ decorator the OIDC + DPoP plugin sets on the Fastify request
 nothing returns `null`, and `null` means no entitlement — a successful, redacted
 Compare. Rejecting an unauthenticated caller belongs to the plugin, upstream; if
 both layers rejected, one rule would have two owners.
+
+### The issuer pin — a two-sided deploy, and a silent failure if you get it wrong
+
+fc-aggregation's verifier **pins `iss`** to a single expected value and rejects
+anything else the way it rejects everything else: empty grants, normal 200, no
+error and nothing in the spine's logs. A coordinator minting under an issuer the
+deployed verifier does not accept therefore looks *exactly* like a coordinator
+whose users simply have no grants.
+
+That is fail-closed, which is the right direction, but it is the kind of
+fail-closed that can sit in production for weeks looking like a product
+decision. So:
+
+- `ENTITLEMENT_SIGNING_ISSUER` **defaults to the contract's `ENTITLEMENT_ISSUER`**,
+  which is what the deployed verifier expects today. Out of the box the entitled
+  path works and nothing changes.
+- Setting it to anything else logs **one warning** naming both the value and the
+  consequence, because "reads come back redacted" is the symptom an operator
+  will actually be chasing.
+- The boot line reports the live value (`iss=…`), so the deployed setting is
+  observable without reading a Secret.
+- **Order of operations, if the coordinator is ever to stop claiming to be
+  fc-backend**: teach ingest-server's verifier the new issuer (or a list),
+  deploy that, and only then set this variable. The reverse order redacts
+  everything with no signal.
+
+`test/connect/compare.test.ts` pins the failure end to end: with OpenFGA
+allowing, a good key, a real uuid and a valid signature, a mismatched issuer
+still comes back with `coverage.redacted: ["inventory_levels"]`, and the answer
+is byte-for-byte identical to an ordinary denial.
 
 ### The ported entitlement module
 

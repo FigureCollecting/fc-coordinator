@@ -33,11 +33,27 @@
  *                                 value, or an env var in a plain deploy)
  *   ENTITLEMENT_SIGNING_KEY_FILE  a path to that PEM (a projected Secret file)
  *   ENTITLEMENT_SIGNING_KID       the key id that goes in the JOSE header
+ *   ENTITLEMENT_SIGNING_ISSUER    the `iss` claim; defaults to the contract's
+ *                                 ENTITLEMENT_ISSUER
  * With a FILE and no explicit kid, the kid is the file's basename minus its
  * extension — the same `<kid>.pub` convention the spine uses to name its
  * verification keys, so a rotation that drops `ent-2027-03.key` beside a
  * matching `ent-2027-03.pub` needs no second variable to be changed in step.
  * With an inline PEM there is no filename to read, so the kid is required.
+ *
+ * THE ISSUER IS CONFIGURATION, AND THAT IS A TRAP WORTH NAMING. The spine's
+ * verifier PINS `iss` to a single expected value and rejects anything else the
+ * way it rejects everything else: SILENTLY, with empty grants and a normal 200.
+ * So an issuer the verifier does not expect is indistinguishable, from the
+ * outside, from a user who simply has no grant — no error, no log at the spine,
+ * just numbers that never appear.
+ *
+ * The default is therefore the contract's own ENTITLEMENT_ISSUER, which is what
+ * the deployed verifier expects today, and changing it is a TWO-SIDED DEPLOY:
+ * the verifier must be taught the new issuer FIRST, or every read goes redacted
+ * the moment this variable is set. Setting it to anything else logs one warning
+ * saying exactly that. It exists so the coordinator can eventually stop
+ * claiming to be the service it replaced, not so it can be changed casually.
  *
  * THE KEY IS READ ONCE. A signing key is not a feature flag: re-reading it per
  * request would put a filesystem call on the hot read path and make the
@@ -73,7 +89,21 @@ export interface MintRequest {
 interface SigningKey {
   key: crypto.KeyObject;
   kid: string;
+  /** The `iss` claim this process mints under. See the header note. */
+  issuer: string;
 }
+
+/**
+ * The claim set as MINTED.
+ *
+ * The contract types `iss` as the literal `typeof ENTITLEMENT_ISSUER`, because
+ * it was written for a world with exactly one mint. Widening it HERE, and only
+ * here, is the honest way to say that the issuer became configuration while
+ * every other claim stays pinned to the contract — a cast at the assignment
+ * would have hidden the same fact. When the spine's verifier learns to accept a
+ * LIST of issuers, the contract can widen and this alias disappears.
+ */
+type MintedAssertion = Omit<EntitlementAssertion, 'iss'> & { iss: string };
 
 /** `null` = minting is off (no key, or a key this process refuses to use). */
 type KeyState = SigningKey | null;
@@ -157,7 +187,23 @@ function loadSigningKey(env: NodeJS.ProcessEnv): KeyState {
     );
     return null;
   }
-  return { key, kid };
+  // The issuer the verifier is expected to accept. Read ONCE alongside the key,
+  // for the same reason: a process's claimed identity must not depend on when a
+  // request happened to arrive.
+  const configuredIssuer = env.ENTITLEMENT_SIGNING_ISSUER?.trim() ?? '';
+  const issuer = configuredIssuer === '' ? ENTITLEMENT_ISSUER : configuredIssuer;
+  if (issuer !== ENTITLEMENT_ISSUER) {
+    // Not a refusal — an operator may be mid-way through the two-sided deploy,
+    // and refusing would make the SAFE ordering (teach the verifier, then
+    // switch the mint) impossible. But it is the one line that connects a
+    // deliberate config change to the symptom it causes if the other side is
+    // not ready, so it names both.
+    console.warn(
+      `[ENTITLEMENT] minting under issuer "${issuer}" instead of the contract default "${ENTITLEMENT_ISSUER}" — the spine verifier PINS this claim and rejects a mismatch SILENTLY, so unless ingest-server has already been configured to accept it, every spine read comes back redacted with no error anywhere.`
+    );
+  }
+
+  return { key, kid, issuer };
 }
 
 function signingKey(env: NodeJS.ProcessEnv = process.env): KeyState {
@@ -173,7 +219,9 @@ function signingKey(env: NodeJS.ProcessEnv = process.env): KeyState {
 export function initEntitlementSigning(env: NodeJS.ProcessEnv = process.env): boolean {
   const state = signingKey(env);
   if (state === null) return false;
-  console.log(`[ENTITLEMENT] assertion minting enabled (kid=${state.kid}, alg=${ENTITLEMENT_ALG})`);
+  console.log(
+    `[ENTITLEMENT] assertion minting enabled (kid=${state.kid}, alg=${ENTITLEMENT_ALG}, iss=${state.issuer})`
+  );
   return true;
 }
 
@@ -221,8 +269,10 @@ export function mintEntitlementAssertion(
   // `kid` appears in the payload as well as the JOSE header: the contract's
   // EntitlementAssertion declares it, and the spine reads it from the header.
   // Both copies are inside the signature, so they cannot disagree undetected.
-  const payload: EntitlementAssertion = {
-    iss: ENTITLEMENT_ISSUER,
+  const payload: MintedAssertion = {
+    // Configuration, not a constant — see the header note. The spine PINS this
+    // and rejects a mismatch silently, so the default is the contract's value.
+    iss: state.issuer,
     aud: ENTITLEMENT_AUDIENCE,
     sub,
     ent,
