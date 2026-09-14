@@ -1,8 +1,8 @@
 // ============================================================================
 // Fastify 5 application factory.
 //
-// Slice 1a carries exactly one route: GET /healthz. OIDC, DPoP, the entitlement
-// port and the Compare pass-through are slice 1b and plug in here.
+// Routes: GET /healthz (the entire public allowlist), the OIDC + DPoP edge's
+// enrolment routes, and the coordinator.v1 Connect surface.
 //
 // Everything the route needs is INJECTED (db, telemetry state, log sink) so the
 // health contract can be tested — including its failure branch — without a
@@ -13,8 +13,11 @@
 // incoming `traceparent` and keeps it active for the rest of the lifecycle, so
 // every log line from a running request carries `trace=<id> span=<id>`.
 // /healthz is excluded: a liveness probe every second is noise, not a trace.
-// Still open: the traceparent Connect INTERCEPTORS (§A.5 rule 3), which arrive
-// with the first Connect hop.
+// ALSO CLOSED IN SLICE 1b: the traceparent Connect INTERCEPTORS (§A.5 rule 3).
+// src/connect/interceptors.ts carries both halves — the server one continues the
+// caller's trace into the handler, the client one injects on the outbound
+// SpineRead hop — so a single traceparent now threads fc-mobile, this service
+// and the spine.
 //
 // AUTH is optional here on purpose. buildApp({ auth }) registers the OIDC +
 // DPoP edge; omitting it yields the health-only app the slice-1a tests build,
@@ -26,6 +29,7 @@ import { probeDatabase, type QueryableDb } from './db/pool.js';
 import { registerHttpTracing } from './platform/http-trace.js';
 import { createStructuredLogger, type LogLevel, type LogSink } from './platform/logger.js';
 import type { TelemetryState } from './platform/telemetry.js';
+import { registerConnect, type ConnectOptions } from './connect/register.js';
 
 export const SERVICE_NAME = 'fc-coordinator';
 
@@ -36,6 +40,18 @@ export interface BuildAppOptions {
   logSink?: LogSink;
   /** Omit to build a health-only app: the edge is not registered at all. */
   auth?: AuthPluginOptions;
+  /**
+   * The coordinator.v1 Connect surface. Omitted, the app serves /healthz only —
+   * which is what the migration Job and the unit tests for the health contract
+   * want. See src/connect/register.ts.
+   *
+   * REGISTERED LAST, AND THAT IS LOAD-BEARING. Fastify binds a route's hooks
+   * when the route is added, so the Connect routes must be registered AFTER
+   * registerAuth or they would never see the deny-by-default onRequest hook.
+   * Compare declares no `config.auth`, so it is `guarded` — the absence is the
+   * protection, which is the whole point of having no opt-in.
+   */
+  compare?: ConnectOptions;
 }
 
 /**
@@ -83,6 +99,8 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
 
     return reply.code(probe.reachable ? 200 : 503).send(body);
   });
+
+  if (options.compare) registerConnect(app, options.compare);
 
   return app;
 }

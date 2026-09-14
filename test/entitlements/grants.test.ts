@@ -549,12 +549,41 @@ describe('grantsForSubject — a bound of zero is not a bound', () => {
       const started = Date.now();
       await expect(grantsForSubject(SUB)).resolves.toEqual([]);
       const elapsed = Date.now() - started;
-      // The 2 000 ms default fired. A 0 would still be pending.
-      expect(elapsed).toBeGreaterThanOrEqual(1_500);
+
+      // THE LOAD-BEARING ASSERTION IS THAT IT SETTLED AT ALL. With the bound
+      // honoured as zero the promise never resolves and this case fails on the
+      // runner's own timeout below.
+      //
+      // The window is deliberately WIDE, and the bound below is NOT the
+      // configured 2 000 ms. axios implements its timeout with the socket's
+      // inactivity timer, which it arms around connect rather than at the call,
+      // so under event-loop contention the rejection can arrive early —
+      // measured at 1 283 ms against this very stub with the loop busy, while
+      // an idle run lands at 2 07x ms every time. A bound near 2 000 would
+      // therefore go red on a loaded CI runner and prove nothing about the
+      // code. 500 ms is still far above any instant-resolve path.
+      expect(elapsed).toBeGreaterThan(500);
       expect(elapsed).toBeLessThan(6_000);
     },
     20000,
   );
+
+  it('falls back to the default CACHE BOUND on a zero, with no clock involved', async () => {
+    // The same rule as above on a different bound, asserted through BEHAVIOUR
+    // rather than elapsed time — a max of 0 honoured literally would evict on
+    // every write, so nothing would ever be served from cache.
+    stub = await startFga(allowed(true));
+    configure(stub.baseUrl, {
+      ENTITLEMENT_GRANT_CACHE_MAX: '0',
+      ENTITLEMENT_GRANT_CACHE_TTL_MS: '30000',
+    });
+
+    await grantsForSubject(SUB, 1_000);
+    await grantsForSubject(SUB, 2_000);
+
+    expect(stub.captured).toHaveLength(1);
+    expect(entitlementGrantCounters()['cache_hit']).toBe(1);
+  });
 });
 
 describe('secret hygiene', () => {

@@ -19,8 +19,15 @@
  * against this server — mirrors scraper/src/services/ingestEmitter.ts's
  * TRANSPORT note for the sibling ingest RPC verbatim.
  */
-import { Code, ConnectError, createClient, type Client } from '@connectrpc/connect';
+import {
+  Code,
+  ConnectError,
+  createClient,
+  type Client,
+  type Interceptor,
+} from '@connectrpc/connect';
 import { createConnectTransport } from '@connectrpc/connect-node';
+import { traceparentClientInterceptor } from '../connect/interceptors.js';
 import { create } from '@bufbuild/protobuf';
 import {
   SpineRead,
@@ -39,10 +46,20 @@ export class SpineReadClient {
   private readonly client: Client<typeof SpineRead>;
   private readonly timeoutMs: number;
 
-  constructor(baseUrl: string, timeoutMs: number = DEFAULT_COMPARE_TIMEOUT_MS) {
+  /**
+   * `interceptors` defaults to the W3C traceparent injector (plan §A.5 rule 3),
+   * so the mesh hop is traced without any wiring at the call site and a future
+   * caller cannot forget it. Pass an explicit list to REPLACE that default —
+   * tests do, to prove the hop is untraced without it.
+   */
+  constructor(
+    baseUrl: string,
+    timeoutMs: number = DEFAULT_COMPARE_TIMEOUT_MS,
+    interceptors: Interceptor[] = [traceparentClientInterceptor()],
+  ) {
     // Connect over HTTP/1.1 — see the TRANSPORT note above. NEVER
     // createGrpcTransport here.
-    const transport = createConnectTransport({ baseUrl, httpVersion: '1.1' });
+    const transport = createConnectTransport({ baseUrl, httpVersion: '1.1', interceptors });
     this.client = createClient(SpineRead, transport);
     this.timeoutMs = timeoutMs;
   }
