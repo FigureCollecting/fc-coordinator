@@ -1,0 +1,276 @@
+/**
+ * entitlementGrants.ts — D6 U6: decide what a caller is entitled to see,
+ * BEFORE anything is minted (spec §3(b), §3(d)).
+ *
+ * ONE QUESTION, ASKED OF OPENFGA: `Check(user:<authentik uuid>,
+ * inventory_levels, app:figurecollecting)`. The relation is APP-LEVEL and the
+ * object is the app — never a per-object feature join, which is the H-2 leak
+ * the B1 model was reshaped to avoid (see fc-infra nodes/fc-ha-01/manifests/
+ * b1-model.fga). The model defines the grant as an INTERSECTION with `member`,
+ * so a stray direct tuple for a non-member confers nothing; that invariant is
+ * the graph's to keep, and this module simply believes the answer.
+ *
+ * THE RULE THAT MATTERS: ANY CHECK THAT IS NOT AN EXPLICIT `allowed: true` IS
+ * A DENY. A 500, a refused connection, a timeout, a body of an unexpected
+ * shape, an unconfigured client, a user with no Authentik identity — all of
+ * them return no grants. This is the B1 fail-open lesson written down: an
+ * authorization model cannot express "an error means no", so the CALLER has to,
+ * and the caller is this file. The graph's own suite asserts the positive
+ * cases; this suite asserts the negative ones.
+ *
+ * DENIAL IS NOT AN ERROR ANYWHERE ABOVE THIS LINE. A denied caller gets a
+ * normal 200 whose stock magnitudes are simply absent, marked by
+ * `coverage.redacted`. Nothing here throws, and nothing here changes a status
+ * code: a gate that answers differently when it fails is an existence oracle,
+ * and one that 500s is a gate an attacker can knock over to make the system
+ * choose between broken and open.
+ *
+ * WHY A CACHE. This sits on the read hot path, and OpenFGA is a cross-cluster
+ * hop (it lives on the auth node, not beside fc-backend). A short per-subject
+ * TTL keeps a page of comparisons down to one Check. The cost is propagation
+ * delay on a grant or a revoke, bounded by the TTL and already bounded by the
+ * assertion's own 60-second lifetime — the same order of magnitude, so the
+ * cache does not meaningfully widen the window that already exists.
+ *
+ * WHY ERRORS GET THEIR OWN, SHORTER TTL. Caching an error-deny for the full
+ * window would turn a momentary OpenFGA blip into minutes of silently missing
+ * numbers; not caching it at all would point a retry storm at the service that
+ * is already unwell. A few seconds is the compromise: the storm is damped, and
+ * recovery is quick.
+ *
+ * IT TAKES A SUBJECT STRING AND NOTHING ELSE. No user model, no database, no
+ * notion of how this process authenticates anyone — see the directory note in
+ * ./index.ts. Mapping a logged-in user to an Authentik uuid is the host
+ * application's job and lives outside this directory, because that mapping is
+ * exactly what differs between the backend this runs in today and the
+ * Postgres-only one it is destined for.
+ */
+import axios from 'axios';
+import { INVENTORY_LEVELS, type EntitlementName } from '@figurecollecting/ingest-contract/entitlement';
+import { mintEntitlementAssertion } from './assertion.js';
+import { isEntitlementSubject } from './subject.js';
+
+/** Nothing granted. A frozen shared value so a caller cannot mutate the denial. */
+const NO_GRANTS: readonly EntitlementName[] = Object.freeze([]);
+const INVENTORY_GRANT: readonly EntitlementName[] = Object.freeze([INVENTORY_LEVELS]);
+
+/** The app object the entitlement hangs off. Overridable so a staging tenant is a config change. */
+const DEFAULT_APP_OBJECT = 'app:figurecollecting';
+/** Long enough to take the hot path off OpenFGA, short enough that a revoke lands promptly. */
+const DEFAULT_CACHE_TTL_MS = 30_000;
+/** A failed Check is remembered only briefly — see the header note. */
+const DEFAULT_ERROR_TTL_MS = 5_000;
+/** Tight by intent: this is a blocking hop inside a user-facing read. */
+const DEFAULT_TIMEOUT_MS = 2_000;
+/**
+ * Hard ceiling on cached subjects. The cache is keyed by subject and nothing
+ * ever removed an entry, so it grew with every distinct identity the process
+ * had ever seen and never shrank. That is bounded by the user count in the
+ * application this runs in today, and unbounded in one that takes the subject
+ * straight from a session claim — which is exactly where this module is going.
+ */
+const DEFAULT_CACHE_MAX_ENTRIES = 10_000;
+
+interface CacheEntry {
+  grants: readonly EntitlementName[];
+  expiresAt: number;
+}
+
+const cache = new Map<string, CacheEntry>();
+const inflight = new Map<string, Promise<readonly EntitlementName[]>>();
+const counters = new Map<string, number>();
+let warnedUnconfigured = false;
+
+const bump = (name: string): void => {
+  counters.set(name, (counters.get(name) ?? 0) + 1);
+};
+
+/** Snapshot: `allow`, `deny`, `error`, `unconfigured`, `bad_subject`, `cache_hit`, `coalesced`, `evicted`. */
+export const entitlementGrantCounters = (): Readonly<Record<string, number>> => Object.fromEntries(counters);
+
+/** Test seam: drop the cache, the in-flight map, the counters and the one-shot warning. */
+export const resetEntitlementGrantsForTest = (): void => {
+  cache.clear();
+  inflight.clear();
+  counters.clear();
+  warnedUnconfigured = false;
+};
+
+/**
+ * A positive finite number from the environment, or the default.
+ *
+ * STRICTLY GREATER THAN ZERO. Every value read through this is a BOUND — a
+ * timeout, a cache lifetime, a map size — and zero is not a smaller bound, it
+ * is the absence of one. axios in particular reads `timeout: 0` as "wait
+ * forever", so a single typo in a deployment would turn the Check on a
+ * user-facing read path into an unbounded hang. A nonsensical value falls back
+ * to the documented default rather than being honoured.
+ */
+const num = (raw: string | undefined, fallback: number): number => {
+  const value = raw === undefined ? NaN : Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+};
+
+/**
+ * Ask OpenFGA. Resolves to `true` ONLY on an explicit `allowed: true`;
+ * everything else resolves to `false` and is counted as an error rather than a
+ * deny, so an operator can tell a revoked user apart from a sick dependency.
+ */
+async function check(subject: string, env: NodeJS.ProcessEnv): Promise<{ allowed: boolean; errored: boolean }> {
+  const apiUrl = env.OPENFGA_API_URL?.trim();
+  const storeId = env.OPENFGA_STORE_ID?.trim();
+  if (!apiUrl || !storeId) {
+    bump('unconfigured');
+    if (!warnedUnconfigured) {
+      warnedUnconfigured = true;
+      console.warn(
+        '[ENTITLEMENT] OpenFGA is not configured (OPENFGA_API_URL / OPENFGA_STORE_ID) — every entitlement check denies and spine reads come back redacted. Expected until the authz substrate is wired.'
+      );
+    }
+    return { allowed: false, errored: false };
+  }
+
+  const body: Record<string, unknown> = {
+    tuple_key: {
+      user: `user:${subject}`,
+      relation: INVENTORY_LEVELS,
+      object: env.OPENFGA_APP_OBJECT?.trim() || DEFAULT_APP_OBJECT,
+    },
+  };
+  // Pinning the model id makes the answer reproducible across a model rollout;
+  // without it OpenFGA evaluates against whatever the latest model is.
+  const modelId = env.OPENFGA_MODEL_ID?.trim();
+  if (modelId) body.authorization_model_id = modelId;
+
+  const token = env.OPENFGA_API_TOKEN?.trim();
+  try {
+    const response = await axios.post(`${apiUrl.replace(/\/+$/, '')}/stores/${storeId}/check`, body, {
+      timeout: num(env.OPENFGA_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
+      headers: {
+        'content-type': 'application/json',
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+    });
+    const data: unknown = response.data;
+    if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+      // A 200 carrying something that is not a Check response is a wire-level
+      // surprise, not a decision. Treated as a fault so it shows up as one.
+      console.error('[ENTITLEMENT] OpenFGA Check returned an unexpected body shape — denying');
+      return { allowed: false, errored: true };
+    }
+    const allowed = (data as { allowed?: unknown }).allowed;
+    if (typeof allowed !== 'boolean') {
+      console.error('[ENTITLEMENT] OpenFGA Check response has no boolean `allowed` — denying');
+      return { allowed: false, errored: true };
+    }
+    return { allowed, errored: false };
+  } catch (err) {
+    // The message ONLY. An axios error carries the full request config,
+    // headers included, so anything broader than this prints the preshared key.
+    console.error('[ENTITLEMENT] OpenFGA Check failed — denying:', (err as Error).message);
+    return { allowed: false, errored: true };
+  }
+}
+
+/**
+ * Write one entry, keeping the map bounded.
+ *
+ * Expired entries go first — they are dead weight and evicting them costs
+ * nothing — and only if that is not enough does it drop the least recently
+ * written, which a Map gives us for free because it preserves insertion order
+ * and every write re-inserts. Evicting a LIVE entry is not a correctness
+ * problem: the next lookup for that subject simply asks OpenFGA again. An
+ * unbounded map, by contrast, is a slow leak in a long-lived process.
+ */
+function cacheSet(subject: string, entry: CacheEntry, nowMs: number, env: NodeJS.ProcessEnv): void {
+  const max = num(env.ENTITLEMENT_GRANT_CACHE_MAX, DEFAULT_CACHE_MAX_ENTRIES);
+  if (cache.size >= max) {
+    for (const [key, value] of cache) {
+      if (value.expiresAt <= nowMs) {
+        cache.delete(key);
+        bump('evicted');
+      }
+    }
+    // Oldest first, stopping the moment there is room. Written as a loop over
+    // the keys rather than repeated `next()` calls so there is no unreachable
+    // "the map was empty" guard: the iteration ends on its own, and both exits
+    // are paths a test can take.
+    for (const key of cache.keys()) {
+      if (cache.size < max) break;
+      cache.delete(key);
+      bump('evicted');
+    }
+  }
+  // Re-insert so insertion order tracks write recency rather than first sight.
+  cache.delete(subject);
+  cache.set(subject, entry);
+}
+
+/**
+ * What this subject may see. `nowMs` is injected so cache expiry is testable
+ * without sleeping.
+ */
+export async function grantsForSubject(
+  subject: string,
+  nowMs: number = Date.now(),
+  env: NodeJS.ProcessEnv = process.env
+): Promise<readonly EntitlementName[]> {
+  // The subject shape is enforced HERE, before anything is asked of OpenFGA.
+  // A differently-shaped identifier is not a question OpenFGA can answer wrong
+  // — it is a question no tuple can ever match, so the answer is a permanent,
+  // silent `false`. See ./subject.ts.
+  if (!isEntitlementSubject(subject)) {
+    bump('bad_subject');
+    return NO_GRANTS;
+  }
+
+  const hit = cache.get(subject);
+  if (hit !== undefined && nowMs < hit.expiresAt) {
+    bump('cache_hit');
+    return hit.grants;
+  }
+
+  // One Check per subject in flight. Without this, a cold cache under load
+  // sends OpenFGA one request per concurrent read for the SAME answer.
+  const pending = inflight.get(subject);
+  if (pending !== undefined) {
+    bump('coalesced');
+    return pending;
+  }
+
+  const run = (async (): Promise<readonly EntitlementName[]> => {
+    const { allowed, errored } = await check(subject, env);
+    const grants = allowed ? INVENTORY_GRANT : NO_GRANTS;
+    bump(errored ? 'error' : allowed ? 'allow' : 'deny');
+    const ttl = errored
+      ? num(env.ENTITLEMENT_GRANT_ERROR_TTL_MS, DEFAULT_ERROR_TTL_MS)
+      : num(env.ENTITLEMENT_GRANT_CACHE_TTL_MS, DEFAULT_CACHE_TTL_MS);
+    cacheSet(subject, { grants, expiresAt: nowMs + ttl }, nowMs, env);
+    return grants;
+  })();
+
+  inflight.set(subject, run);
+  try {
+    return await run;
+  } finally {
+    inflight.delete(subject);
+  }
+}
+
+/**
+ * The `fc-entitlements` header value for this subject, or `null` when there is
+ * nothing to send.
+ *
+ * THE WHOLE MODULE IN ONE CALL, and the only entry point a host application
+ * needs: check, then sign the outcome. Both halves already resolve every
+ * failure to "nothing", so this does too — and a caller that gets `null`
+ * attaches no header, which is what a denial looks like on the wire.
+ */
+export async function entitlementHeaderFor(
+  subject: string,
+  nowMs: number = Date.now(),
+  env: NodeJS.ProcessEnv = process.env
+): Promise<string | null> {
+  const ent = await grantsForSubject(subject, nowMs, env);
+  return mintEntitlementAssertion({ sub: subject, ent }, nowMs, env);
+}

@@ -19,7 +19,13 @@
     "migrate": "sh scripts/migrate.sh"
   },
   "dependencies": {
+    "@bufbuild/protobuf": "^2.15.0",
+    "@connectrpc/connect": "^2.2.0",
+    "@connectrpc/connect-fastify": "^2.2.0",
+    "@connectrpc/connect-node": "^2.2.0",
+    "@figurecollecting/fc-api-contract": "^0.1.0",
     "@figurecollecting/fc-shared": "^1.7.0",
+    "@figurecollecting/ingest-contract": "^0.5.0",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/context-async-hooks": "^2.11.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",
@@ -27,6 +33,7 @@
     "@opentelemetry/sdk-trace-base": "^2.11.0",
     "@opentelemetry/sdk-trace-node": "^2.11.0",
     "@opentelemetry/semantic-conventions": "^1.43.0",
+    "axios": "^1.20.0",
     "fastify": "^5.12.4",
     "jose": "^6.2.12",
     "pg": "^8.23.0"
