@@ -48,6 +48,33 @@ describe('platform/shared — the single fc-shared seam', () => {
     }
   });
 
+  it('EXTENDS the sensitive-key pattern locally for DPoP, which fc-shared does not cover', () => {
+    for (const key of ['dpop', 'dpop_nonce', 'DPoP-Nonce', 'http.request.header.dpop', 'nonce']) {
+      expect(shared.COORDINATOR_SENSITIVE_KEY_PATTERN.test(key)).toBe(true);
+    }
+    // and everything the shared baseline already matched still matches
+    for (const key of ['password', 'access_token', 'authorization', 'cookie', 'client_secret']) {
+      expect(shared.COORDINATOR_SENSITIVE_KEY_PATTERN.test(key)).toBe(true);
+    }
+    // ...without swallowing the DPoP METRICS an operator needs to read
+    for (const key of ['jti', 'device_id', 'user', 'htu', 'latency_ms', 'app.dpop.attempts', 'nonce_rotations']) {
+      expect(shared.COORDINATOR_SENSITIVE_KEY_PATTERN.test(key)).toBe(false);
+    }
+  });
+
+  it('redacts an OPAQUE dpop_nonce that no VALUE pattern can catch', () => {
+    // The nonce is not a JWS, so /eyJ[A-Za-z0-9._-]{10,}/ does not see it: the
+    // KEY pattern is the only thing standing between it and a log line.
+    const nonce = 'q8Zr3kVn1xMpLb7TfGhQaWcEdRyUiOpAsDfGhJkLzXcVbNm0';
+
+    expect(shared.redactAttributes({ dpop_nonce: nonce }, shared.COORDINATOR_REDACT_OPTIONS)).toEqual({
+      dpop_nonce: '[REDACTED]',
+    });
+
+    // Proof the local extension is load-bearing: fc-shared's default leaves it.
+    expect(shared.redactAttributes({ dpop_nonce: nonce })).toEqual({ dpop_nonce: nonce });
+  });
+
   it('is the ONLY non-test module in src/ that names the fc-shared package', () => {
     const offenders = sourceFiles(SRC)
       .filter((file) => file !== SEAM)

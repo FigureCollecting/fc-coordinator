@@ -11,7 +11,12 @@
 // Shaped as a pino-compatible logger so it can be handed to Fastify as
 // `loggerInstance`: Fastify requires fatal/error/warn/info/debug/trace/child.
 // ============================================================================
-import { getActiveTraceIds, redactValue, sanitizeLogValue } from './shared.js';
+import {
+  COORDINATOR_REDACT_OPTIONS,
+  getActiveTraceIds,
+  redactValue,
+  sanitizeLogValue,
+} from './shared.js';
 
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal' | 'silent';
 
@@ -100,7 +105,10 @@ function safeFields(fields: Record<string, unknown>): Record<string, unknown> {
     reduced[key] = serializer ? serializer(fields[key]) : fields[key];
   }
 
-  const redacted = redactValue(reduced, { maxDepth: MAX_FIELD_DEPTH }) as Record<string, unknown>;
+  const redacted = redactValue(reduced, {
+    ...COORDINATOR_REDACT_OPTIONS,
+    maxDepth: MAX_FIELD_DEPTH,
+  }) as Record<string, unknown>;
   const out: Record<string, unknown> = {};
   for (const key of Object.keys(redacted)) {
     const value = redacted[key];

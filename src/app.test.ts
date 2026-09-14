@@ -20,22 +20,16 @@ afterEach(async () => {
 });
 
 describe('GET /healthz', () => {
-  it('returns 200 and reports db reachability plus otel state', async () => {
+  it('returns 200 and reports db and otel as a STATE, not as detail', async () => {
     app = buildApp({
       db: reachableDb,
-      dbTarget: 'pg-coord-rw.fc:5432/fccoord',
       telemetry: { registered: true, exporter: 'otlp', serviceName: 'fc-coordinator' },
       logLevel: 'silent',
     });
 
     const res = await app.inject({ method: 'GET', url: '/healthz' });
     expect(res.statusCode).toBe(200);
-
-    const body = res.json() as Record<string, unknown>;
-    expect(body['status']).toBe('ok');
-    expect(body['service']).toBe('fc-coordinator');
-    expect(body['db']).toMatchObject({ reachable: true, target: 'pg-coord-rw.fc:5432/fccoord' });
-    expect(body['otel']).toEqual({ registered: true, exporter: 'otlp' });
+    expect(res.json()).toEqual({ status: 'ok', db: 'ok', otel: 'registered' });
   });
 
   it('returns 503 and degraded status when the database is unreachable', async () => {
@@ -43,38 +37,47 @@ describe('GET /healthz', () => {
 
     const res = await app.inject({ method: 'GET', url: '/healthz' });
     expect(res.statusCode).toBe(503);
-
-    const body = res.json() as { status: string; db: Record<string, unknown> };
-    expect(body.status).toBe('degraded');
-    expect(body.db['reachable']).toBe(false);
-    expect(body.db['code']).toBe('ECONNREFUSED');
+    expect(res.json()).toEqual({ status: 'degraded', db: 'down', otel: 'missing' });
   });
 
-  it('never puts a credential or a driver message in the response body', async () => {
-    app = buildApp({ db: unreachableDb, dbTarget: 'pg:5432/fccoord', logLevel: 'silent' });
+  it('carries EXACTLY three keys — the endpoint is public and every extra one is disclosure', async () => {
+    // /healthz is the whole public allowlist: kubelet and the image HEALTHCHECK
+    // carry no credential, so anything the body says, it says to the internet
+    // the day this fronts a public edge. Earlier it reported host:port/dbname,
+    // the driver error code and a latency. None of that belongs to an
+    // unauthenticated caller; the target is logged once at startup instead.
+    app = buildApp({ db: reachableDb, logLevel: 'silent' });
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json() as Record<string, unknown>;
+
+    expect(Object.keys(body).sort()).toEqual(['db', 'otel', 'status']);
+  });
+
+  it('never leaks the host, the port, the database name, a driver code or a latency', async () => {
+    app = buildApp({ db: unreachableDb, logLevel: 'silent' });
     const res = await app.inject({ method: 'GET', url: '/healthz' });
 
-    expect(res.body).not.toContain(PASSWORD);
-    expect(res.body).not.toContain('ECONNREFUSED pg://');
-    expect(res.body).not.toContain('postgres://');
+    for (const leak of [PASSWORD, 'ECONNREFUSED', 'postgres://', 'pg:5432', 'fccoord', 'latency']) {
+      expect(res.body).not.toContain(leak);
+    }
+    expect(res.body).not.toMatch(/\d+\.\d+/);
   });
 
-  it('reports otel as unregistered when telemetry was never started', async () => {
+  it('reports otel as missing when telemetry was never started', async () => {
     app = buildApp({ db: reachableDb, logLevel: 'silent' });
-    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json() as Record<
-      string,
-      Record<string, unknown>
-    >;
-    expect(body['otel']).toEqual({ registered: false, exporter: 'none' });
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json() as Record<string, unknown>;
+    expect(body['otel']).toBe('missing');
   });
 
-  it('reports an unknown db target rather than inventing one', async () => {
-    app = buildApp({ db: reachableDb, logLevel: 'silent' });
-    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json() as Record<
-      string,
-      Record<string, unknown>
-    >;
-    expect(body['db']?.['target']).toBe('unknown');
+  it('reports otel as registered even when the exporter is a no-op', async () => {
+    app = buildApp({
+      db: reachableDb,
+      telemetry: { registered: true, exporter: 'noop', serviceName: 'fc-coordinator' },
+      logLevel: 'silent',
+    });
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json() as Record<string, unknown>;
+    // The exporter KIND is an operational detail; that a provider is registered
+    // at all is the health fact. The kind is visible in the startup log.
+    expect(body['otel']).toBe('registered');
   });
 });
 

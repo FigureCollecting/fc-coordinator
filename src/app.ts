@@ -8,17 +8,22 @@
 // health contract can be tested — including its failure branch — without a
 // database, a collector or a socket.
 //
-// OPEN FOR SLICE 1b — no log line from the RUNNING service carries a trace tag
-// yet. The logger is correct and stamps `trace=<id> span=<id>` whenever a span
-// is active (platform/logger.ts), and telemetry registers a real SDK, but
-// nothing here starts a span: inbound HTTP is not instrumented and the
-// traceparent Connect interceptors (§A.5 rule 3) arrive with the first Connect
-// hop. Until then every request is logged outside any span, so the tag is
-// correctly absent rather than zeroed. The close is an onRequest hook that
-// starts a server span from the incoming `traceparent`, registered right here.
+// CLOSED IN SLICE 1b (was N3): inbound HTTP IS instrumented now.
+// registerHttpTracing adds the onRequest hook that opens a server span from the
+// incoming `traceparent` and keeps it active for the rest of the lifecycle, so
+// every log line from a running request carries `trace=<id> span=<id>`.
+// /healthz is excluded: a liveness probe every second is noise, not a trace.
+// Still open: the traceparent Connect INTERCEPTORS (§A.5 rule 3), which arrive
+// with the first Connect hop.
+//
+// AUTH is optional here on purpose. buildApp({ auth }) registers the OIDC +
+// DPoP edge; omitting it yields the health-only app the slice-1a tests build,
+// so an auth misconfiguration cannot take /healthz down with it.
 // ============================================================================
 import Fastify, { type FastifyInstance } from 'fastify';
+import { registerAuth, type AuthPluginOptions } from './auth/plugin.js';
 import { probeDatabase, type QueryableDb } from './db/pool.js';
+import { registerHttpTracing } from './platform/http-trace.js';
 import { createStructuredLogger, type LogLevel, type LogSink } from './platform/logger.js';
 import type { TelemetryState } from './platform/telemetry.js';
 
@@ -26,19 +31,30 @@ export const SERVICE_NAME = 'fc-coordinator';
 
 export interface BuildAppOptions {
   db: QueryableDb;
-  /** host:port/database, already stripped of credentials (db/pool describeTarget). */
-  dbTarget?: string;
   telemetry?: TelemetryState;
   logLevel?: LogLevel;
   logSink?: LogSink;
+  /** Omit to build a health-only app: the edge is not registered at all. */
+  auth?: AuthPluginOptions;
 }
 
+/**
+ * THE PUBLIC HEALTH BODY, and it is deliberately this small.
+ *
+ * /healthz is the entire public allowlist — kubelet and the image HEALTHCHECK
+ * carry no credential, so it cannot be guarded. Everything it says, it says to
+ * whoever can reach the port. It previously reported host:port/dbname, the
+ * driver's error code and a probe latency; none of that is a caller's business
+ * and the first is a map of the estate. The database target is logged ONCE at
+ * startup instead, where an operator can still read it and a stranger cannot.
+ *
+ * Three keys, three states. A probe needs the status code; an operator needs to
+ * know WHICH subsystem is unhappy. Neither needs anything else.
+ */
 export interface HealthBody {
   status: 'ok' | 'degraded';
-  service: string;
-  version: string;
-  db: { reachable: boolean; latencyMs: number; target: string; code?: string };
-  otel: { registered: boolean; exporter: string };
+  db: 'ok' | 'down';
+  otel: 'registered' | 'missing';
 }
 
 export function buildApp(options: BuildAppOptions): FastifyInstance {
@@ -50,19 +66,19 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
     }),
   });
 
-  app.get('/healthz', async (_request, reply) => {
+  registerHttpTracing(app, { ignorePaths: ['/healthz'] });
+  if (options.auth !== undefined) registerAuth(app, options.auth);
+
+  // THE PUBLIC ALLOWLIST, in full. The auth hook is deny-by-default, so this
+  // is the only thing in the service that answers without credentials — and it
+  // has to, because kubelet and the image HEALTHCHECK carry none.
+  app.get('/healthz', { config: { auth: 'public' } }, async (_request, reply) => {
     const probe = await probeDatabase(options.db);
 
-    // Never a secret: the target is pre-stripped of userinfo and the database
-    // error is reported as a CODE, never as the driver's message.
     const body: HealthBody = {
       status: probe.reachable ? 'ok' : 'degraded',
-      service: SERVICE_NAME,
-      version: process.env['SERVICE_VERSION'] ?? 'unknown',
-      db: { ...probe, target: options.dbTarget ?? 'unknown' },
-      otel: options.telemetry
-        ? { registered: options.telemetry.registered, exporter: options.telemetry.exporter }
-        : { registered: false, exporter: 'none' },
+      db: probe.reachable ? 'ok' : 'down',
+      otel: options.telemetry?.registered === true ? 'registered' : 'missing',
     };
 
     return reply.code(probe.reachable ? 200 : 503).send(body);
