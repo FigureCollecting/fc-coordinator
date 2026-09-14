@@ -1,0 +1,21 @@
+{
+  // TODO(fc-shared 1.7.0): replace these compilerOptions with
+  //   "extends": "@figurecollecting/fc-shared/tsconfig.base.json"
+  // once 1.7.0 ships the toolchain baseline as a real file (§A.5). Until then
+  // the BOM is honoured by hand: TS 6, ESM, Node >=24.15, strict.
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts"]
+}

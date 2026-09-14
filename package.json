@@ -1,0 +1,43 @@
+{
+  "name": "fc-coordinator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "fc-mobile coordinator: OIDC + DPoP edge, entitlements, collections and sync on Postgres.",
+  "main": "dist/server.js",
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "migrate": "sh scripts/migrate.sh"
+  },
+  "dependencies": {
+    "@figurecollecting/fc-shared": "^1.6.0",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/context-async-hooks": "^2.11.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",
+    "@opentelemetry/resources": "^2.11.0",
+    "@opentelemetry/sdk-trace-base": "^2.11.0",
+    "@opentelemetry/sdk-trace-node": "^2.11.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0",
+    "fastify": "^5.12.4",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@testcontainers/postgresql": "^12.1.0",
+    "@types/node": "^26.4.0",
+    "@types/pg": "^8.23.1",
+    "@vitest/coverage-v8": "^4.1.11",
+    "testcontainers": "^12.1.0",
+    "tsx": "^4.23.13",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.11"
+  }
+}
