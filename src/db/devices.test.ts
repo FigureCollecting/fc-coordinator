@@ -202,6 +202,40 @@ describe('device queries', () => {
       expect(await findLiveDevice(pool, owner, 'thumb-1')).toBeDefined();
     });
 
+    it('revokes ONE device of a user with several, leaving the rest live', async () => {
+      // The scoping test above (another user's device) cannot see a revoke that
+      // drops `id` from its WHERE and keeps `user_id`: it would revoke the
+      // CALLER's own devices, and with one device per user that is
+      // indistinguishable from revoking the right one. Three devices on ONE
+      // user is the arrangement that tells the difference.
+      const userId = randomUUID();
+      await ensureAppUser(pool, userId);
+      const phone = await enrollDevice(pool, { userId, jkt: 'thumb-phone', jwk: JWK });
+      const tablet = await enrollDevice(pool, { userId, jkt: 'thumb-tablet', jwk: JWK });
+      const laptop = await enrollDevice(pool, { userId, jkt: 'thumb-laptop', jwk: JWK });
+
+      expect(await revokeDevice(pool, { userId, deviceId: phone.deviceId })).toMatchObject({
+        deviceId: phone.deviceId,
+        changed: true,
+      });
+
+      expect(await findLiveDevice(pool, userId, 'thumb-phone')).toBeUndefined();
+      expect(await findLiveDevice(pool, userId, 'thumb-tablet')).toEqual({
+        deviceId: tablet.deviceId,
+        jkt: 'thumb-tablet',
+      });
+      expect(await findLiveDevice(pool, userId, 'thumb-laptop')).toEqual({
+        deviceId: laptop.deviceId,
+        jkt: 'thumb-laptop',
+      });
+
+      const { rows } = await pool.query(
+        'SELECT count(*) FILTER (WHERE revoked_at IS NOT NULL)::int AS revoked, count(*)::int AS total FROM device WHERE user_id = $1',
+        [userId],
+      );
+      expect(rows[0]).toEqual({ revoked: 1, total: 3 });
+    });
+
     it('returns undefined for a device id that does not exist', async () => {
       const userId = randomUUID();
       await ensureAppUser(pool, userId);
