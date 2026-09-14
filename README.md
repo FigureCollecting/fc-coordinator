@@ -268,15 +268,38 @@ to prevent.
 | unknown seed | `200` with `heads: []` — not an error |
 | spine unconfigured or unreachable | `UNAVAILABLE` |
 
+### Guarded, and how that is known
+
+Compare declares **no `config.auth`**, so the edge's deny-by-default registry
+classifies it `guarded`. Absence is the protection — there is no per-route opt-in
+to forget. `connect-fastify` registers the RPC as ONE route entry covering nine
+methods (`GET HEAD TRACE DELETE OPTIONS PATCH PUT QUERY POST`), and
+`test/connect/guarded.test.ts` asserts all nine reject an uncredentialed call and
+that neither the spine nor OpenFGA is reached on the way to the refusal. A guard
+that only covered POST would leave eight verbs open on an authenticated route
+while a URL-only enumeration test still passed.
+
+The same file drives the whole path: enrol a device, then a Connect unary POST
+carrying an access token and a DPoP proof, and asserts that **the uuid the proof
+was verified for is the uuid OpenFGA was asked about**. That is the first
+assertion in which the identity a caller proved and the identity the spine is
+told about are the same value, established by two independently built modules.
+
 ### The identity seam
 
-The handler needs one thing from authentication: the caller's Authentik uuid. It
-takes an **injected resolver**, defaulting to reading the `callerIdentity`
-decorator the OIDC + DPoP plugin sets on the Fastify request
-(`CALLER_IDENTITY_DECORATOR` in `src/connect/identity.ts`). A resolver that finds
-nothing returns `null`, and `null` means no entitlement — a successful, redacted
-Compare. Rejecting an unauthenticated caller belongs to the plugin, upstream; if
-both layers rejected, one rule would have two owners.
+The handler needs one thing from authentication: the caller's Authentik uuid.
+`CALLER_IDENTITY_DECORATOR` and `CallerIdentity` are declared once in
+`src/identity.ts` and imported by both the edge and this module — they used to be
+a string literal on each branch, and a mismatch would have been silent and
+safe-looking (every caller reads as unauthenticated, every Compare redacted, both
+suites green).
+
+`src/connect/identity.ts` keeps the part that is genuinely this side's: turning a
+Fastify request into a Connect handler-context value, and an **injected resolver**
+so a test can supply an identity without standing up the edge. A resolver that
+finds nothing returns `null`, and `null` means no entitlement — a successful,
+redacted Compare. Rejecting an unauthenticated caller belongs to the edge,
+upstream; if both layers rejected, one rule would have two owners.
 
 ### The issuer pin — a two-sided deploy, and a silent failure if you get it wrong
 

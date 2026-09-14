@@ -174,6 +174,11 @@ describe('the health route is unaffected by the Connect surface', () => {
 
     const res = await (app as FastifyInstance).inject({ method: 'GET', url: '/healthz' });
     expect(res.statusCode).toBe(200);
-    expect(res.json().service).toBe('fc-coordinator');
+    // The slice-1b health body is three keys and no more: a probe needs the
+    // status code, an operator needs to know WHICH subsystem is unhappy, and
+    // /healthz is the one unauthenticated route so it tells a stranger nothing
+    // else. It is asserted WHOLE here, so mounting Connect cannot quietly widen
+    // the one body the estate serves without credentials.
+    expect(res.json()).toEqual({ status: 'ok', db: 'ok', otel: 'missing' });
   });
 });

@@ -45,11 +45,23 @@ export interface BuildAppOptions {
    * which is what the migration Job and the unit tests for the health contract
    * want. See src/connect/register.ts.
    *
-   * REGISTERED LAST, AND THAT IS LOAD-BEARING. Fastify binds a route's hooks
-   * when the route is added, so the Connect routes must be registered AFTER
-   * registerAuth or they would never see the deny-by-default onRequest hook.
-   * Compare declares no `config.auth`, so it is `guarded` — the absence is the
-   * protection, which is the whole point of having no opt-in.
+   * Compare declares no `config.auth`, so the edge's deny-by-default registry
+   * classifies it `guarded` — the absence IS the protection, which is the whole
+   * point of having no opt-in.
+   *
+   * ON ORDERING, stated precisely because the obvious claim is WRONG. The auth
+   * plugin's rule is that routes must be registered after registerAuth, since
+   * Fastify binds a route's hooks when the route is added. The Connect surface
+   * turns out to be immune to that trap: registerConnect goes through
+   * `app.register()`, which Fastify DEFERS until ready(), so its routes are
+   * bound after the hook whichever order these two calls appear in. Measured,
+   * not assumed — moving this call above registerAuth leaves all nine methods
+   * still answering 401.
+   *
+   * It stays here anyway. Relying on deferral is relying on an implementation
+   * detail of a third-party plugin, and a future switch to registering these
+   * routes synchronously would lose the guard silently. The thing that actually
+   * protects this is test/connect/guarded.test.ts, which asks the socket.
    */
   compare?: ConnectOptions;
 }
