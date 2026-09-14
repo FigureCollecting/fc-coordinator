@@ -24,6 +24,11 @@ export default defineConfig({
         'src/server.ts',
       ],
       thresholds: {
+        // PER FILE, not a repo-wide average. The estate standard is 85% on
+        // AFFECTED code; a global threshold lets an entirely untested file ship
+        // behind well-covered neighbours, and hands out more slack the bigger
+        // the repo gets. test/coverage-gate.test.ts proves this bites.
+        perFile: true,
         lines: 85,
         branches: 85,
         functions: 85,
