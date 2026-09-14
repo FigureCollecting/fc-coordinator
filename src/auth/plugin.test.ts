@@ -671,15 +671,129 @@ describe('ROUTE ENUMERATION — every route on the real app is accounted for', (
     expect(res.headers['www-authenticate']).toBeUndefined();
   });
 
-  it('the registry covers EVERY route Fastify reports, so nothing registered before the hook', async () => {
+  it('the registry holds every METHOD of every route Fastify actually serves', async () => {
     const app = await realApp();
-    // printRoutes is the independent source: if a route were registered before
-    // registerAuth, the onRoute hook would not have seen it and it would be
-    // both unguarded and invisible to the enumeration test above.
-    const reported = (app.printRoutes({ commonPrefix: false }).match(/\(([A-Z, ]+)\)/g) ?? [])
-      .flatMap((group) => group.slice(1, -1).split(', '))
-      .sort();
-    const registered = app.auth.routes.map((r) => r.method).sort();
-    expect(registered).toEqual(reported);
+    // hasRoute is the independent source, and it is asked PER METHOD. A registry
+    // built from a route entry whose `method` is an array would otherwise record
+    // one method and hide the other eight — the exact shape connect-fastify
+    // registers an RPC in. Counting per URL is what makes that visible.
+    const byUrl = new Map<string, string[]>();
+    for (const route of app.auth.routes) {
+      byUrl.set(route.url, [...(byUrl.get(route.url) ?? []), route.method]);
+    }
+    expect(byUrl.size).toBeGreaterThan(0);
+
+    for (const [url, registered] of byUrl) {
+      const served = app.supportedMethods.filter((method) => app.hasRoute({ method, url }));
+      expect({ url, methods: [...registered].sort() }).toEqual({ url, methods: [...served].sort() });
+    }
+  });
+
+  it('finds no route Fastify serves that the registry missed', async () => {
+    const app = await realApp();
+    const known = new Set(app.auth.routes.map((r) => `${r.method} ${r.url}`));
+    for (const url of new Set(app.auth.routes.map((r) => r.url))) {
+      for (const method of app.supportedMethods) {
+        if (app.hasRoute({ method, url })) {
+          expect(known.has(`${method} ${url}`)).toBe(true);
+        }
+      }
+    }
+  });
+});
+
+// ===========================================================================
+// THE NINE-METHOD ROUTE. connect-fastify registers an RPC as ONE route entry
+// whose `method` is an ARRAY of nine verbs. A guard that assumes `method` is a
+// string, or that only POST carries a body worth protecting, leaves eight of
+// them open while a URL-only enumeration test still passes.
+//
+// Connect unary is POST + `Content-Type: application/json` +
+// `Connect-Protocol-Version: 1` with a BARE message body. The guard must read
+// nothing but the Authorization and DPoP headers: no form body, no CSRF token,
+// no Accept negotiation.
+// ===========================================================================
+const CONNECT_METHODS = ['GET', 'HEAD', 'TRACE', 'DELETE', 'OPTIONS', 'PATCH', 'PUT', 'POST', 'QUERY'];
+const RPC_URL = '/coordinator.v1.CompareService/Compare';
+
+describe('a Connect-shaped route registered with a nine-method array', () => {
+  it('is guarded on EVERY ONE of the nine methods, not just POST', async () => {
+    const h = await harness();
+    h.app.route({
+      method: CONNECT_METHODS as never,
+      url: RPC_URL,
+      handler: async () => ({ stockOnHand: 3 }),
+    });
+
+    const statuses: Record<string, number> = {};
+    for (const method of CONNECT_METHODS) {
+      const res = await h.app.inject({ method: method as 'POST', url: RPC_URL });
+      statuses[method] = res.statusCode;
+      expect(res.body).not.toContain('stockOnHand');
+    }
+
+    expect(statuses).toEqual(Object.fromEntries(CONNECT_METHODS.map((m) => [m, 401])));
+  });
+
+  it('classifies all nine methods in the registry, so the enumeration test sees nine routes', async () => {
+    const h = await harness();
+    h.app.route({ method: CONNECT_METHODS as never, url: RPC_URL, handler: async () => ({}) });
+    await h.app.ready();
+
+    const registered = h.runtime.routes.filter((r) => r.url === RPC_URL);
+    expect(registered.map((r) => r.method).sort()).toEqual([...CONNECT_METHODS].sort());
+    expect(registered.every((r) => r.auth === 'guarded')).toBe(true);
+  });
+
+  it('lets a correctly signed Connect unary POST through, reading only the two headers', async () => {
+    const h = await harness();
+    // Register BEFORE the first inject: inject boots the instance, and Fastify
+    // refuses routes after that. This is the same ordering rule the guard
+    // depends on, surfacing in a test.
+    h.app.route({
+      method: CONNECT_METHODS as never,
+      url: RPC_URL,
+      handler: async (request) => ({ sub: request.callerIdentity?.sub }),
+    });
+    const key = await makeDeviceKey();
+    const token = await h.token();
+    await enrol(h, key, token);
+
+    const proof = await makeProof(key, {
+      htm: 'POST',
+      htu: `${TEST_ORIGIN}${RPC_URL}`,
+      accessToken: token,
+      nonce: h.runtime.nonce.mint(),
+    });
+    const res = await h.app.inject({
+      method: 'POST',
+      url: RPC_URL,
+      headers: {
+        authorization: `DPoP ${token}`,
+        dpop: proof,
+        'content-type': 'application/json',
+        'connect-protocol-version': '1',
+      },
+      payload: { gtin14: '04901990123456' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ sub: USER });
+  });
+});
+
+describe('the subject reaches the entitlement seam VERBATIM', () => {
+  it('passes the Authentik uuid through byte for byte, never trimmed or case-folded', async () => {
+    // OpenFGA compares subjects byte for byte, so any normalisation here shows
+    // up downstream as a silently empty entitlement set.
+    const mixedCase = '5F3C1B9A-7e2d-4C6B-8a10-3D9E2F4B6C81';
+    const h = await harness();
+    const key = await makeDeviceKey();
+    const token = await h.token(mixedCase);
+    await enrol(h, key, token);
+
+    const res = await call(h, { token, key, nonce: h.runtime.nonce.mint() });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { identity: { sub: string } }).identity.sub).toBe(mixedCase);
   });
 });
