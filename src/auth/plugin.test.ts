@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { registerAuth, type AuthRuntime, type DeviceStore } from './plugin.js';
+import { buildApp } from '../app.js';
 import { resolveAuthConfig, type AuthConfig } from './config.js';
 import { createAccessTokenVerifier } from './oidc.js';
 import type { AppUserState, EnrolledDevice, LiveDevice, RevokedDevice } from '../db/devices.js';
@@ -109,8 +110,9 @@ async function harness(
       algorithms: config.oidcAlgorithms,
     }),
   });
-  app.get('/guarded', { preHandler: app.dpopGuard }, async (request) => ({ identity: request.identity }));
-  await app.ready();
+  // NOT readied here: deny-by-default means tests add routes to prove they are
+  // protected without asking, and inject() boots the instance on first use.
+  app.get('/guarded', async (request) => ({ identity: request.callerIdentity }));
   open.push(app);
 
   return {
@@ -181,8 +183,8 @@ describe('acceptance — DPoP edge', () => {
   it('HAPPY PATH: a bound device with a valid nonce is let through and carries an identity', async () => {
     const res = await call(h, { token, key, nonce: h.runtime.nonce.mint() });
     expect(res.statusCode).toBe(200);
-    expect((res.json() as { identity: { userId: string; jkt: string } }).identity).toMatchObject({
-      userId: USER,
+    expect((res.json() as { identity: { sub: string; jkt: string } }).identity).toMatchObject({
+      sub: USER,
       jkt: key.jkt,
     });
   });
@@ -561,5 +563,123 @@ describe('GET /auth/session', () => {
     const res = await call(h, { path: '/auth/session', token, key, nonce: h.runtime.nonce.mint() });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ userId: USER, deviceId, jkt: key.jkt });
+  });
+});
+
+// ===========================================================================
+// DENY BY DEFAULT (challenger B2). A route that forgets to ask for protection
+// must be protected anyway. The enumeration test is the part that keeps this
+// true as the Connect surface lands beside it.
+// ===========================================================================
+describe('the edge is deny-by-default', () => {
+  it('protects a route that asked for NOTHING', async () => {
+    const h = await harness();
+    h.app.get('/forgot-to-guard', async () => ({ secret: 'stockOnHand=3' }));
+    await h.app.ready();
+
+    const res = await h.app.inject({ method: 'GET', url: '/forgot-to-guard' });
+    expect(res.statusCode).toBe(401);
+    expect(res.body).not.toContain('stockOnHand');
+  });
+
+  it('protects a route registered AFTER the auth wiring, with any method', async () => {
+    const h = await harness();
+    h.app.post('/late/:id', async () => ({ ok: true }));
+    h.app.delete('/late/:id', async () => ({ ok: true }));
+    await h.app.ready();
+
+    expect((await h.app.inject({ method: 'POST', url: '/late/1' })).statusCode).toBe(401);
+    expect((await h.app.inject({ method: 'DELETE', url: '/late/1' })).statusCode).toBe(401);
+  });
+
+  it('lets a route opt OUT explicitly, and only explicitly', async () => {
+    const h = await harness();
+    h.app.get('/open', { config: { auth: 'public' } }, async () => ({ ok: true }));
+    await h.app.ready();
+
+    expect((await h.app.inject({ method: 'GET', url: '/open' })).statusCode).toBe(200);
+  });
+
+  it('answers an unknown path with 401, not 404 — an unauthenticated caller gets no path oracle', async () => {
+    const h = await harness();
+    const res = await h.app.inject({ method: 'GET', url: '/does-not-exist' });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('records every registered route, with the protection class that applies to it', async () => {
+    const h = await harness();
+    await h.app.ready();
+    const urls = h.runtime.routes.map((r) => `${r.method} ${r.url} ${r.auth}`).sort();
+    expect(urls).toContain('POST /auth/devices enrolment');
+    expect(urls).toContain('GET /auth/session guarded');
+    expect(urls).toContain('POST /auth/devices/:deviceId/revoke guarded');
+  });
+});
+
+describe('ROUTE ENUMERATION — every route on the real app is accounted for', () => {
+  const PUBLIC = new Set(['GET /healthz', 'HEAD /healthz']);
+
+  async function realApp() {
+    const issuer = await makeIssuer();
+    const store = memoryStore();
+    const config = resolveAuthConfig({
+      OIDC_ISSUER: issuer.issuer,
+      OIDC_AUDIENCE: issuer.audience,
+      OIDC_JWKS_URI: 'https://auth.test.invalid/jwks',
+      COORDINATOR_PUBLIC_ORIGIN: TEST_ORIGIN,
+    });
+    const app = buildApp({
+      db: { query: async () => ({ rows: [] }) },
+      logLevel: 'silent',
+      auth: {
+        config,
+        devices: store.store,
+        verifyAccessToken: createAccessTokenVerifier({
+          jwks: issuer.jwks,
+          issuer: issuer.issuer,
+          audience: issuer.audience,
+          algorithms: config.oidcAlgorithms,
+        }),
+      },
+    });
+    await app.ready();
+    open.push(app);
+    return app;
+  }
+
+  it('rejects an unauthenticated request to EVERY route that is not on the public allowlist', async () => {
+    const app = await realApp();
+    const routes = app.auth.routes.filter((r) => !PUBLIC.has(`${r.method} ${r.url}`));
+    expect(routes.length).toBeGreaterThan(0);
+
+    for (const route of routes) {
+      const url = route.url.replace(/:[A-Za-z]+/g, '00000000-0000-4000-8000-000000000000');
+      const res = await app.inject({ method: route.method as 'GET', url });
+      expect({ route: `${route.method} ${route.url}`, status: res.statusCode }).toEqual({
+        route: `${route.method} ${route.url}`,
+        status: 401,
+      });
+    }
+  });
+
+  it('serves the public allowlist without credentials', async () => {
+    const app = await realApp();
+    const res = await app.inject({ method: 'GET', url: '/healthz' });
+    // 200 because the injected db answers. The point is that it answered AT ALL
+    // with no Authorization header and no proof.
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['www-authenticate']).toBeUndefined();
+  });
+
+  it('the registry covers EVERY route Fastify reports, so nothing registered before the hook', async () => {
+    const app = await realApp();
+    // printRoutes is the independent source: if a route were registered before
+    // registerAuth, the onRoute hook would not have seen it and it would be
+    // both unguarded and invisible to the enumeration test above.
+    const reported = (app.printRoutes({ commonPrefix: false }).match(/\(([A-Z, ]+)\)/g) ?? [])
+      .flatMap((group) => group.slice(1, -1).split(', '))
+      .sort();
+    const registered = app.auth.routes.map((r) => r.method).sort();
+    expect(registered).toEqual(reported);
   });
 });

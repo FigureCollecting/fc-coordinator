@@ -60,7 +60,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
   registerHttpTracing(app, { ignorePaths: ['/healthz'] });
   if (options.auth !== undefined) registerAuth(app, options.auth);
 
-  app.get('/healthz', async (_request, reply) => {
+  // THE PUBLIC ALLOWLIST, in full. The auth hook is deny-by-default, so this
+  // is the only thing in the service that answers without credentials — and it
+  // has to, because kubelet and the image HEALTHCHECK carry none.
+  app.get('/healthz', { config: { auth: 'public' } }, async (_request, reply) => {
     const probe = await probeDatabase(options.db);
 
     // Never a secret: the target is pre-stripped of userinfo and the database

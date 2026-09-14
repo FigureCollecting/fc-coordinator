@@ -12,60 +12,56 @@
 // NEW row. Ending one device touches neither the user's credentials (which live
 // in Authentik) nor any other device.
 //
+// NO ROUTE HERE ATTACHES A GUARD. Authentication happens in the global hook in
+// plugin.ts, which is deny-by-default; a route only ever declares how it is
+// WEAKENED. `/auth/devices` declares `enrolment` because its key cannot be in
+// the device table yet. Everything else says nothing and is fully guarded.
+//
 // Input validation is written out rather than left to a JSON schema: these
 // three routes take two scalars between them, and an explicit 400 is easier to
 // read than a schema whose failure mode is a 500 on an absent body.
 // ============================================================================
-import type { FastifyInstance, FastifyReply, FastifyRequest, preHandlerHookHandler } from 'fastify';
-import type { DpopOutcome } from './dpop.js';
+import type { FastifyInstance } from 'fastify';
 import type { AuthRuntime } from './plugin.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LABEL_LENGTH = 100;
 
-export type Authenticated = { userId: string; proof: DpopOutcome & { ok: true } } | undefined;
-
 export interface AuthRoutesOptions {
   runtime: AuthRuntime;
-  dpopGuard: preHandlerHookHandler;
-  /** The enrolment chain: same seven steps, self-asserted binding. */
-  enrolmentAuthenticate: (request: FastifyRequest, reply: FastifyReply) => Promise<Authenticated>;
 }
 
 export function registerAuthRoutes(app: FastifyInstance, options: AuthRoutesOptions): void {
   const { runtime } = options;
 
-  app.post('/auth/devices', async (request, reply) => {
+  app.post('/auth/devices', { config: { auth: 'enrolment' } }, async (request, reply) => {
+    const caller = request.callerIdentity!;
+    const proof = request.dpopProof!;
+
     const label = (request.body as { label?: unknown } | null | undefined)?.label;
     if (label !== undefined && (typeof label !== 'string' || label.length > MAX_LABEL_LENGTH)) {
       return reply.code(400).send({ error: 'invalid_label' });
     }
 
-    const authenticated = await options.enrolmentAuthenticate(request, reply);
-    if (authenticated === undefined) return reply;
-
-    const state = await runtime.devices.ensureAppUser(authenticated.userId);
+    const state = await runtime.devices.ensureAppUser(caller.sub);
     if (state === 'deleted') {
       request.log.warn({ auth_outcome: 'user_soft_deleted' }, 'refused enrolment');
       return reply.code(403).send({ error: 'account_closed' });
     }
 
     const device = await runtime.devices.enroll({
-      userId: authenticated.userId,
-      jkt: authenticated.proof.jkt,
-      jwk: authenticated.proof.jwk as unknown as Record<string, unknown>,
+      userId: caller.sub,
+      jkt: proof.jkt,
+      jwk: proof.jwk as Record<string, unknown>,
       label: typeof label === 'string' ? label : undefined,
     });
 
     // A negative cache entry may exist for a key that was tried before it was
     // enrolled; drop it so the very next request with this key is bound.
-    runtime.bindings.invalidate(authenticated.userId, device.jkt);
+    runtime.bindings.invalidate(caller.sub, device.jkt);
 
-    request.identity = {
-      userId: authenticated.userId,
-      deviceId: device.deviceId,
-      jkt: device.jkt,
-    };
+    // The one place deviceId goes from null to known.
+    caller.deviceId = device.deviceId;
 
     return reply.code(device.created ? 201 : 200).send({
       deviceId: device.deviceId,
@@ -77,13 +73,12 @@ export function registerAuthRoutes(app: FastifyInstance, options: AuthRoutesOpti
 
   app.post<{ Params: { deviceId: string } }>(
     '/auth/devices/:deviceId/revoke',
-    { preHandler: options.dpopGuard },
     async (request, reply) => {
-      const identity = request.identity!;
+      const caller = request.callerIdentity!;
       const { deviceId } = request.params;
       if (!UUID.test(deviceId)) return reply.code(400).send({ error: 'invalid_device_id' });
 
-      const revoked = await runtime.devices.revoke({ userId: identity.userId, deviceId });
+      const revoked = await runtime.devices.revoke({ userId: caller.sub, deviceId });
       if (revoked === undefined) {
         // Not this user's device, or no such device. The two are reported
         // identically on purpose: a 404 that distinguishes them is a device-id
@@ -91,7 +86,7 @@ export function registerAuthRoutes(app: FastifyInstance, options: AuthRoutesOpti
         return reply.code(404).send({ error: 'device_not_found' });
       }
 
-      runtime.bindings.invalidate(identity.userId, revoked.jkt);
+      runtime.bindings.invalidate(caller.sub, revoked.jkt);
       return reply.code(200).send({
         deviceId: revoked.deviceId,
         revokedAt: revoked.revokedAt,
@@ -100,8 +95,8 @@ export function registerAuthRoutes(app: FastifyInstance, options: AuthRoutesOpti
     },
   );
 
-  app.get('/auth/session', { preHandler: options.dpopGuard }, async (request) => {
-    const identity = request.identity!;
-    return { userId: identity.userId, deviceId: identity.deviceId, jkt: identity.jkt };
+  app.get('/auth/session', async (request) => {
+    const caller = request.callerIdentity!;
+    return { userId: caller.sub, deviceId: caller.deviceId, jkt: caller.jkt };
   });
 }

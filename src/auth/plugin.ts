@@ -2,10 +2,26 @@
 // The DPoP edge, wired onto Fastify (plan §A.4, §C slice 1 items 4-5).
 //
 // Deliberately NOT a Fastify plugin in the encapsulated sense: it is a plain
-// function called on the ROOT instance, so `app.dpopGuard` is visible to every
-// route registered anywhere — including the Connect routes that land beside it
-// — without pulling in fastify-plugin. Register it once in buildApp; attach the
-// guard per route with `{ preHandler: app.dpopGuard }`.
+// function called on the ROOT instance, so its hook reaches every route
+// registered anywhere after it — including the Connect surface that lands
+// beside it — without pulling in fastify-plugin.
+//
+// DENY BY DEFAULT. There is no per-route opt-IN. One global `onRequest` hook
+// authenticates EVERY request, and a route escapes only by declaring
+// `config: { auth: 'public' }` in its own registration. An earlier version of
+// this file exported an `app.dpopGuard` preHandler that routes attached
+// themselves; a challenger pointed out the obvious consequence — a route that
+// forgets is completely open, nothing fails, and the Connect surface from the
+// parallel branch never mentioned the guard at all, so Compare would have
+// shipped unauthenticated. Opt-in protection is protection that depends on
+// everyone remembering.
+//
+// ORDERING IS THE ONE RULE: call registerAuth BEFORE any route or plugin is
+// registered. Fastify binds a route's hooks when the route is added, so a route
+// registered first would never see this hook. `runtime.routes` records every
+// route the hook actually covers, and a test cross-checks that registry against
+// `app.printRoutes()` — which is what turns the ordering rule from a convention
+// into something that fails loudly.
 //
 // EVERY GUARDED RESPONSE CARRIES A FRESH `DPoP-Nonce`, success or failure. That
 // is what lets a steady client never see a 401: it refreshes the nonce from
@@ -17,7 +33,8 @@
 // token, and `sub`. The outcome REASON is logged, because an operator needs to
 // tell a clock-skew problem from an attack, and a reason names no secret.
 // ============================================================================
-import type { FastifyInstance, FastifyReply, FastifyRequest, preHandlerHookHandler } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest, onRequestHookHandler } from 'fastify';
+import { CALLER_IDENTITY_DECORATOR, type AuthenticatedCaller } from '../identity.js';
 import { verifyDpopProof, type BindingOutcome, type DpopOutcome } from './dpop.js';
 import { createBindingResolver, type BindingResolver } from './binding.js';
 import { createNonceEpoch, type NonceEpoch } from './nonce.js';
@@ -38,12 +55,20 @@ import {
   type SqlClient,
 } from '../db/devices.js';
 
-/** The verified caller. Set by the guard; never assembled from request input. */
-export interface CoordinatorIdentity {
-  /** The Authentik uuid. Put it in no log line and on no span. */
-  userId: string;
-  deviceId: string;
-  jkt: string;
+/**
+ * How a route is protected. ABSENT means `guarded` — that is the whole point.
+ *
+ *   public     no credentials at all (/healthz, and nothing else so far)
+ *   enrolment  OIDC + the full DPoP chain, but the key vouches for ITSELF
+ *              because it is not in the device table yet
+ *   guarded    OIDC + the full DPoP chain against an ENROLLED, live device
+ */
+export type RouteAuthMode = 'public' | 'enrolment' | 'guarded';
+
+export interface RegisteredRoute {
+  method: string;
+  url: string;
+  auth: RouteAuthMode;
 }
 
 /** The device table as a PORT, so the edge is testable without a container. */
@@ -78,15 +103,24 @@ export interface AuthRuntime {
   config: AuthConfig;
   devices: DeviceStore;
   verifyAccessToken: AccessTokenVerifier;
+  /** Every route the enforcement hook covers. The protected-set registry. */
+  routes: RegisteredRoute[];
 }
 
 declare module 'fastify' {
+  interface FastifyContextConfig {
+    /** Omit for `guarded`. Only an explicit value can weaken a route. */
+    auth?: RouteAuthMode;
+  }
   interface FastifyRequest {
-    identity: CoordinatorIdentity | null;
+    /**
+     * The verified proof, for the enrolment route alone: it needs the PUBLIC
+     * JWK the signature just proved possession of, which must never be re-read
+     * from an unauthenticated request body.
+     */
+    dpopProof: { jkt: string; jwk: unknown } | null;
   }
   interface FastifyInstance {
-    /** Full chain: OIDC, then the seven DPoP steps against an ENROLLED device. */
-    dpopGuard: preHandlerHookHandler;
     auth: AuthRuntime;
   }
 }
@@ -134,10 +168,27 @@ export function registerAuth(app: FastifyInstance, options: AuthPluginOptions): 
     config,
     devices: options.devices,
     verifyAccessToken: options.verifyAccessToken,
+    routes: [],
   };
 
-  app.decorateRequest('identity', null);
+  app.decorateRequest(CALLER_IDENTITY_DECORATOR, null);
+  app.decorateRequest('dpopProof', null);
   app.decorate('auth', runtime);
+
+  // The protected-set registry. onRoute fires for every route added AFTER this
+  // point — which is exactly the set the enforcement hook covers — so a route
+  // missing from here is a route registered too early, and the enumeration test
+  // compares this against app.printRoutes() to say so.
+  app.addHook('onRoute', (route) => {
+    const methods = Array.isArray(route.method) ? route.method : [route.method];
+    for (const method of methods) {
+      runtime.routes.push({
+        method,
+        url: route.url,
+        auth: route.config?.auth ?? 'guarded',
+      });
+    }
+  });
 
   /**
    * Steps shared by the guard and by enrolment. Returns the verified subject
@@ -193,36 +244,43 @@ export function registerAuth(app: FastifyInstance, options: AuthPluginOptions): 
     return { userId: verified.token.sub, proof: outcome };
   };
 
-  const dpopGuard: preHandlerHookHandler = async (request, reply) => {
-    // cnf.jkt is PREFERRED when a future Authentik issues it, and ignored
-    // (path B) when it is absent — binding.ts owns that choice.
-    const result = await authenticate(request, reply, (token) =>
-      runtime.bindings.for(token.sub, token.cnfJkt),
+  /**
+   * The single enforcement point. Runs on EVERY request, including one that
+   * matched no route at all — an unknown path is answered 401 rather than 404
+   * so an unauthenticated caller cannot map the surface.
+   */
+  const enforce: onRequestHookHandler = async (request, reply) => {
+    const mode: RouteAuthMode = request.routeOptions.config?.auth ?? 'guarded';
+    if (mode === 'public') return undefined;
+
+    const result = await authenticate(
+      request,
+      reply,
+      mode === 'enrolment'
+        ? // The bootstrap: the key being enrolled is not in the device table
+          // yet, so it vouches for itself. Every OTHER step of the chain still
+          // applies, so a leaked access token alone cannot enrol a key.
+          () => async () => ({ bound: true, deviceId: SELF_ASSERTED })
+        : // cnf.jkt is PREFERRED when a future Authentik issues it, and ignored
+          // (path B) when absent — binding.ts owns that choice.
+          (token) => runtime.bindings.for(token.sub, token.cnfJkt),
     );
     if (result === undefined) return reply;
 
-    request.identity = {
-      userId: result.userId,
-      deviceId: result.proof.deviceId,
+    const caller: AuthenticatedCaller = {
+      sub: result.userId,
+      // Known only after the row exists; the enrolment handler fills it in.
+      deviceId: mode === 'enrolment' ? null : result.proof.deviceId,
       jkt: result.proof.jkt,
     };
+    request.callerIdentity = caller;
+    request.dpopProof = { jkt: result.proof.jkt, jwk: result.proof.jwk };
     return undefined;
   };
 
-  app.decorate('dpopGuard', dpopGuard);
+  app.addHook('onRequest', enforce);
 
-  registerAuthRoutes(app, {
-    runtime,
-    dpopGuard,
-    /**
-     * Enrolment is the bootstrap: the key being enrolled is not in the device
-     * table yet, so it vouches for itself. Everything else in the chain still
-     * applies — signature, htm/htu, iat, ath, nonce and jti — so a leaked
-     * access token alone cannot enrol a key without a live proof.
-     */
-    enrolmentAuthenticate: (request, reply) =>
-      authenticate(request, reply, () => async () => ({ bound: true, deviceId: SELF_ASSERTED })),
-  });
+  registerAuthRoutes(app, { runtime });
 
   return runtime;
 }
