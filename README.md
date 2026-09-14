@@ -55,6 +55,14 @@ and fc-shared treats an all-zero id as "no span" — so every log line would
 silently lose its trace tag. With no collector configured the service uses a
 real span processor and a no-op *exporter* instead, which keeps trace ids real.
 
+### Known gap: no trace tag on live log lines yet
+
+The logger stamps `trace=<id> span=<id>` on every line **that is emitted inside
+an active span**, and a unit test proves it. In slice 1a nothing starts a span
+for an inbound request, so a running server's log lines carry no tag. This is
+tracked as open for slice 1b, which adds the `traceparent` interceptors and a
+Fastify `onRequest` hook that opens a server span.
+
 ## Health
 
 `GET /healthz` returns 200 when the database answers and 503 when it does not.

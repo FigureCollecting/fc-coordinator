@@ -7,6 +7,15 @@
 // Everything the route needs is INJECTED (db, telemetry state, log sink) so the
 // health contract can be tested — including its failure branch — without a
 // database, a collector or a socket.
+//
+// OPEN FOR SLICE 1b — no log line from the RUNNING service carries a trace tag
+// yet. The logger is correct and stamps `trace=<id> span=<id>` whenever a span
+// is active (platform/logger.ts), and telemetry registers a real SDK, but
+// nothing here starts a span: inbound HTTP is not instrumented and the
+// traceparent Connect interceptors (§A.5 rule 3) arrive with the first Connect
+// hop. Until then every request is logged outside any span, so the tag is
+// correctly absent rather than zeroed. The close is an onRequest hook that
+// starts a server span from the incoming `traceparent`, registered right here.
 // ============================================================================
 import Fastify, { type FastifyInstance } from 'fastify';
 import { probeDatabase, type QueryableDb } from './db/pool.js';
