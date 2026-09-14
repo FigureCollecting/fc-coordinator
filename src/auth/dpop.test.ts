@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
+import { resolveAuthConfig } from './config.js';
 import { createNonceEpoch, type NonceEpoch } from './nonce.js';
 import { createJtiWindow, type JtiWindow } from './replay.js';
 import { verifyDpopProof, type DpopVerifyInput } from './dpop.js';
@@ -340,5 +341,94 @@ describe('verifyDpopProof — step 6, the nonce, and it precedes the jti check',
     expect(
       (await dpopVerify(await input({ requireNonce: false }, { nonce: foreign }))).reason,
     ).toBe('nonce_invalid');
+  });
+});
+
+// ===========================================================================
+// THE REPLAY HOLE (challenger B1). The iat check compares at SECOND
+// granularity while the jti window prunes at MILLISECOND granularity, so a
+// window sized to exactly (maxAge + skew) seconds evicts a jti while the proof
+// it names is still iat-valid for up to another 999 ms.
+//
+// Adapted from the challenger's test/challenger-order.test.ts. Two changes:
+// the ttl comes from resolveAuthConfig rather than being computed in the test,
+// so this pins the CONFIG FORMULA and not just today's number; and the search
+// reports the exploitable window rather than a bare boolean.
+// ===========================================================================
+describe('verifyDpopProof — the jti window must cover the WHOLE iat window', () => {
+  it('never accepts the same proof twice, for any clock offset inside the iat window', async () => {
+    const maxAgeSeconds = 30;
+    const clockSkewSeconds = 5;
+    const { jtiTtlMs } = resolveAuthConfig({
+      OIDC_ISSUER: 'https://i.test.invalid/',
+      OIDC_AUDIENCE: 'a',
+      OIDC_JWKS_URI: 'https://i.test.invalid/jwks',
+      COORDINATOR_PUBLIC_ORIGIN: TEST_ORIGIN,
+      DPOP_PROOF_MAX_AGE_SECONDS: String(maxAgeSeconds),
+      DPOP_CLOCK_SKEW_SECONDS: String(clockSkewSeconds),
+    });
+
+    // The worst case: a client whose clock runs the full accepted skew fast,
+    // presenting at the very START of a second. Both halves are needed — the
+    // hole is the gap between a floored second and a millisecond timer.
+    const presentAtSecond = 1_800_000_000;
+    let clock = presentAtSecond * 1000;
+    const now = (): number => clock;
+    const iat = presentAtSecond + clockSkewSeconds;
+
+    const window = createJtiWindow({ ttlMs: jtiTtlMs, maxEntries: 1000, now });
+    const epoch = createNonceEpoch({ periodMs: PERIOD_MS, now });
+    const device = await makeDeviceKey();
+    const proof = await makeProof(device, {
+      htm: 'POST',
+      htu: `${TEST_ORIGIN}${PATH}`,
+      accessToken: ACCESS_TOKEN,
+      iat,
+      nonce: epoch.mint(),
+    });
+    const base: DpopVerifyInput = {
+      proof,
+      method: 'POST',
+      path: PATH,
+      origin: TEST_ORIGIN,
+      accessToken: ACCESS_TOKEN,
+      resolveBinding: async () => ({ bound: true, deviceId: DEVICE_ID }),
+      nonce: epoch,
+      jti: window,
+      algorithms: ['ES256'],
+      maxAgeSeconds,
+      clockSkewSeconds,
+      requireNonce: true,
+      now,
+    };
+
+    expect((await verifyDpopProof(base)).ok).toBe(true);
+    expect(window.size).toBe(1);
+
+    // Walk the clock forward, millisecond by millisecond, over the band where
+    // a hole can exist and find the FIRST moment the proof is accepted twice.
+    // The jti check cannot stop rejecting before the entry is EVICTED, which
+    // cannot happen before ttlMs, so the sweep starts a second short of that
+    // and runs past the end of any iat window this config can produce.
+    let firstReplayAt: number | undefined;
+    for (let offset = jtiTtlMs - 1_000; offset <= jtiTtlMs + 5_000; offset += 1) {
+      clock = presentAtSecond * 1000 + offset;
+      if ((await verifyDpopProof(base)).ok) {
+        firstReplayAt = offset;
+        break;
+      }
+    }
+
+    // The last moment the iat rule alone would still admit it, for the message.
+    let lastIatValid = 0;
+    for (let offset = 0; offset <= 50_000; offset += 1) {
+      const second = Math.floor((presentAtSecond * 1000 + offset) / 1000);
+      if (iat >= second - maxAgeSeconds && iat <= second + clockSkewSeconds) lastIatValid = offset;
+    }
+
+    expect({
+      firstReplayAt,
+      exploitableMs: firstReplayAt === undefined ? 0 : lastIatValid - firstReplayAt + 1,
+    }).toEqual({ firstReplayAt: undefined, exploitableMs: 0 });
   });
 });

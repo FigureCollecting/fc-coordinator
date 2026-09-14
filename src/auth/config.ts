@@ -16,10 +16,19 @@
 //                                   make any proof match any URL.
 //
 // TWO SETTINGS ARE DERIVED, NOT CONFIGURED:
-//   jtiTtlMs = (proofMaxAge + clockSkew) * 1000. The replay window must cover
-//   the whole `iat` acceptance window; letting an operator set them
+//   jtiTtlMs = (proofMaxAge + clockSkew) * 1000 + 1000. The replay window must
+//   cover the whole `iat` acceptance window; letting an operator set them
 //   independently invites a configuration where an expiring jti still names an
 //   acceptable proof. Deriving it removes the failure mode entirely.
+//
+//   THE + 1000 IS LOAD-BEARING, and it is the granularity mismatch between the
+//   two rules. `iat` is a JWT numeric date and the check compares FLOORED
+//   SECONDS, so a proof presented at the very start of second N by a client
+//   whose clock runs the full accepted skew fast stays iat-valid until the end
+//   of second N + maxAge + skew — up to 999 ms past the millisecond timer the
+//   replay window prunes on. Without the extra second the jti is evicted while
+//   the proof it names is still acceptable, and the SAME proof replays inside
+//   that gap. Measured at 999 ms before the fix; zero after.
 //
 // ALGORITHMS ARE VALIDATED AGAINST AN ALLOWLIST at boot. A symmetric `alg` on
 // the DPoP path would be catastrophic — the "public" JWK in the proof header
@@ -145,7 +154,8 @@ export function resolveAuthConfig(env: Env = process.env): AuthConfig {
     clockSkewSeconds,
     noncePeriodMs: positiveNumber(env, 'DPOP_NONCE_PERIOD_SECONDS', 300) * 1000,
     jtiMaxEntries: positiveNumber(env, 'DPOP_JTI_MAX_ENTRIES', 100_000, { integer: true }),
-    jtiTtlMs: (proofMaxAgeSeconds + clockSkewSeconds) * 1000,
+    // + 1000: see the header. Seconds-granularity iat vs ms-granularity eviction.
+    jtiTtlMs: (proofMaxAgeSeconds + clockSkewSeconds) * 1000 + 1000,
     deviceCacheTtlMs: positiveNumber(env, 'DEVICE_CACHE_TTL_SECONDS', 5) * 1000,
     requireNonce: boolean(env, 'DPOP_REQUIRE_NONCE', true),
   };

@@ -8,10 +8,17 @@
 //
 // TWO bounds, and the interaction between them is the whole design:
 //
-//   ttlMs       set by the caller to the `iat` acceptance window (max age plus
-//               clock skew). An entry that expires is therefore a proof that
-//               the iat check would already reject, so eviction by time can
-//               never open a replay hole.
+//   ttlMs       set by the caller to the `iat` acceptance window PLUS ONE
+//               SECOND. The extra second is not slack: `iat` is checked at
+//               FLOORED-SECOND granularity while this window prunes on a
+//               millisecond timer, so a window sized to exactly (maxAge + skew)
+//               evicts an entry while the proof it names is still iat-valid for
+//               up to another 999 ms — and the same proof replays in that gap.
+//               An EARLIER VERSION OF THIS COMMENT CLAIMED eviction by time
+//               could never open a replay hole. That was false, and a
+//               challenger's injected-clock test measured the hole at 999 ms.
+//               It holds only because auth/config.ts now adds the second; see
+//               the formula there, and the test that pins it in dpop.test.ts.
 //   maxEntries  a hard cap so a flood cannot exhaust memory. Eviction here is
 //               oldest-first, and it CAN open a replay hole for the evicted
 //               jti — bounded, deliberate, and the reason the cap is sized well

@@ -29,7 +29,30 @@ describe('resolveAuthConfig', () => {
       DPOP_PROOF_MAX_AGE_SECONDS: '45',
       DPOP_CLOCK_SKEW_SECONDS: '10',
     });
-    expect(config.jtiTtlMs).toBe((45 + 10) * 1000);
+    // The extra SECOND closes the granularity gap: `iat` is checked in floored
+    // seconds, this window prunes in milliseconds, and without it a proof
+    // replays for up to 999 ms after its jti is evicted (measured; see the
+    // replay-hole test in dpop.test.ts, which pins this formula end to end).
+    expect(config.jtiTtlMs).toBe((45 + 10) * 1000 + 1000);
+  });
+
+  it('keeps the jti window strictly longer than the widest iat window, at every setting', () => {
+    for (const [maxAge, skew] of [
+      ['1', '0'],
+      ['30', '5'],
+      ['45', '10'],
+      ['300', '60'],
+    ]) {
+      const config = resolveAuthConfig({
+        ...COMPLETE,
+        DPOP_PROOF_MAX_AGE_SECONDS: maxAge,
+        DPOP_CLOCK_SKEW_SECONDS: skew,
+      });
+      // The widest a proof can stay iat-valid is (maxAge + skew) seconds plus
+      // the remainder of the second it was presented in.
+      const widestIatWindowMs = (Number(maxAge) + Number(skew)) * 1000 + 999;
+      expect(config.jtiTtlMs).toBeGreaterThan(widestIatWindowMs);
+    }
   });
 
   it('names the missing variable rather than failing obscurely', () => {
