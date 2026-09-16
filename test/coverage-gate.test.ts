@@ -40,8 +40,21 @@ describe('the coverage gate is per file, not a repo-wide average', () => {
     let output: string;
     let status: number | null;
     try {
-      // The positional filter is `src/`, so the child runs only the src suites —
-      // this file lives under test/, so there is no recursion.
+      // The child must run EVERY suite that covers src/, or a file tested only
+      // from test/ looks untested and the probe stops being the sole failure —
+      // which is what this case measures. Slice 1b made that concrete: the
+      // ported entitlement module and the Connect surface live in src/ and are
+      // driven from test/, so a `src/` positional filter under-measured them.
+      //
+      // So: exclude, rather than filter. Three exclusions, each for its own
+      // reason, and none of them costs any src/ coverage:
+      //   coverage-gate  this file — the child would recurse into it
+      //   migrations     covers scripts/migrate.sh against a Testcontainers
+      //                  Postgres; two minutes for zero src/ lines
+      //   import-graph   rebuilds dist/ and measures it in a further child, so
+      //                  it contributes no coverage to this process either way
+      // The CLI `--exclude` replaces the config's, so node_modules and dist are
+      // restated here.
       const run = spawnSync(
         'npx',
         [
@@ -52,7 +65,11 @@ describe('the coverage gate is per file, not a repo-wide average', () => {
           `--coverage.include=${PROBE}`,
           '--coverage.reporter=text',
           `--coverage.reportsDirectory=${reports}`,
-          'src/',
+          '--exclude=node_modules/**',
+          '--exclude=dist/**',
+          '--exclude=test/coverage-gate.test.ts',
+          '--exclude=test/migrations.test.ts',
+          '--exclude=test/import-graph.test.ts',
         ],
         { cwd: REPO, encoding: 'utf8', timeout: 300_000 },
       );

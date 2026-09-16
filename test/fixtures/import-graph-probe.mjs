@@ -7,7 +7,13 @@
 //
 //   node test/fixtures/import-graph-probe.mjs <absolute module path>
 //
-// Prints one JSON object: { resolved: string[], required: string[] }.
+// Prints one JSON object: { resolved: [{specifier, parentURL}], required: [] }.
+//
+// WHY THE PARENT IS RECORDED, not just the specifier. Slice 1b made `axios` a
+// legitimate dependency of ONE directory — the ported entitlement module, whose
+// portability contract names it explicitly — while it is still forbidden as a
+// transitive of the fc-shared barrel. "Is axios in the graph" can no longer
+// answer that; "who asked for axios" can.
 import { createRequire, registerHooks } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
@@ -20,7 +26,7 @@ if (!target) {
 const resolved = [];
 registerHooks({
   resolve(specifier, context, nextResolve) {
-    resolved.push(specifier);
+    resolved.push({ specifier, parentURL: context.parentURL ?? null });
     return nextResolve(specifier, context);
   },
 });

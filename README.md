@@ -5,10 +5,11 @@ sync, on Postgres only. It replaces fc-backend for the mobile client rather than
 extending it — there is no password, no TOTP and no WebAuthn here, because
 identity belongs to Authentik.
 
-This repository currently holds **slice 1a**: the skeleton. Fastify 5 with a
-single `GET /healthz`, the fc-shared telemetry baseline, the Postgres pool and
-the first two migrations. OIDC, DPoP, the entitlement port and the Compare
-pass-through are slice 1b.
+This repository holds **slice 1a** (the skeleton: Fastify 5, `GET /healthz`, the
+fc-shared telemetry baseline, the Postgres pool, migrations 0001-0002) and
+**slice 1b-ent**: the ported U6 entitlement module, the spine read client, and
+the `coordinator.v1` Compare pass-through served as Connect-Web. OIDC and DPoP
+arrive on their own branch and plug into the identity seam described below.
 
 ## Requirements
 
@@ -45,6 +46,14 @@ npm start        # node dist/server.js
 | `PGSSLMODE` | unset | `disable` \| `require` \| `verify-full`; production uses `verify-full` |
 | `PGSSLROOTCERT` | unset | path to the CA PEM for `verify-full` (contents are read, not the path) |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | collector endpoint; falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `SPINE_READ_URL` | unset | ingest-server Connect base URL; **unset means Compare answers `UNAVAILABLE`** and no transport is built |
+| `SPINE_READ_TIMEOUT_MS` | `10000` | per-call deadline on the mesh hop |
+| `OPENFGA_API_URL` `OPENFGA_STORE_ID` | unset | the entitlement Check; **unset means every Check denies** |
+| `OPENFGA_API_TOKEN` `OPENFGA_MODEL_ID` `OPENFGA_APP_OBJECT` `OPENFGA_TIMEOUT_MS` | unset / `app:figurecollecting` / `2000` | optional Check settings |
+| `ENTITLEMENT_SIGNING_KEY_PEM` or `ENTITLEMENT_SIGNING_KEY_FILE` | unset | the Ed25519 PKCS#8 signing key; **unset means no assertion is ever sent** |
+| `ENTITLEMENT_SIGNING_KID` | unset (derived from a key FILE's basename) | the JOSE `kid`; production mints under `ent-2026-09` or the spine silently redacts |
+| `ENTITLEMENT_SIGNING_ISSUER` | the contract's `ENTITLEMENT_ISSUER` | the `iss` claim. **Do not set this until ingest-server's verifier has been taught the new value** — see below |
+| `ENTITLEMENT_GRANT_CACHE_TTL_MS` `ENTITLEMENT_GRANT_ERROR_TTL_MS` `ENTITLEMENT_GRANT_CACHE_MAX` | `30000` / `5000` / `10000` | grant cache bounds; a value that is not a positive number falls back to the default |
 
 ### Edge authentication (OIDC + DPoP)
 
@@ -96,16 +105,33 @@ and fc-shared treats an all-zero id as "no span" — so every log line would
 silently lose its trace tag. With no collector configured the service uses a
 real span processor and a no-op *exporter* instead, which keeps trace ids real.
 
-### Tracing
+### Trace propagation (§A.5 rule 3) — complete
 
-Inbound HTTP **is** instrumented (slice 1b closed the slice-1a gap). An
-`onRequest` hook opens a `SERVER` span from the incoming `traceparent` and keeps
-it active for the whole request, so every log line a handler emits carries
-`trace=<id> span=<id>` joined to the caller's trace. Spans are named by route
-TEMPLATE, never by concrete path, and `/healthz` opens no span at all.
+Rule 3 is done end to end, and it took both slice-1b branches to close it. Each
+half was the other's "still open".
 
-Still open: the `traceparent` Connect **interceptors** (§A.5 rule 3), which
-arrive with the first Connect hop.
+**Inbound HTTP** (`src/platform/http-trace.ts`). An `onRequest` hook opens a
+`SERVER` span from the incoming `traceparent` and keeps it active for the whole
+request, so every log line a handler emits carries `trace=<id> span=<id>` joined
+to the caller's trace. Spans are named by route TEMPLATE, never by concrete
+path, and `/healthz` opens no span at all — a liveness probe every second is
+noise, not a trace.
+
+**Connect** (`src/connect/interceptors.ts`). The server interceptor continues
+the caller's trace into the RPC handler; the client interceptor opens a `CLIENT`
+span and injects `traceparent` on the outbound SpineRead hop. Both are on by
+default — `SpineReadClient` attaches the client one unless a caller replaces the
+list, so the mesh hop cannot be left untraced by forgetting to wire it.
+
+The result is one `traceparent` threading fc-mobile, this service and the spine,
+with the coordinator visible in the middle as its own span rather than as a
+transparent relay.
+
+Spans record **outcome and counts only** — the rpc name and, on failure, the
+Connect status code. Never a subject, never the assertion, never a proof, never
+a nonce. `recordException` is deliberately not called: it would copy an upstream
+error message onto the span, and a `ConnectError`'s message routinely carries
+whatever the upstream said.
 
 ## Health
 
@@ -199,3 +225,125 @@ The fork shift-left policy: fork **feature** branches run the full core CI, fork
 `develop`/`main` mirrors run nothing, and the image build is org-only. A fork
 run authenticates to GitHub Packages with a fork-held `read:packages` PAT in
 `secrets.NODE_AUTH_TOKEN`; the org falls back to `GITHUB_TOKEN`.
+
+## `coordinator.v1` — the Compare pass-through
+
+`POST /coordinator.v1.CompareService/Compare`, Connect protocol over plain
+HTTP — Connect-Web, so fc-mobile needs no gRPC-Web proxy and this service needs
+no second listener. The contract is `@figurecollecting/fc-api-contract`.
+
+```
+curl -X POST http://127.0.0.1:5052/coordinator.v1.CompareService/Compare \
+  -H 'Content-Type: application/json' \
+  -H 'Connect-Protocol-Version: 1' \
+  -d '{"gtin14":"04573102591234","nowIso":"2026-09-14T12:00:00.000Z"}'
+```
+
+**What the coordinator adds**: authentication (the edge), authorisation (an
+OpenFGA Check, then a 60-second Ed25519 assertion minted server-side and
+attached to the mesh hop as the `fc-entitlements` header), and nothing else.
+The assertion never reaches the client.
+
+**What it never does**: reinterpret the spine's answer. `result_json` crosses
+back **byte for byte** — never parsed and reserialised, because read.v1's
+fidelity doctrine keeps every scraped token as raw text and a JSON round trip
+would undo that at the last hop. `coverage` is a **lift**: the same members of
+`redacted` in the same order, and the same `semanticsRev` string, copied out of
+`result_json` so a client can decide whether to render an "unavailable to you"
+affordance without parsing the blob.
+
+A response whose coverage cannot be lifted is refused with `INTERNAL`, not
+returned with an empty `redacted`. Claiming "nothing was withheld" about a
+response nobody could read is the confident zero the redaction contract exists
+to prevent.
+
+| Case | Answer |
+|---|---|
+| entitled | `200`, `stockOnHand` present, `coverage.redacted: []` |
+| not entitled | `200`, `stockOnHand` absent, `coverage.redacted: ["inventory_levels"]` |
+| OpenFGA unconfigured or unreachable | as "not entitled" — **fail closed**, and the correct state until plan decision D4 lands |
+| no signing key | as "not entitled" |
+| nobody authenticated | as "not entitled" — rejecting is the edge plugin's job, not this handler's |
+| neither seed set, or a `now_iso` with no time or no zone | `INVALID_ARGUMENT`, before any mesh call |
+| unknown seed | `200` with `heads: []` — not an error |
+| spine unconfigured or unreachable | `UNAVAILABLE` |
+
+### Guarded, and how that is known
+
+Compare declares **no `config.auth`**, so the edge's deny-by-default registry
+classifies it `guarded`. Absence is the protection — there is no per-route opt-in
+to forget. `connect-fastify` registers the RPC as ONE route entry covering nine
+methods (`GET HEAD TRACE DELETE OPTIONS PATCH PUT QUERY POST`), and
+`test/connect/guarded.test.ts` asserts all nine reject an uncredentialed call and
+that neither the spine nor OpenFGA is reached on the way to the refusal. A guard
+that only covered POST would leave eight verbs open on an authenticated route
+while a URL-only enumeration test still passed.
+
+The same file drives the whole path: enrol a device, then a Connect unary POST
+carrying an access token and a DPoP proof, and asserts that **the uuid the proof
+was verified for is the uuid OpenFGA was asked about**. That is the first
+assertion in which the identity a caller proved and the identity the spine is
+told about are the same value, established by two independently built modules.
+
+### The identity seam
+
+The handler needs one thing from authentication: the caller's Authentik uuid.
+`CALLER_IDENTITY_DECORATOR` and `CallerIdentity` are declared once in
+`src/identity.ts` and imported by both the edge and this module — they used to be
+a string literal on each branch, and a mismatch would have been silent and
+safe-looking (every caller reads as unauthenticated, every Compare redacted, both
+suites green).
+
+`src/connect/identity.ts` keeps the part that is genuinely this side's: turning a
+Fastify request into a Connect handler-context value, and an **injected resolver**
+so a test can supply an identity without standing up the edge. A resolver that
+finds nothing returns `null`, and `null` means no entitlement — a successful,
+redacted Compare. Rejecting an unauthenticated caller belongs to the edge,
+upstream; if both layers rejected, one rule would have two owners.
+
+### The issuer pin — a two-sided deploy, and a silent failure if you get it wrong
+
+fc-aggregation's verifier **pins `iss`** to a single expected value and rejects
+anything else the way it rejects everything else: empty grants, normal 200, no
+error and nothing in the spine's logs. A coordinator minting under an issuer the
+deployed verifier does not accept therefore looks *exactly* like a coordinator
+whose users simply have no grants.
+
+That is fail-closed, which is the right direction, but it is the kind of
+fail-closed that can sit in production for weeks looking like a product
+decision. So:
+
+- `ENTITLEMENT_SIGNING_ISSUER` **defaults to the contract's `ENTITLEMENT_ISSUER`**,
+  which is what the deployed verifier expects today. Out of the box the entitled
+  path works and nothing changes.
+- Setting it to anything else logs **one warning** naming both the value and the
+  consequence, because "reads come back redacted" is the symptom an operator
+  will actually be chasing.
+- The boot line reports the live value (`iss=…`), so the deployed setting is
+  observable without reading a Secret.
+- **Order of operations, if the coordinator is ever to stop claiming to be
+  fc-backend**: teach ingest-server's verifier the new issuer (or a list),
+  deploy that, and only then set this variable. The reverse order redacts
+  everything with no signal.
+
+`test/connect/compare.test.ts` pins the failure end to end: with OpenFGA
+allowing, a good key, a real uuid and a valid signature, a mismatched issuer
+still comes back with `coverage.redacted: ["inventory_levels"]`, and the answer
+is byte-for-byte identical to an ordinary denial.
+
+### The ported entitlement module
+
+`src/entitlements/` is a **directory copy** of fc-backend's U6 module (PR #249,
+merged at `c82fb05`), whose review defects were already fixed on that head: the
+uuid guard now bites in both the Check and the mint, the portability test catches
+bare and dynamic imports, `timeout: 0` falls back to the default, and the grant
+cache is bounded. The port changed ESM import specifiers and the header comment;
+`entitlementSubject.legacy.ts` and the `authentikId` model field were **not**
+carried across — the subject comes straight from the identity resolver.
+
+It imports node builtins, `axios` and `@figurecollecting/ingest-contract` and
+nothing else — not this app's logger, which is why it writes to `console`.
+`test/entitlements/portability.test.ts` fails the build if that stops being
+true, and `test/import-graph.test.ts` asserts the built graph resolves `axios`
+**only** from inside `dist/entitlements/`, never as a transitive of the fc-shared
+barrel.

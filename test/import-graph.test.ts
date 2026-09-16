@@ -6,6 +6,23 @@
 // test that only checked "the import works" would pass on the 1.6.0 barrel too,
 // so this one measures the REAL module graph of the REAL built output, in a
 // child process, using Node's own resolver.
+//
+// SLICE 1b CHANGED WHAT "axios" MEANS HERE, and the guard had to get more
+// precise rather than more permissive. The ported entitlement module
+// (src/entitlements, from fc-backend U6) calls OpenFGA over axios; that is a
+// DECLARED part of its portability contract, enforced by
+// test/entitlements/portability.test.ts, and it is a direct dependency of this
+// repo. So axios in the app graph is no longer evidence of anything by itself.
+// What is still forbidden — and is the thing the original test was really
+// about — is axios arriving as a TRANSITIVE of the fc-shared barrel. The
+// distinction the graph can make is WHO ASKED, so that is what is asserted:
+//
+//   the fc-shared seam    resolves none of axios, zustand, react
+//   the whole application resolves neither zustand nor react, and resolves
+//                         axios ONLY from inside dist/entitlements/
+//
+// Loosening this to "axios is allowed anywhere" would have thrown away the
+// original guard; the parent check keeps it and sharpens it.
 // ============================================================================
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -18,13 +35,21 @@ const PROBE = path.join(REPO, 'test', 'fixtures', 'import-graph-probe.mjs');
 const BUILT_APP = path.join(REPO, 'dist', 'app.js');
 const BUILT_SEAM = path.join(REPO, 'dist', 'platform', 'shared.js');
 
-// The browser half of fc-shared. None of it belongs in a Postgres-only service:
-// api/* is the axios client for LEGACY fc-backend, stores/* are fc-mobile's
-// zustand singletons, and react arrives only as zustand's peer.
-const FORBIDDEN = ['axios', 'zustand', 'react'];
+// The browser half of fc-shared, none of which belongs in a Postgres-only
+// service: stores/* are fc-mobile's zustand singletons and react arrives only
+// as zustand's peer. Forbidden outright, everywhere.
+const BROWSER_ONLY = ['zustand', 'react'];
+
+// Allowed, but only from the one directory whose contract declares it.
+const ENTITLEMENTS_DIR = 'dist/entitlements/';
+
+interface Resolution {
+  specifier: string;
+  parentURL: string | null;
+}
 
 interface Graph {
-  resolved: string[];
+  resolved: Resolution[];
   required: string[];
 }
 
@@ -37,12 +62,21 @@ function probe(target: string): Graph {
   return JSON.parse(out) as Graph;
 }
 
-function hits(graph: Graph, forbidden: string): string[] {
-  const bySpecifier = graph.resolved.filter(
-    (specifier) => specifier === forbidden || specifier.startsWith(`${forbidden}/`),
-  );
-  const byPath = graph.required.filter((file) => file.includes(`/node_modules/${forbidden}/`));
+/** Every resolution OF a package — by specifier, and by the file it landed in. */
+function hits(graph: Graph, pkg: string): string[] {
+  const bySpecifier = graph.resolved
+    .filter((r) => r.specifier === pkg || r.specifier.startsWith(`${pkg}/`))
+    .map((r) => r.specifier);
+  const byPath = graph.required.filter((file) => file.includes(`/node_modules/${pkg}/`));
   return [...bySpecifier, ...byPath];
+}
+
+/** Who asked for a package, as repo-relative paths. */
+function importersOf(graph: Graph, pkg: string): string[] {
+  return graph.resolved
+    .filter((r) => r.specifier === pkg || r.specifier.startsWith(`${pkg}/`))
+    .map((r) => (r.parentURL === null ? '<entry>' : r.parentURL.replace(/^file:\/\//, '')))
+    .map((file) => path.relative(REPO, file));
 }
 
 describe('the coordinator import graph never reaches the browser half of fc-shared', () => {
@@ -55,16 +89,32 @@ describe('the coordinator import graph never reaches the browser half of fc-shar
   }, 360_000);
 
   it('loads the fc-shared seam without resolving axios, zustand or react', () => {
+    // The seam's rule is unchanged and absolute: nothing the coordinator takes
+    // from fc-shared may pull the browser bundle, axios included.
     const graph = probe(BUILT_SEAM);
-    for (const forbidden of FORBIDDEN) {
+    for (const forbidden of ['axios', ...BROWSER_ONLY]) {
       expect({ forbidden, hits: hits(graph, forbidden) }).toEqual({ forbidden, hits: [] });
     }
   });
 
-  it('loads the whole application without resolving axios, zustand or react', () => {
+  it('loads the whole application without resolving zustand or react', () => {
     const graph = probe(BUILT_APP);
-    for (const forbidden of FORBIDDEN) {
+    for (const forbidden of BROWSER_ONLY) {
       expect({ forbidden, hits: hits(graph, forbidden) }).toEqual({ forbidden, hits: [] });
+    }
+  });
+
+  it('resolves axios ONLY from the ported entitlement module, never from fc-shared', () => {
+    const graph = probe(BUILT_APP);
+    const importers = importersOf(graph, 'axios');
+
+    // Anti-vacuous: the module really is in the graph and really does use it.
+    expect(importers.length).toBeGreaterThan(0);
+    for (const importer of importers) {
+      expect({ importer, inEntitlements: importer.startsWith(ENTITLEMENTS_DIR) }).toEqual({
+        importer,
+        inEntitlements: true,
+      });
     }
   });
 
@@ -72,9 +122,10 @@ describe('the coordinator import graph never reaches the browser half of fc-shar
     // Guard against a vacuous pass: a graph that loads NOTHING would also have
     // no forbidden hits. Prove the real package is in there.
     const graph = probe(BUILT_SEAM);
-    const reachesShared = [...graph.resolved, ...graph.required].some((entry) =>
-      entry.includes('@figurecollecting/fc-shared'),
-    );
+    const reachesShared = [
+      ...graph.resolved.map((r) => r.specifier),
+      ...graph.required,
+    ].some((entry) => entry.includes('@figurecollecting/fc-shared'));
     expect(reachesShared).toBe(true);
   });
 });
