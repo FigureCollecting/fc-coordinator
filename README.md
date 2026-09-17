@@ -226,6 +226,29 @@ The fork shift-left policy: fork **feature** branches run the full core CI, fork
 run authenticates to GitHub Packages with a fork-held `read:packages` PAT in
 `secrets.NODE_AUTH_TOKEN`; the org falls back to `GITHUB_TOKEN`.
 
+### The image
+
+`ghcr.io/figurecollecting/fc-coordinator`, published by the `Build container
+image` job on **org push events only** — `develop`, `main` and a `v*` tag. A
+pull_request build stays `push: false` and never logs in to the registry, and a
+fork never publishes at all.
+
+Tags: the branch name (`develop`), the release tag when there is one, and
+`sha-<short>` on every publish. The job also emits the **digest** as a job
+output and into the run summary, because fc-infra pins the image by digest —
+`ghcr.io/figurecollecting/fc-coordinator:develop@sha256:…` — so a manifest
+cannot silently follow a retag.
+
+Order inside the job is load-first: the image is built with `load: true` and the
+non-root assertion runs against it **before** the publish step exists, so a root
+image cannot reach the registry ahead of the check that would have caught it.
+The publish step re-invokes buildx and is a cache hit on every layer.
+
+The package inherits the org's no-public-packages policy, so it is private like
+scraper's and ingest-server's. The cluster pulls it with the `ghcr-pull`
+`imagePullSecret`, which must exist in the target namespace before the first
+rollout.
+
 ## `coordinator.v1` — the Compare pass-through
 
 `POST /coordinator.v1.CompareService/Compare`, Connect protocol over plain
