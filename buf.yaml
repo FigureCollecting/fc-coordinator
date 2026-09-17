@@ -1,0 +1,5 @@
+# The vendored openfga.v1 slice. See proto/openfga/v1/openfga_service.proto for
+# why the slice exists and where it came from.
+version: v2
+modules:
+  - path: proto

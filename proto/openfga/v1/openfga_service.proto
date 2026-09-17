@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+// A SLICE of buf.build/openfga/api — the one call fc-coordinator makes.
+//
+// WHY A SLICE AND NOT THE MODULE. The upstream file is 77 KB and pulls six
+// external import trees (google.api.annotations, field_behavior, visibility,
+// protoc-gen-openapiv2 options, validate, plus four sibling openfga files) for
+// annotations that describe a REST transcoding and a swagger document — none of
+// which affects a single byte on the gRPC wire. What does affect the wire is
+// the package, the service name, the method name and the FIELD NUMBERS, and
+// those are reproduced here exactly.
+//
+// WHY VENDORED AND NOT the buf registry npm packages (@buf/openfga_api.*).
+// Those would put a second external registry (buf.build/gen/npm) in the install
+// path of every CI run and every image build, and pin the generated artifact to
+// a protobuf-es version chosen by the registry rather than by this repo. The
+// file here is pinned by git, reviewable in a diff, and needs no network.
+//
+// SOURCE OF TRUTH: github.com/openfga/api, openfga/v1/openfga_service.proto at
+// commit 7a79d2abab5b9ccc962ae995a1aab70c0a1cf19d
+// (sha256 d05816c630c6f99f66ebda17a1c389e5612935316943c0e4abb0f70cd14f4695).
+// The numbers below are asserted against that source in
+// test/entitlements/openfga-wire.test.ts — if you edit this file, run
+// `npm run proto:generate` and that suite will tell you whether you were right.
+//
+// THE HTTP API IS THIS ONE. Upstream declares `Check` with a
+// google.api.http annotation mapping it to POST /stores/{store_id}/check, so
+// the REST endpoint fc-coordinator used until now was a grpc-gateway
+// transcoding OF this service. Moving to gRPC moves to the primary definition;
+// it does not adopt a second API.
+
+package openfga.v1;
+
+// The tuple a Check asks about. Upstream calls it CheckRequestTupleKey — there
+// is also a plain `TupleKey` in openfga/v1/openfga.proto with the same three
+// fields, and they are NOT interchangeable as message names.
+message CheckRequestTupleKey {
+  string user = 1;
+  string relation = 2;
+  string object = 3;
+}
+
+message CheckRequest {
+  string store_id = 1;
+  CheckRequestTupleKey tuple_key = 2;
+  // FOUR, not five. Upstream numbers this 4 and gives 5 to `bool trace`.
+  string authorization_model_id = 4;
+
+  // Upstream fields this slice does not send, reserved so that a local edit
+  // cannot quietly take a number that already means something at the far end:
+  //   3 contextual_tuples   5 trace   6 context   7 consistency
+  reserved 3, 5, 6, 7;
+}
+
+message CheckResponse {
+  bool allowed = 1;
+  string resolution = 2;
+}
+
+service OpenFGAService {
+  rpc Check(CheckRequest) returns (CheckResponse);
+}

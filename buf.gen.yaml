@@ -1,0 +1,24 @@
+# Code generation: TypeScript via protoc-gen-es (@bufbuild/protoc-gen-es,
+# resolved from node_modules/.bin when run through `npm run proto:generate`),
+# the same shape fc-api-contract and fc-ingest-contract already use.
+#
+# THE OUTPUT IS COMMITTED and lands INSIDE src/entitlements, not in a gen/ tree
+# at the repo root. That directory is a portable copy — it travels to its next
+# host as a directory, and test/entitlements/portability.test.ts fails the build
+# if it reaches outside itself — so the wire types it needs have to travel with
+# it. Generation is a local step; CI compiles the committed file, and
+# test/entitlements/openfga-wire.test.ts asserts that file still matches both
+# the .proto beside it and the upstream field numbers.
+#
+# `clean: true` wipes src/entitlements/gen before regenerating, so a file left
+# behind by a deleted proto shows up as a deletion in the diff rather than
+# lingering forever. It touches nothing else in the module directory.
+version: v2
+clean: true
+plugins:
+  - local: protoc-gen-es
+    out: src/entitlements/gen
+    opt:
+      - target=ts
+      # Node16/NodeNext resolution requires the extension on relative imports.
+      - import_extension=js

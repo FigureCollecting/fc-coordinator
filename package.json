@@ -16,7 +16,8 @@
     "dev": "tsx watch src/server.ts",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "migrate": "sh scripts/migrate.sh"
+    "migrate": "sh scripts/migrate.sh",
+    "proto:generate": "buf generate"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.15.0",
@@ -39,6 +40,8 @@
     "pg": "^8.23.0"
   },
   "devDependencies": {
+    "@bufbuild/buf": "^1.73.0",
+    "@bufbuild/protoc-gen-es": "^2.15.0",
     "@testcontainers/postgresql": "^12.1.0",
     "@types/node": "^26.4.0",
     "@types/pg": "^8.23.1",
