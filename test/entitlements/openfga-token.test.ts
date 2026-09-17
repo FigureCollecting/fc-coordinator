@@ -385,3 +385,54 @@ describe('the boot line', () => {
     expect(printed).not.toContain('confidential');
   });
 });
+
+// ===========================================================================
+// THE TOKEN ENDPOINT IS A TRANSPORT DECISION, NOT JUST A URL
+// ===========================================================================
+describe('the token endpoint scheme', () => {
+  const httpsEnv = (endpoint: string): NodeJS.ProcessEnv =>
+    ({
+      OPENFGA_OIDC_TOKEN_ENDPOINT: endpoint,
+      OPENFGA_OIDC_CLIENT_ID: 'openfga',
+      OPENFGA_OIDC_USERNAME: USERNAME,
+      OPENFGA_OIDC_PASSWORD: PASSWORD,
+    }) as NodeJS.ProcessEnv;
+
+  it.each([
+    ['a routable http host', 'http://auth.example.com/application/o/token/'],
+    ['an http host by IP', 'http://10.1.2.3:9000/token'],
+  ])('REFUSES to mint over %s', async (_label, endpoint) => {
+    // resolveAuthConfig already refuses a non-https OIDC_JWKS_URI, and JWKS
+    // carries PUBLIC KEYS. This endpoint carries the service account's
+    // password. The weaker rule was on the higher-value secret.
+    expect(await getOpenFgaToken(httpsEnv(endpoint), T0)).toBeNull();
+    expect(JSON.stringify(errors)).toContain('https');
+  });
+
+  it('allows loopback http, which is how a local issuer and these fixtures are reached', async () => {
+    // The same exemption auth/config.ts makes, for the same reason: loopback is
+    // not a hop anyone can sit on. Deliberately NOT an opt-out environment
+    // variable — a flag that disables a transport requirement is a flag that
+    // eventually gets set in production.
+    expect(await getOpenFgaToken(httpsEnv(idp.url), T0)).toBe('token-1');
+  });
+
+  it('allows https', async () => {
+    // Refused at the socket, not at the scheme check: getting this far means
+    // the scheme was accepted and the mint was actually attempted.
+    expect(await getOpenFgaToken(httpsEnv('https://127.0.0.2:1/token'), T0)).toBeNull();
+    expect(JSON.stringify(errors)).not.toContain('https unless');
+  });
+
+  it('REFUSES an endpoint that is not an absolute URL at all', async () => {
+    expect(await getOpenFgaToken(httpsEnv('auth.example.com/token'), T0)).toBeNull();
+    expect(JSON.stringify(errors)).toContain('OPENFGA_OIDC_TOKEN_ENDPOINT');
+  });
+
+  it('says so at BOOT, so it is not discovered at the first read', () => {
+    const described = describeOpenFgaAuth(httpsEnv('http://auth.example.com/token'));
+    expect(described).toContain('REFUSED');
+    expect(initOpenFgaAuth(httpsEnv('http://auth.example.com/token'))).toBe('oidc');
+    expect(JSON.stringify(errors)).toContain('REFUSED');
+  });
+});

@@ -66,6 +66,13 @@ const MIN_REFRESH_FRACTION = 0.5;
 const DEFAULT_MINT_TIMEOUT_MS = 5_000;
 const DEFAULT_SCOPE = 'openid';
 
+/**
+ * Loopback is the one place plaintext is acceptable, because it is not a hop
+ * anyone can sit on. Exactly the exemption src/auth/config.ts makes for
+ * OIDC_JWKS_URI, and exactly the set it uses.
+ */
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+
 const OIDC_KEYS = [
   'OPENFGA_OIDC_TOKEN_ENDPOINT',
   'OPENFGA_OIDC_CLIENT_ID',
@@ -83,6 +90,7 @@ let cached: CachedToken | null = null;
 let inflight: Promise<string | null> | null = null;
 let warnedShadowedStatic = false;
 let warnedIncomplete = false;
+let warnedEndpoint = false;
 let loggedBootLine = false;
 
 const counters = new Map<string, number>();
@@ -100,6 +108,7 @@ export const resetOpenFgaTokenForTest = (): void => {
   counters.clear();
   warnedShadowedStatic = false;
   warnedIncomplete = false;
+  warnedEndpoint = false;
   loggedBootLine = false;
 };
 
@@ -136,7 +145,13 @@ export function describeOpenFgaAuth(env: NodeJS.ProcessEnv): string {
     const missing = OIDC_KEYS.filter((key) => trimmed(env[key]) === '');
     const endpoint = trimmed(env.OPENFGA_OIDC_TOKEN_ENDPOINT) || '(unset)';
     const clientId = trimmed(env.OPENFGA_OIDC_CLIENT_ID) || '(unset)';
-    const state = missing.length === 0 ? 'complete' : `INCOMPLETE, missing ${missing.join(', ')}`;
+    const rejected = missing.length === 0 ? rejectEndpoint(endpoint) : null;
+    const state =
+      missing.length > 0
+        ? `INCOMPLETE, missing ${missing.join(', ')}`
+        : rejected !== null
+          ? `REFUSED — ${rejected}`
+          : 'complete';
     return `oidc client_credentials (${state}; token_endpoint=${endpoint}, client_id=${clientId})`;
   }
   if (mode === 'static') return 'static preshared token (OPENFGA_API_TOKEN)';
@@ -152,11 +167,47 @@ export function initOpenFgaAuth(env: NodeJS.ProcessEnv = process.env): OpenFgaAu
   const mode = openFgaAuthMode(env);
   if (!loggedBootLine) {
     loggedBootLine = true;
-    const line = `[ENTITLEMENT] OpenFGA credential: ${describeOpenFgaAuth(env)}`;
-    if (mode === 'none') console.warn(line);
+    const described = describeOpenFgaAuth(env);
+    const line = `[ENTITLEMENT] OpenFGA credential: ${described}`;
+    // A provider that cannot be used is worse than no provider at all: it looks
+    // configured, mints nothing, and denies every read forever. It gets the
+    // loudest level, at BOOT, rather than waiting for the first Check.
+    if (described.includes('REFUSED')) console.error(line);
+    else if (mode === 'none') console.warn(line);
     else console.log(line);
   }
   return mode;
+}
+
+/**
+ * Is this an endpoint the service account's password may be sent to?
+ *
+ * WHY THE RULE IS HERE AT ALL. `resolveAuthConfig` already refuses a non-https
+ * `OIDC_JWKS_URI` and explains why every variable there has no safe default.
+ * JWKS carries PUBLIC KEYS. This endpoint carries a password and, when
+ * configured, a client secret — so the weaker rule was sitting on the
+ * higher-value secret. Plaintext here is an offer to read the credential off
+ * the wire, and it was previously accepted in silence: no warning, no boot
+ * line, nothing.
+ *
+ * NO OPT-OUT VARIABLE, deliberately. The loopback exemption is enough for a
+ * local issuer and for every fixture in the suite, and a flag whose whole
+ * purpose is to disable a transport requirement is a flag that eventually gets
+ * set in production by someone in a hurry.
+ *
+ * Returns null when the endpoint is acceptable, or the reason it is not.
+ */
+function rejectEndpoint(raw: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return `OPENFGA_OIDC_TOKEN_ENDPOINT must be an absolute URL, got '${raw}'`;
+  }
+  if (url.protocol !== 'https:' && !LOOPBACK_HOSTS.has(url.hostname)) {
+    return `OPENFGA_OIDC_TOKEN_ENDPOINT must use https (got '${url.protocol}') unless it is loopback — the service account's password is sent to it`;
+  }
+  return null;
 }
 
 interface OidcConfig {
@@ -182,8 +233,18 @@ function oidcConfig(env: NodeJS.ProcessEnv): OidcConfig | null {
     }
     return null;
   }
+  const endpoint = trimmed(env.OPENFGA_OIDC_TOKEN_ENDPOINT);
+  const rejected = rejectEndpoint(endpoint);
+  if (rejected !== null) {
+    if (!warnedEndpoint) {
+      warnedEndpoint = true;
+      console.error(`[ENTITLEMENT] REFUSED to mint an OpenFGA token: ${rejected}. Every entitlement check denies and spine reads come back redacted until this is corrected.`);
+    }
+    return null;
+  }
+
   return {
-    endpoint: trimmed(env.OPENFGA_OIDC_TOKEN_ENDPOINT),
+    endpoint,
     clientId: trimmed(env.OPENFGA_OIDC_CLIENT_ID),
     username: trimmed(env.OPENFGA_OIDC_USERNAME),
     // NOT trimmed: a password's surrounding whitespace is part of it.
