@@ -38,6 +38,7 @@ npm start        # node dist/server.js
 |---|---|---|
 | `COORDINATOR_PORT` | `5052` | listen port |
 | `COORDINATOR_HOST` | `0.0.0.0` | listen address |
+| `COORDINATOR_ROUTE_PREFIX` | `/api` | every route except `/healthz` is served under this. Set it to the empty string to serve at the root. **The edge must not rewrite it** — see below |
 | `LOG_LEVEL` | `info` | trace / debug / info / warn / error / fatal / silent |
 | `SERVICE_VERSION` | `unknown` | stamped into the image and reported by `/healthz` |
 | `DATABASE_URL` | unset | full DSN; when unset the discrete `PG*` variables are used |
@@ -49,11 +50,110 @@ npm start        # node dist/server.js
 | `SPINE_READ_URL` | unset | ingest-server Connect base URL; **unset means Compare answers `UNAVAILABLE`** and no transport is built |
 | `SPINE_READ_TIMEOUT_MS` | `10000` | per-call deadline on the mesh hop |
 | `OPENFGA_API_URL` `OPENFGA_STORE_ID` | unset | the entitlement Check; **unset means every Check denies** |
-| `OPENFGA_API_TOKEN` `OPENFGA_MODEL_ID` `OPENFGA_APP_OBJECT` `OPENFGA_TIMEOUT_MS` | unset / `app:figurecollecting` / `2000` | optional Check settings |
+| `OPENFGA_MODEL_ID` `OPENFGA_APP_OBJECT` `OPENFGA_TIMEOUT_MS` | unset / `app:figurecollecting` / `2000` | optional Check settings. A `OPENFGA_TIMEOUT_MS` of `0` is refused and falls back, because axios reads it as "wait forever" |
+| `OPENFGA_OIDC_TOKEN_ENDPOINT` `OPENFGA_OIDC_CLIENT_ID` `OPENFGA_OIDC_USERNAME` `OPENFGA_OIDC_PASSWORD` | unset | the minted credential. **Setting any one of them puts the process on the OIDC path**, and a partial set fails closed there rather than degrading to an unauthenticated Check |
+| `OPENFGA_OIDC_CLIENT_SECRET` `OPENFGA_OIDC_SCOPE` `OPENFGA_OIDC_REFRESH_SKEW_SECONDS` `OPENFGA_OIDC_TIMEOUT_MS` | unset / `openid` / `120` / `5000` | optional provider settings |
+| `OPENFGA_API_TOKEN` | unset | the preshared token, for local runs and break-glass. **Ignored when the OIDC path is configured**, with one warning saying so |
 | `ENTITLEMENT_SIGNING_KEY_PEM` or `ENTITLEMENT_SIGNING_KEY_FILE` | unset | the Ed25519 PKCS#8 signing key; **unset means no assertion is ever sent** |
 | `ENTITLEMENT_SIGNING_KID` | unset (derived from a key FILE's basename) | the JOSE `kid`; production mints under `ent-2026-09` or the spine silently redacts |
 | `ENTITLEMENT_SIGNING_ISSUER` | the contract's `ENTITLEMENT_ISSUER` | the `iss` claim. **Do not set this until ingest-server's verifier has been taught the new value** — see below |
 | `ENTITLEMENT_GRANT_CACHE_TTL_MS` `ENTITLEMENT_GRANT_ERROR_TTL_MS` `ENTITLEMENT_GRANT_CACHE_MAX` | `30000` / `5000` / `10000` | grant cache bounds; a value that is not a positive number falls back to the default |
+
+### The route prefix, and why the edge must not rewrite it
+
+Production serves this behind `https://figurecollecting.com/api`, and the
+service serves that path **itself**. That is not a style choice.
+
+The DPoP `htu` check compares `COORDINATOR_PUBLIC_ORIGIN` plus the path **this
+process received**. A `stripPrefix` at the edge would leave every client signing
+a proof for `/api/coordinator.v1.CompareService/Compare` while the server
+compared it against `/coordinator.v1.CompareService/Compare`, and every request
+would come back 401 naming nothing in particular. So the prefix is served
+natively and the tunnel forwards the path unchanged.
+
+`/healthz` is the one exception and stays at the root. Only kubelet and the
+image HEALTHCHECK reach it, both in-cluster and both by literal path, and the
+public tunnel routes the prefix and nothing else — so leaving it unprefixed is
+what keeps the one unauthenticated route off the public surface. A request to
+`${prefix}/healthz` matches no route and gets the same 401 as anything else.
+
+`test/connect/prefix.test.ts` pins the failure mode directly: a caller whose
+token, key, device and nonce are all valid, but whose proof names the stripped
+path, is rejected.
+
+### The OpenFGA credential
+
+The Check presents a **minted** token, not a configured one. The authorization
+service authenticates callers against an OIDC provider whose tokens live ten
+minutes, so a static environment value is correct for ten minutes and then
+denies forever — silently, because a 401 is caught, counted as an error and
+turned into a deny. Every read would come back redacted with nothing in the log
+but a recurring "Check failed".
+
+- `client_credentials` with a **username and password**, which looks wrong and
+  is not: the provider models this caller as a service account whose app
+  password is presented beside the public client id. Both values are
+  url-encoded, so a password containing `&`, `=` or `+` survives the wire.
+- **Refreshed ahead of expiry** at `expires_in - OPENFGA_OIDC_REFRESH_SKEW_SECONDS`,
+  floored at half the lifetime so a short token cannot schedule its refresh in
+  the past and re-mint on every call.
+- **Single-flight**: a cold start under load mints once.
+- **Fails closed**: a mint failure denies and the Check is never made. Falling
+  through to an unauthenticated Check would produce the same redacted read and
+  a 401 in the log, sending an operator to the wrong system.
+- A **401 from OpenFGA** buys exactly one forced re-mint, then a deny. One, not
+  a loop: a credential that is wrong rather than stale must not become a request
+  storm against the provider.
+- The boot line names which path is active, and says `INCOMPLETE` with the
+  missing variable when the provider is only half configured.
+
+### The entitlement audit line
+
+One structured line per decision, at info level, on `app.log`:
+
+```json
+{"event":"entitlement.check","subject":"<uuid>","relation":"inventory_levels",
+ "object":"app:figurecollecting","decision":"allow","source":"openfga",
+ "latency_ms":7,"model_id":"01K…"}
+```
+
+`decision` is `allow` / `deny` / `error` / `unconfigured` / `bad_subject`, and
+`source` is `openfga` / `cache` / `coalesced` / `none`. A cache hit is a
+decision and says so, replaying the **original** outcome — a cached error-deny
+reported as a plain deny reads like a revocation that never happened. `error`
+carries `http_status` where there was one, so a 504 is distinguishable from a
+401, and `reason` where the status does not say: `transport`, `bad_body`,
+`token_mint_failed`.
+
+**Why it exists here and not in OpenFGA.** OpenFGA logs no authenticated
+subject, and the multicluster gateway collapses every caller into one mesh
+identity before the request arrives. The decision is per-caller; the record was
+not. This is the only place it can be written.
+
+**Why the subject is on it.** The estate's telemetry rule keeps `sub` off spans.
+That rule and this line are both right, because they are about different sinks:
+the line goes to the application log, behind the same boundary as the process,
+and never onto a span. Without the subject the record answers nothing. A subject
+that failed the uuid rule is recorded as `(invalid)` rather than verbatim — that
+value came from the host and could be an email.
+
+`src/entitlements` is a portable directory, so it cannot import this app's
+logger; it exposes a sink and `registerConnect` installs `app.log.info` into it.
+Unset, it falls back to the console rather than dropping the trail.
+
+### Fail-closed on the Check
+
+Any answer that is not an explicit `allowed: true` is a deny, and a non-2xx is
+an **error**-deny rather than a revocation. This already held — the Check is
+`axios.post` with no `validateStatus`, and axios's default rejects on anything
+outside 2xx, which is what turns a sidecar's fast 504 during a partition into a
+deny rather than letting it sail past a check for a thrown connection error.
+
+`test/entitlements/fail-closed.test.ts` pins it, and pins it so it cannot pass
+for the wrong reason: every non-2xx fixture carries `{"allowed": true}`, so a
+mutation adding `validateStatus: () => true` turns the body into an accepted
+grant and the suite red. There is a source assertion beside it, because
+behaviour alone cannot catch every way the rule could be loosened.
 
 ### Edge authentication (OIDC + DPoP)
 
@@ -325,6 +425,15 @@ decision. So:
   fc-backend**: teach ingest-server's verifier the new issuer (or a list),
   deploy that, and only then set this variable. The reverse order redacts
   everything with no signal.
+- **In production this is set explicitly to `fc-coordinator`**, and the code
+  default deliberately stays the contract's. The spine already accepts
+  `fc-backend,fc-coordinator`, so the first half of that order is done and the
+  variable can be set today. Setting it in the manifest rather than changing the
+  default is what **decouples** the later narrowing: once ingest-server drops
+  `fc-backend` from its accepted issuers, nothing here has to change in step. A
+  coordinator relying on the default would have minted under `fc-backend` and
+  redacted every read from that moment, with a healthy boot line, OpenFGA
+  allowing, and the spine saying `wrong_issuer` into the void.
 
 `test/connect/compare.test.ts` pins the failure end to end: with OpenFGA
 allowing, a good key, a real uuid and a valid signature, a mismatched issuer
