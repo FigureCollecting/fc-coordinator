@@ -11,6 +11,14 @@ const MIGRATIONS = path.join(REPO, 'migrations');
 const DB = 'fccoord';
 const MIGRATOR = 'fc_coordinator_migrator';
 const MIGRATOR_PW = 'migrator-pw';
+// The APPLICATION role. 0000_grants.sql names it literally, because it is the
+// role the deployed DSN connects as — the migration and the Deployment share
+// one contract and a mismatch must fail loudly here rather than silently in
+// production. The migrator's name, by contrast, is NOT hardcoded anywhere: the
+// grants file uses the CURRENT role, which is why this fixture can run under a
+// differently-named migrator and still prove the real behaviour.
+const APP = 'coordinator';
+const APP_PW = 'app-pw';
 
 // ---------------------------------------------------------------------------
 // Static suite: doctrine that holds without a database.
@@ -18,8 +26,14 @@ const MIGRATOR_PW = 'migrator-pw';
 describe('migrations — numbered-SQL doctrine', () => {
   const files = readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql')).sort();
 
-  it('ships exactly the slice-1a pair, numbered NNNN_ and gap-free', () => {
-    expect(files).toEqual(['0001_identity.sql', '0002_collection.sql']);
+  it('ships the grants file ahead of the slice-1a pair, numbered NNNN_ and gap-free', () => {
+    // 0000 FIRST, and the ordering is the whole point: ALTER DEFAULT PRIVILEGES
+    // applies to objects created AFTER it, so a grants file numbered above 0001
+    // would grant nothing on the tables 0001 and 0002 create. migrate.sh also
+    // refuses a back-dated prefix (exit 6), so this file can never be added
+    // later to a database that has already applied 0001 — it is 0000 or it is a
+    // hand-run psql nobody can prove.
+    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql']);
   });
 
   it('contains no transaction control — the runner owns the boundaries (psql -1)', () => {
@@ -79,6 +93,7 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     // The migrator is a NON-SUPERUSER schema owner — the estate's three-role
     // model. migrate.sh refuses to run as a superuser.
     await asSuper(`CREATE ROLE ${MIGRATOR} LOGIN PASSWORD '${MIGRATOR_PW}' NOSUPERUSER`);
+    await asSuper(`CREATE ROLE ${APP} LOGIN PASSWORD '${APP_PW}' NOSUPERUSER`);
     await asSuper(`CREATE DATABASE ${DB} OWNER ${MIGRATOR}`);
   }, 240_000);
 
@@ -86,19 +101,61 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     await pg?.stop();
   });
 
-  it('applies both migrations in one run and records them in the ledger', async () => {
+  it('applies all three migrations in one run and records them in the ledger', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=2 skipped=0');
+    expect(run.output).toContain('applied=3 skipped=0');
 
     const ledger = await asMigratorDb('SELECT filename FROM schema_migrations ORDER BY filename');
-    expect(ledger.stdout.trim().split('\n')).toEqual(['0001_identity.sql', '0002_collection.sql']);
+    expect(ledger.stdout.trim().split('\n')).toEqual([
+      '0000_grants.sql',
+      '0001_identity.sql',
+      '0002_collection.sql',
+    ]);
   });
 
   it('is a no-op on re-run', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=2');
+    expect(run.output).toContain('applied=0 skipped=3');
+  });
+
+  // ── The two-role split, proven rather than described ──────────────────────
+  // This is the same assertion as the cluster acceptance (C21 A4). It belongs
+  // here as well as there: a migration that grants nothing is indistinguishable
+  // from one that grants correctly until an application tries to read, and the
+  // error it then raises is SQLSTATE 42501, which fc-coordinator's error mapper
+  // turns into INTERNAL — i.e. it looks like a bug in the service, not like a
+  // permissions problem in the schema.
+  const asApp = (sql: string, db = DB): Promise<ExecResult> =>
+    pg.exec(['psql', '-U', APP, '-d', db, '-At', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
+
+  it('lets the APP role read and write rows in tables the migrator created', async () => {
+    const read = await asApp('SELECT count(*) FROM app_user');
+    expect(read.exitCode).toBe(0);
+
+    const write = await asApp(
+      "INSERT INTO app_user (id, display_name) VALUES ('99999999-9999-9999-9999-999999999999', 'app-writes')",
+    );
+    expect(write.exitCode).toBe(0);
+    const cleanup = await asApp(
+      "DELETE FROM app_user WHERE id = '99999999-9999-9999-9999-999999999999'",
+    );
+    expect(cleanup.exitCode).toBe(0);
+  });
+
+  it('REFUSES DDL from the APP role — the half that makes the split real', async () => {
+    const ddl = await asApp('CREATE TABLE zt_probe (i int)');
+    expect(ddl.exitCode).not.toBe(0);
+    // 42501 = insufficient_privilege. Asserted by CODE, not by message text,
+    // because the message is localised and the code is the contract.
+    expect(ddl.output).toMatch(/42501|permission denied/i);
+  });
+
+  it('REFUSES TRUNCATE from the APP role — a delete it could never audit row by row', async () => {
+    const truncate = await asApp('TRUNCATE app_user');
+    expect(truncate.exitCode).not.toBe(0);
+    expect(truncate.output).toMatch(/42501|permission denied|must be owner/i);
   });
 
   it('creates app_user keyed by the Authentik uuid with soft delete and no password column', async () => {
@@ -215,7 +272,7 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
   it('still exits 0 on a correctly named directory', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=2');
+    expect(run.output).toContain('applied=0 skipped=3');
   });
 
   it('refuses the whole run when an applied migration has been edited on disk', async () => {

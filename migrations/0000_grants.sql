@@ -1,0 +1,111 @@
+-- 0000_grants.sql — the four statements that make two database roles WORK rather than BREAK.
+--
+-- Runs FIRST, as the MIGRATOR, through scripts/migrate.sh (ledger row + sha256, atomic with the
+-- file under psql -1). It is a MIGRATION rather than a hand-run psql for one reason: an
+-- un-versioned grant is a grant nobody can prove was applied, and the whole point of splitting the
+-- owner from the application is that the split is provable.
+--
+-- ── WHY IT MUST BE 0000 AND CAN NEVER BE ADDED LATER ────────────────────────────────────────────
+-- ALTER DEFAULT PRIVILEGES applies to objects created AFTER it runs. Numbered above 0001 it would
+-- grant nothing on the tables 0001 and 0002 create. And migrate.sh refuses a pending file whose
+-- prefix is at or below the highest APPLIED prefix (exit 6, "out-of-order migration"), so once a
+-- database has applied 0001 this file can never enter its ledger at all — the only remaining route
+-- would be the hand-run psql the header above rules out. It is 0000 on the first run, or it is
+-- unprovable forever.
+--
+-- ── WHAT GOES WRONG WITHOUT THIS FILE ───────────────────────────────────────────────────────────
+-- The migrator owns the database, so every table 0001 and 0002 create belongs to it. The
+-- application role is a different role and inherits nothing, so it would see a schema full of
+-- tables it may not touch. The failure is SQLSTATE 42501, and src/connect/interceptors.ts maps an
+-- unrecognised pg error to INTERNAL rather than PERMISSION_DENIED — so the service reports a BUG,
+-- not a permissions problem, and an operator goes looking in the wrong file.
+--
+-- ── WHY DEFAULT PRIVILEGES AND NOT "ON ALL TABLES" ──────────────────────────────────────────────
+-- GRANT ... ON ALL TABLES IN SCHEMA public applies to the tables that exist RIGHT NOW. It would
+-- cover 0001 and 0002 and silently miss every table any future migration adds — a regression that
+-- appears months later, in one endpoint, as an INTERNAL error.
+--
+-- ── THE MIGRATOR IS NOT NAMED HERE, AND THAT IS DELIBERATE ──────────────────────────────────────
+-- ALTER DEFAULT PRIVILEGES with no FOR ROLE clause attaches to the CURRENT role, which is always
+-- exactly the role creating the tables, because it is the role running this runner.
+--
+-- THE REASON IS TESTABILITY, NOT SAFETY, and an earlier version of this comment got that wrong.
+-- It claimed a hardcoded `FOR ROLE coordinator_migrator` would fail SILENTLY under a
+-- differently-named credential. It does not. Measured on PostgreSQL 17:
+--
+--     $ psql -U other_migrator -c 'ALTER DEFAULT PRIVILEGES FOR ROLE coordinator_migrator
+--                                  IN SCHEMA public GRANT SELECT ON TABLES TO coordinator;'
+--     ERROR:  permission denied to change default privileges
+--
+-- A role that is not a member of the target cannot set defaults on its behalf, so the hardcoded
+-- form fails LOUDLY and, under `psql -1` with ON_ERROR_STOP, rolls this whole file back with the
+-- ledger left clean. Do not carry the old claim forward: it would teach a false fact about
+-- PostgreSQL and make a future maintainer distrust `FOR ROLE` where it is the right tool.
+--
+-- The real reason to drop the clause is that the test fixture runs as `fc_coordinator_migrator`
+-- while production runs as `coordinator_migrator`. A hardcoded name could therefore never be
+-- exercised by the suite at all, and an untested privilege model is exactly what this estate
+-- refuses. The current form is the one the tests actually run.
+--
+-- AND IT CANNOT OVER-GRANT, which is the question dropping the clause naturally raises. Default
+-- privileges are keyed on `defaclrole`, so they reach only objects created by the role that set
+-- them. Measured on the same database: after this file runs, `pg_default_acl` holds exactly the
+-- migrator's rows, and a table created by ANY other role — the application role included — gets
+-- nothing:
+--
+--     made_by_migrator  app_can_select=true
+--     made_by_other     app_can_select=false
+--
+-- The APPLICATION role, by contrast, IS named literally: `coordinator` is the role the deployed
+-- DSN connects as, so the migration and the Deployment share one contract. If the role does not
+-- exist, the GRANT below fails with `role "coordinator" does not exist`, psql -1 rolls the whole
+-- file back, and the ledger stays clean. Loud, and at the right moment.
+--
+-- ── WHAT IS DELIBERATELY NOT GRANTED ────────────────────────────────────────────────────────────
+-- No CREATE on schema public, so the app role can never DDL. No TRUNCATE — a delete it could never
+-- audit row by row. No REFERENCES, no TRIGGER. PG15+ already removed PUBLIC's CREATE on the public
+-- schema and the app role is not the schema owner, so the DDL refusal is the database's own
+-- default rather than something this file arranges; test/migrations.test.ts proves it anyway,
+-- because a privilege model nobody exercises is a privilege model nobody has checked.
+--
+-- ── AN INVARIANT THIS FILE DEPENDS ON WITHOUT STATING IT ────────────────────────────────────────
+-- migrate.sh creates `schema_migrations` BEFORE the apply loop (the ledger block precedes the
+-- per-file loop), so the ledger already exists when this file runs and the defaults set below
+-- never reach it. That is why the application role holds NOTHING on the migration ledger and
+-- cannot rewrite its own schema provenance — measured, not assumed:
+--
+--     device             select=true  insert=true  update=true
+--     schema_migrations  select=false insert=false update=false
+--
+-- It is a good outcome that nobody designed, which makes it fragile. IF THE RUNNER IS EVER
+-- REORDERED so the ledger is created after the first migration, the app role silently gains write
+-- access to migration provenance, and nothing here or in the acceptance ladder would notice.
+--
+-- NO transaction control in this file: migrate.sh owns the boundary (a top-level BEGIN/COMMIT
+-- refuses the whole run, exit 5) and wraps this file and its ledger row in one -1 transaction.
+
+-- May open a connection to this database at all. PUBLIC holds CONNECT by default, so this is
+-- belt-and-braces — and it is the line that keeps working on the day someone revokes CONNECT from
+-- PUBLIC, which is exactly the hardening this estate is applying elsewhere.
+--
+-- Built through \gexec rather than written literally because the database NAME differs between the
+-- deployment (`coordinator`) and the test fixture (`fccoord`), and a migration that only works
+-- against one of them is a migration the suite cannot exercise. A plpgsql DO block would have done
+-- the same job, but its `BEGIN` sits at the start of a line and the doctrine scan reads that as
+-- transaction control.
+SELECT format('GRANT CONNECT ON DATABASE %I TO coordinator', current_database())
+\gexec
+
+-- May see into the schema. Without USAGE every object inside is invisible regardless of any
+-- table-level grant below.
+GRANT USAGE ON SCHEMA public TO coordinator;
+
+-- Rows, from every table the migrator creates from here on.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO coordinator;
+
+-- Sequences behind every `bigserial` / identity column. USAGE is what nextval() needs; SELECT is
+-- what currval() and lastval() need. Without these, an INSERT into a table the app may write fails
+-- at the column DEFAULT — which reads as a table-permission bug and is not one.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT USAGE, SELECT ON SEQUENCES TO coordinator;
