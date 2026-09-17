@@ -546,9 +546,18 @@ describe('grantsForSubject — a bound of zero is not a bound', () => {
       });
       configure(stub.baseUrl, { OPENFGA_TIMEOUT_MS: value });
 
-      const started = Date.now();
+      // performance.now(), NOT Date.now(): this is an ELAPSED-TIME measurement
+      // and Date.now() is not monotonic. On this estate's WSL2 hosts the host
+      // clock resyncs backwards by a whole second often enough to be seen —
+      // measured at 2 of 10 runs, with the same signature every time
+      // ("expected -933 to be greater than 500", a NEGATIVE duration), and it
+      // reproduces identically on develop, so it predates this test's last
+      // change. performance.now() is monotonic by definition and cannot go
+      // backwards, which removes the failure mode entirely without weakening
+      // the assertion by an inch.
+      const started = performance.now();
       await expect(grantsForSubject(SUB)).resolves.toEqual([]);
-      const elapsed = Date.now() - started;
+      const elapsed = performance.now() - started;
 
       // THE LOAD-BEARING ASSERTION IS THAT IT SETTLED AT ALL. With the bound
       // honoured as zero the promise never resolves and this case fails on the

@@ -93,6 +93,12 @@ export interface AuthPluginOptions {
   devices: DeviceStore;
   /** Injected so tests need no Authentik and no network. */
   verifyAccessToken: AccessTokenVerifier;
+  /**
+   * Mount the enrolment routes under this. buildApp passes the service-wide
+   * COORDINATOR_ROUTE_PREFIX; the hook itself is global and needs no prefix,
+   * because it runs on EVERY request including one that matched no route.
+   */
+  routePrefix?: string;
 }
 
 /** Handles the edge holds. Exposed so tests can assert the state budget. */
@@ -280,7 +286,7 @@ export function registerAuth(app: FastifyInstance, options: AuthPluginOptions): 
 
   app.addHook('onRequest', enforce);
 
-  registerAuthRoutes(app, { runtime });
+  registerAuthRoutes(app, { runtime, prefix: options.routePrefix ?? '' });
 
   return runtime;
 }

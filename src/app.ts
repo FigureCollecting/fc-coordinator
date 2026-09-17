@@ -24,6 +24,7 @@
 // so an auth misconfiguration cannot take /healthz down with it.
 // ============================================================================
 import Fastify, { type FastifyInstance } from 'fastify';
+import { validateRoutePrefix } from './auth/config.js';
 import { registerAuth, type AuthPluginOptions } from './auth/plugin.js';
 import { probeDatabase, type QueryableDb } from './db/pool.js';
 import { registerHttpTracing } from './platform/http-trace.js';
@@ -64,6 +65,14 @@ export interface BuildAppOptions {
    * protects this is test/connect/guarded.test.ts, which asks the socket.
    */
   compare?: ConnectOptions;
+  /**
+   * Serve everything except /healthz under this path. `''` — the default HERE —
+   * is the root, which is what every test that does not care about the edge
+   * wants. The PROCESS default is `/api`: src/server.ts reads it through
+   * resolveRoutePrefix, so the deployed shape comes from the env contract while
+   * this factory stays a library with no hidden environment read.
+   */
+  routePrefix?: string;
 }
 
 /**
@@ -86,6 +95,11 @@ export interface HealthBody {
 }
 
 export function buildApp(options: BuildAppOptions): FastifyInstance {
+  // Validated even when injected directly: a caller that hands in 'api' would
+  // otherwise mount `apicoordinator.v1…` and answer 401 to everything with no
+  // clue why.
+  const routePrefix = validateRoutePrefix(options.routePrefix ?? '');
+
   const app = Fastify({
     loggerInstance: createStructuredLogger({
       name: SERVICE_NAME,
@@ -95,11 +109,18 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
   });
 
   registerHttpTracing(app, { ignorePaths: ['/healthz'] });
-  if (options.auth !== undefined) registerAuth(app, options.auth);
+  if (options.auth !== undefined) registerAuth(app, { ...options.auth, routePrefix });
 
   // THE PUBLIC ALLOWLIST, in full. The auth hook is deny-by-default, so this
   // is the only thing in the service that answers without credentials — and it
   // has to, because kubelet and the image HEALTHCHECK carry none.
+  //
+  // UNPREFIXED, deliberately, and it is the ONE route that does not move. Only
+  // kubelet and the image HEALTHCHECK reach it, both in-cluster and both by
+  // literal path; the public tunnel routes the prefix and nothing else, so
+  // leaving it at the root is what keeps the one unauthenticated route off the
+  // public surface entirely. `${prefix}/healthz` is an unknown path and gets
+  // the same 401 as anything else that matched no route.
   app.get('/healthz', { config: { auth: 'public' } }, async (_request, reply) => {
     const probe = await probeDatabase(options.db);
 
@@ -112,7 +133,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
     return reply.code(probe.reachable ? 200 : 503).send(body);
   });
 
-  if (options.compare) registerConnect(app, options.compare);
+  if (options.compare) registerConnect(app, { ...options.compare, routePrefix });
 
   return app;
 }

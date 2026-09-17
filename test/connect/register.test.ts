@@ -24,6 +24,7 @@ import { CALLER_IDENTITY_DECORATOR } from '../../src/connect/identity.js';
 import {
   resetEntitlementGrantsForTest,
   resetEntitlementSigningForTest,
+  resetOpenFgaTokenForTest,
 } from '../../src/entitlements/index.js';
 import { startTelemetry, type Telemetry } from '../../src/platform/telemetry.js';
 import { generateTestSigningKey } from '../helpers/entitlementVerifier.js';
@@ -73,6 +74,9 @@ afterEach(async () => {
   }
   resetEntitlementGrantsForTest();
   resetEntitlementSigningForTest();
+  // The credential path is one-shot module state too: without this, the boot
+  // line is logged by whichever test ran first and no later test can see it.
+  resetOpenFgaTokenForTest();
   vi.restoreAllMocks();
 });
 
@@ -151,6 +155,21 @@ describe('the boot-time signing check', () => {
     expect(logged).toContain('minting enabled');
     expect(logged).toContain(KID);
     expect(logged).not.toContain('PRIVATE KEY');
+  });
+
+  it('also names the OpenFGA credential path, for the same reason', async () => {
+    // A ten-minute token that was silently absent is exactly the failure the
+    // signing boot line already guards against on the mint side. `initSigning`
+    // governs both, because they are one question: "is this process actually
+    // able to do the thing it is here to do?"
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await startWithDefaultResolver({ decorate: { sub: SUB } });
+
+    const printed = [...logSpy.mock.calls, ...warnSpy.mock.calls]
+      .map((args) => args.map(String).join(' '))
+      .join('\n');
+    expect(printed).toContain('OpenFGA credential');
   });
 
   it('can be turned off without changing whether minting works', async () => {

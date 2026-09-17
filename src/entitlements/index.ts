@@ -54,6 +54,11 @@ export {
   grantsForSubject,
   entitlementGrantCounters,
   resetEntitlementGrantsForTest,
+  setEntitlementAuditSink,
+  type EntitlementAuditEvent,
+  type EntitlementAuditSink,
+  type EntitlementAuditSource,
+  type EntitlementDecision,
 } from './grants.js';
 
 export { isEntitlementSubject, ENTITLEMENT_SUBJECT_PATTERN } from './subject.js';
@@ -65,3 +70,12 @@ export {
   resetEntitlementSigningForTest,
   type MintRequest,
 } from './assertion.js';
+
+export {
+  initOpenFgaAuth,
+  describeOpenFgaAuth,
+  openFgaAuthMode,
+  openFgaTokenCounters,
+  resetOpenFgaTokenForTest,
+  type OpenFgaAuthMode,
+} from './openfgaToken.js';

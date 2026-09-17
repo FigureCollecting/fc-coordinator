@@ -48,6 +48,7 @@
 import axios from 'axios';
 import { INVENTORY_LEVELS, type EntitlementName } from '@figurecollecting/ingest-contract/entitlement';
 import { mintEntitlementAssertion } from './assertion.js';
+import { openFgaAuthHeaders, openFgaAuthMode } from './openfgaToken.js';
 import { isEntitlementSubject } from './subject.js';
 
 /** Nothing granted. A frozen shared value so a caller cannot mutate the denial. */
@@ -71,13 +72,101 @@ const DEFAULT_TIMEOUT_MS = 2_000;
  */
 const DEFAULT_CACHE_MAX_ENTRIES = 10_000;
 
-interface CacheEntry {
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THE AUDIT SEAM.
+ *
+ * OpenFGA logs no authenticated subject — a Check entry names the store, the
+ * method and a request id, and nothing that says WHO asked — and the
+ * multicluster gateway collapses every caller into one mesh identity before the
+ * request arrives. So the decision is per-caller and the record is not, and the
+ * only place the distinction can be written down is here, at the caller.
+ *
+ * COUNTERS ARE NOT AN AUDIT TRAIL. "seventeen denies" answers no question worth
+ * asking after the fact.
+ *
+ * THE SUBJECT GOES IN THE LINE, AND IT DOES NOT GO ON A SPAN. Those are not in
+ * conflict, they are about different sinks: the estate's telemetry rule keeps
+ * `sub` off spans, where it would fan out to a collector and a trace store,
+ * while this line stays in the application log behind the same boundary as the
+ * process. The subject is a pseudonymous provider uuid, and without it the
+ * record answers nothing. Do not "fix" this by dropping it, and do not "fix"
+ * the span rule by adding it.
+ *
+ * WHY A SINK VARIABLE RATHER THAN AN IMPORT. This directory is a portable copy
+ * — test/entitlements/portability.test.ts fails the build if it reaches outside
+ * itself for anything but axios and the contract — so it cannot import the host
+ * application's logger. The host installs one; unset falls back to the console,
+ * because a module that silently drops its audit trail when copied into a new
+ * host is worse than one that never had it.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+/** What the Check concluded. `error` is a sick dependency; `deny` is a revoked user. */
+export type EntitlementDecision = 'allow' | 'deny' | 'error' | 'unconfigured' | 'bad_subject';
+
+/** Where the answer came from. A cache hit is still a decision. */
+export type EntitlementAuditSource = 'openfga' | 'cache' | 'coalesced' | 'none';
+
+export interface EntitlementAuditEvent {
+  event: 'entitlement.check';
+  /** The provider uuid the question was asked about. Never on a span. */
+  subject: string;
+  relation: string;
+  object: string;
+  decision: EntitlementDecision;
+  source: EntitlementAuditSource;
+  /** Measured around the HTTP call. Zero when there was not one. */
+  latency_ms: number;
+  /** The pinned model, when one is pinned — the answer is only reproducible against it. */
+  model_id?: string;
+  /** Present when OpenFGA answered, so a 504 is distinguishable from a 401. */
+  http_status?: number;
+  /** Why, when the status does not say: `transport`, `bad_body`, `token_mint_failed`. */
+  reason?: string;
+}
+
+export type EntitlementAuditSink = (event: EntitlementAuditEvent) => void;
+
+/**
+ * Stands in for a subject that failed the uuid rule. That value came from the
+ * host and can be anything it had to hand — an email, a session id, a username
+ * — so the DECISION belongs in the record and the value does not.
+ */
+const REDACTED_SUBJECT = '(invalid)';
+
+let auditSink: EntitlementAuditSink | null = null;
+
+/** Install the host's logger. Pass null to go back to the console. */
+export const setEntitlementAuditSink = (sink: EntitlementAuditSink | null): void => {
+  auditSink = sink;
+};
+
+function emitAudit(event: EntitlementAuditEvent): void {
+  try {
+    if (auditSink !== null) auditSink(event);
+    else console.info('[ENTITLEMENT]', JSON.stringify(event));
+  } catch {
+    // An audit line is a RECORD, not a gate. A host whose logger throws must
+    // not turn every entitled read into a denial; that would be a fail-closed
+    // rule applied to the one thing it should never govern.
+  }
+}
+
+/** The answer, plus everything the record needs to say about how it was reached. */
+interface Decision {
   grants: readonly EntitlementName[];
+  decision: EntitlementDecision;
+  httpStatus?: number;
+  reason?: string;
+}
+
+interface CacheEntry extends Decision {
   expiresAt: number;
 }
 
 const cache = new Map<string, CacheEntry>();
-const inflight = new Map<string, Promise<readonly EntitlementName[]>>();
+const inflight = new Map<string, Promise<Decision>>();
 const counters = new Map<string, number>();
 let warnedUnconfigured = false;
 
@@ -85,10 +174,15 @@ const bump = (name: string): void => {
   counters.set(name, (counters.get(name) ?? 0) + 1);
 };
 
-/** Snapshot: `allow`, `deny`, `error`, `unconfigured`, `bad_subject`, `cache_hit`, `coalesced`, `evicted`. */
+/** Snapshot: `allow`, `deny`, `error`, `unconfigured`, `bad_subject`, `cache_hit`, `coalesced`, `evicted`, `reminted`. */
 export const entitlementGrantCounters = (): Readonly<Record<string, number>> => Object.fromEntries(counters);
 
-/** Test seam: drop the cache, the in-flight map, the counters and the one-shot warning. */
+/**
+ * Test seam: drop the cache, the in-flight map, the counters and the one-shot
+ * warning. The audit sink is NOT cleared — it is host wiring installed once at
+ * boot, not per-request state, and clearing it here would silently unwire the
+ * one thing a test might be asserting on.
+ */
 export const resetEntitlementGrantsForTest = (): void => {
   cache.clear();
   inflight.clear();
@@ -111,12 +205,37 @@ const num = (raw: string | undefined, fallback: number): number => {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 };
 
+/** What one Check came back as. `errored` separates a sick dependency from a revoked user. */
+interface CheckOutcome {
+  allowed: boolean;
+  errored: boolean;
+  /** Present when OpenFGA answered at all, so a 504 is distinguishable from a 401. */
+  httpStatus?: number;
+  /** Why, when the reason is not simply the status. */
+  reason?: string;
+}
+
 /**
  * Ask OpenFGA. Resolves to `true` ONLY on an explicit `allowed: true`;
  * everything else resolves to `false` and is counted as an error rather than a
  * deny, so an operator can tell a revoked user apart from a sick dependency.
+ *
+ * NO `validateStatus`, AND THAT IS LOAD-BEARING. axios's default rejects on any
+ * non-2xx, which is what turns a proxy's fast 504 during a partition into an
+ * error-deny here. A partition does NOT surface as a transport exception — the
+ * sidecar answers — so fail-closed logic keying on a thrown connection error
+ * would sail straight past it. Setting `validateStatus` at all would move every
+ * non-2xx into the success branch, where the body has no boolean `allowed` and
+ * the outcome happens to stay a deny for the wrong reason. Pinned by
+ * test/entitlements/fail-closed.test.ts, both behaviourally and as source.
+ *
+ * ONE RETRY, ONLY ON 401, ONLY ON THE OIDC PATH. A cached token that expired or
+ * was rotated under us is the one failure a retry can fix, and it is bounded at
+ * one: re-mint, ask again, and if the answer is still 401 then the credential
+ * is wrong rather than stale, and looping would turn that into a request storm
+ * against the identity provider.
  */
-async function check(subject: string, env: NodeJS.ProcessEnv): Promise<{ allowed: boolean; errored: boolean }> {
+async function check(subject: string, env: NodeJS.ProcessEnv, nowMs: number): Promise<CheckOutcome> {
   const apiUrl = env.OPENFGA_API_URL?.trim();
   const storeId = env.OPENFGA_STORE_ID?.trim();
   if (!apiUrl || !storeId) {
@@ -127,7 +246,7 @@ async function check(subject: string, env: NodeJS.ProcessEnv): Promise<{ allowed
         '[ENTITLEMENT] OpenFGA is not configured (OPENFGA_API_URL / OPENFGA_STORE_ID) — every entitlement check denies and spine reads come back redacted. Expected until the authz substrate is wired.'
       );
     }
-    return { allowed: false, errored: false };
+    return { allowed: false, errored: false, reason: 'unconfigured' };
   }
 
   const body: Record<string, unknown> = {
@@ -142,33 +261,68 @@ async function check(subject: string, env: NodeJS.ProcessEnv): Promise<{ allowed
   const modelId = env.OPENFGA_MODEL_ID?.trim();
   if (modelId) body.authorization_model_id = modelId;
 
-  const token = env.OPENFGA_API_TOKEN?.trim();
-  try {
-    const response = await axios.post(`${apiUrl.replace(/\/+$/, '')}/stores/${storeId}/check`, body, {
-      timeout: num(env.OPENFGA_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
-      headers: {
-        'content-type': 'application/json',
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
-      },
-    });
-    const data: unknown = response.data;
-    if (typeof data !== 'object' || data === null || Array.isArray(data)) {
-      // A 200 carrying something that is not a Check response is a wire-level
-      // surprise, not a decision. Treated as a fault so it shows up as one.
-      console.error('[ENTITLEMENT] OpenFGA Check returned an unexpected body shape — denying');
-      return { allowed: false, errored: true };
+  const url = `${apiUrl.replace(/\/+$/, '')}/stores/${storeId}/check`;
+  const timeout = num(env.OPENFGA_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+  const canRemint = openFgaAuthMode(env) === 'oidc';
+  let reminted = false;
+
+  for (;;) {
+    const auth = await openFgaAuthHeaders(env, nowMs, { forceRefresh: reminted });
+    if (auth === undefined) {
+      // A credential IS configured and could not be obtained. Never fall
+      // through to an unauthenticated Check: OpenFGA would answer 401 and the
+      // outcome would be identical, but the record would name the wrong cause.
+      return { allowed: false, errored: true, reason: 'token_mint_failed' };
     }
-    const allowed = (data as { allowed?: unknown }).allowed;
-    if (typeof allowed !== 'boolean') {
-      console.error('[ENTITLEMENT] OpenFGA Check response has no boolean `allowed` — denying');
-      return { allowed: false, errored: true };
+
+    try {
+      const response = await axios.post(url, body, {
+        timeout,
+        // A 3xx IS THE ONE NON-2xx THE RULE ABOVE DOES NOT COVER, because it
+        // never reaches it: axios follows the redirect and the answer arrives
+        // as a 200 from somewhere else entirely. So the fail-closed rule held
+        // for every status class that had been asked about and failed OPEN for
+        // the one that had not. A redirect target answering `{"allowed": true}`
+        // could issue the grant, unauthenticated — the bearer is dropped on a
+        // cross-host hop, so what leaks is not a credential but the DECISION.
+        //
+        // With this at 0 the 3xx comes back as an ordinary response and the
+        // default validateStatus rejects it, so it denies like any other
+        // non-2xx. Pinned in test/entitlements/redirect.test.ts across 301,
+        // 302, 303, 307 and 308, each with a body claiming a grant.
+        maxRedirects: 0,
+        headers: { 'content-type': 'application/json', ...auth },
+      });
+      const data: unknown = response.data;
+      if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+        // A 200 carrying something that is not a Check response is a wire-level
+        // surprise, not a decision. Treated as a fault so it shows up as one.
+        console.error('[ENTITLEMENT] OpenFGA Check returned an unexpected body shape — denying');
+        return { allowed: false, errored: true, httpStatus: response.status, reason: 'bad_body' };
+      }
+      const allowed = (data as { allowed?: unknown }).allowed;
+      if (typeof allowed !== 'boolean') {
+        console.error('[ENTITLEMENT] OpenFGA Check response has no boolean `allowed` — denying');
+        return { allowed: false, errored: true, httpStatus: response.status, reason: 'bad_body' };
+      }
+      return { allowed, errored: false, httpStatus: response.status };
+    } catch (err) {
+      const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+      if (status === 401 && canRemint && !reminted) {
+        reminted = true;
+        bump('reminted');
+        continue;
+      }
+      // The message ONLY. An axios error carries the full request config,
+      // headers included, so anything broader than this prints the credential.
+      console.error('[ENTITLEMENT] OpenFGA Check failed — denying:', (err as Error).message);
+      return {
+        allowed: false,
+        errored: true,
+        ...(status === undefined ? {} : { httpStatus: status }),
+        reason: status === undefined ? 'transport' : 'http_error',
+      };
     }
-    return { allowed, errored: false };
-  } catch (err) {
-    // The message ONLY. An axios error carries the full request config,
-    // headers included, so anything broader than this prints the preshared key.
-    console.error('[ENTITLEMENT] OpenFGA Check failed — denying:', (err as Error).message);
-    return { allowed: false, errored: true };
   }
 }
 
@@ -215,18 +369,47 @@ export async function grantsForSubject(
   nowMs: number = Date.now(),
   env: NodeJS.ProcessEnv = process.env
 ): Promise<readonly EntitlementName[]> {
+  const relation = INVENTORY_LEVELS;
+  const object = env.OPENFGA_APP_OBJECT?.trim() || DEFAULT_APP_OBJECT;
+  const modelId = env.OPENFGA_MODEL_ID?.trim();
+
+  /** One line per decision, whichever of the four paths reached it. */
+  const audit = (
+    who: string,
+    decision: Decision,
+    source: EntitlementAuditSource,
+    latencyMs: number,
+  ): void => {
+    emitAudit({
+      event: 'entitlement.check',
+      subject: who,
+      relation,
+      object,
+      decision: decision.decision,
+      source,
+      latency_ms: latencyMs,
+      ...(modelId ? { model_id: modelId } : {}),
+      ...(decision.httpStatus === undefined ? {} : { http_status: decision.httpStatus }),
+      ...(decision.reason === undefined ? {} : { reason: decision.reason }),
+    });
+  };
+
   // The subject shape is enforced HERE, before anything is asked of OpenFGA.
   // A differently-shaped identifier is not a question OpenFGA can answer wrong
   // — it is a question no tuple can ever match, so the answer is a permanent,
   // silent `false`. See ./subject.ts.
   if (!isEntitlementSubject(subject)) {
     bump('bad_subject');
+    audit(REDACTED_SUBJECT, { grants: NO_GRANTS, decision: 'bad_subject' }, 'none', 0);
     return NO_GRANTS;
   }
 
   const hit = cache.get(subject);
   if (hit !== undefined && nowMs < hit.expiresAt) {
     bump('cache_hit');
+    // The ORIGINAL decision, replayed. A cached error-deny reported as a plain
+    // deny reads like a revocation that never happened.
+    audit(subject, hit, 'cache', 0);
     return hit.grants;
   }
 
@@ -235,23 +418,76 @@ export async function grantsForSubject(
   const pending = inflight.get(subject);
   if (pending !== undefined) {
     bump('coalesced');
-    return pending;
+    const shared = await pending;
+    audit(subject, shared, 'coalesced', 0);
+    return shared.grants;
   }
 
-  const run = (async (): Promise<readonly EntitlementName[]> => {
-    const { allowed, errored } = await check(subject, env);
-    const grants = allowed ? INVENTORY_GRANT : NO_GRANTS;
-    bump(errored ? 'error' : allowed ? 'allow' : 'deny');
-    const ttl = errored
+  const run = (async (): Promise<Decision> => {
+    // Elapsed time, so performance.now() and NOT Date.now(): the latter is not
+    // monotonic, and on this estate's WSL2 hosts it steps backwards by about a
+    // second often enough that commit fef12ca on this very branch had to fix
+    // the identical pattern in a test, where it produced a measured -933.
+    // Applying that fix to the test and not to the production measurement would
+    // have left the audit record free to carry a negative latency.
+    //
+    // `nowMs` is untouched by this: it is a fixed instant the caller chose for
+    // cache arithmetic, not a stopwatch.
+    const startedAt = performance.now();
+    const outcome = await check(subject, env, nowMs);
+    const latencyMs = Math.round(performance.now() - startedAt);
+
+    const grants = outcome.allowed ? INVENTORY_GRANT : NO_GRANTS;
+    // The counters keep their long-standing behaviour: an unconfigured client
+    // is counted by check() AND bumps `deny` here, exactly as before, so
+    // nothing that reads these numbers today changes. The AUDIT line is where
+    // the distinction is drawn, because that is the thing being added.
+    bump(outcome.errored ? 'error' : outcome.allowed ? 'allow' : 'deny');
+    const name: EntitlementDecision =
+      outcome.reason === 'unconfigured'
+        ? 'unconfigured'
+        : outcome.errored
+          ? 'error'
+          : outcome.allowed
+            ? 'allow'
+            : 'deny';
+
+    const decision: Decision = {
+      grants,
+      decision: name,
+      ...(outcome.httpStatus === undefined ? {} : { httpStatus: outcome.httpStatus }),
+      ...(outcome.reason === undefined || outcome.reason === 'unconfigured'
+        ? {}
+        : { reason: outcome.reason }),
+    };
+
+    const ttl = outcome.errored
       ? num(env.ENTITLEMENT_GRANT_ERROR_TTL_MS, DEFAULT_ERROR_TTL_MS)
       : num(env.ENTITLEMENT_GRANT_CACHE_TTL_MS, DEFAULT_CACHE_TTL_MS);
-    cacheSet(subject, { grants, expiresAt: nowMs + ttl }, nowMs, env);
-    return grants;
+    cacheSet(subject, { ...decision, expiresAt: nowMs + ttl }, nowMs, env);
+
+    // `source` NAMES WHERE THE ANSWER CAME FROM, and two decisions reach here
+    // having made no request at all: an unconfigured client, which returns
+    // before a request is even built, and a failed token mint, which refuses to
+    // ask unauthenticated. Reporting either as `openfga` says the service
+    // answered when it was never asked — and this is the one field separating a
+    // refusal by OpenFGA and a question that never got there, so anyone
+    // counting OpenFGA traffic by it would over-count by exactly the outage
+    // they are diagnosing. `bad_subject` already gets this right above.
+    //
+    // NOTE TO A FUTURE EDITOR: do not write the word `from` immediately before
+    // a quoted string anywhere in this directory, comments included. The
+    // portability guard's specifier extractor does not strip comments — on
+    // purpose, since a partial guard is worse than none — so it reads that
+    // shape as an import and fails the build. This comment cost one.
+    const asked = name !== 'unconfigured' && outcome.reason !== 'token_mint_failed';
+    audit(subject, decision, asked ? 'openfga' : 'none', asked ? latencyMs : 0);
+    return decision;
   })();
 
   inflight.set(subject, run);
   try {
-    return await run;
+    return (await run).grants;
   } finally {
     inflight.delete(subject);
   }
