@@ -32,6 +32,8 @@ const EXPECTED_FUNCTIONS = [
   'describeOpenFgaAuth',
   'openFgaAuthMode',
   'openFgaTokenCounters',
+  // the caller-side audit trail: the host installs its own logger
+  'setEntitlementAuditSink',
   // test seams
   'resetEntitlementGrantsForTest',
   'resetEntitlementSigningForTest',

@@ -14,7 +14,11 @@
 // ============================================================================
 import { fastifyConnectPlugin } from '@connectrpc/connect-fastify';
 import type { FastifyInstance } from 'fastify';
-import { initEntitlementSigning, initOpenFgaAuth } from '../entitlements/index.js';
+import {
+  initEntitlementSigning,
+  initOpenFgaAuth,
+  setEntitlementAuditSink,
+} from '../entitlements/index.js';
 import { createCompareRoutes, type CompareRoutesDeps } from './compare.js';
 import {
   decoratorIdentityResolver,
@@ -63,6 +67,21 @@ export interface ConnectOptions extends CompareRoutesDeps {
 }
 
 export function registerConnect(app: FastifyInstance, options: ConnectOptions): void {
+  // THE HOST'S HALF OF THE AUDIT SEAM. The portable module cannot import this
+  // app's logger and stay portable, so it exposes a sink and falls back to the
+  // console; here is where it stops being a fallback. `app.log` is the same
+  // logger every other line goes through, so the decision arrives tagged with
+  // the trace of the request it belonged to — which is the difference between a
+  // record and a pile of lines.
+  //
+  // INFO, not debug: this is an audit trail, and one that a log level can turn
+  // off in production is not one. And the LOG, never a span: the subject is on
+  // this line deliberately and must never reach the collector. See the seam's
+  // comment in src/entitlements/grants.ts.
+  setEntitlementAuditSink((event) => {
+    app.log.info(event, 'entitlement decision');
+  });
+
   if (options.initSigning !== false) {
     initEntitlementSigning();
     initOpenFgaAuth();

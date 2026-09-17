@@ -72,13 +72,101 @@ const DEFAULT_TIMEOUT_MS = 2_000;
  */
 const DEFAULT_CACHE_MAX_ENTRIES = 10_000;
 
-interface CacheEntry {
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THE AUDIT SEAM.
+ *
+ * OpenFGA logs no authenticated subject — a Check entry names the store, the
+ * method and a request id, and nothing that says WHO asked — and the
+ * multicluster gateway collapses every caller into one mesh identity before the
+ * request arrives. So the decision is per-caller and the record is not, and the
+ * only place the distinction can be written down is here, at the caller.
+ *
+ * COUNTERS ARE NOT AN AUDIT TRAIL. "seventeen denies" answers no question worth
+ * asking after the fact.
+ *
+ * THE SUBJECT GOES IN THE LINE, AND IT DOES NOT GO ON A SPAN. Those are not in
+ * conflict, they are about different sinks: the estate's telemetry rule keeps
+ * `sub` off spans, where it would fan out to a collector and a trace store,
+ * while this line stays in the application log behind the same boundary as the
+ * process. The subject is a pseudonymous provider uuid, and without it the
+ * record answers nothing. Do not "fix" this by dropping it, and do not "fix"
+ * the span rule by adding it.
+ *
+ * WHY A SINK VARIABLE RATHER THAN AN IMPORT. This directory is a portable copy
+ * — test/entitlements/portability.test.ts fails the build if it reaches outside
+ * itself for anything but axios and the contract — so it cannot import the host
+ * application's logger. The host installs one; unset falls back to the console,
+ * because a module that silently drops its audit trail when copied into a new
+ * host is worse than one that never had it.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+/** What the Check concluded. `error` is a sick dependency; `deny` is a revoked user. */
+export type EntitlementDecision = 'allow' | 'deny' | 'error' | 'unconfigured' | 'bad_subject';
+
+/** Where the answer came from. A cache hit is still a decision. */
+export type EntitlementAuditSource = 'openfga' | 'cache' | 'coalesced' | 'none';
+
+export interface EntitlementAuditEvent {
+  event: 'entitlement.check';
+  /** The provider uuid the question was asked about. Never on a span. */
+  subject: string;
+  relation: string;
+  object: string;
+  decision: EntitlementDecision;
+  source: EntitlementAuditSource;
+  /** Measured around the HTTP call. Zero when there was not one. */
+  latency_ms: number;
+  /** The pinned model, when one is pinned — the answer is only reproducible against it. */
+  model_id?: string;
+  /** Present when OpenFGA answered, so a 504 is distinguishable from a 401. */
+  http_status?: number;
+  /** Why, when the status does not say: `transport`, `bad_body`, `token_mint_failed`. */
+  reason?: string;
+}
+
+export type EntitlementAuditSink = (event: EntitlementAuditEvent) => void;
+
+/**
+ * Stands in for a subject that failed the uuid rule. That value came from the
+ * host and can be anything it had to hand — an email, a session id, a username
+ * — so the DECISION belongs in the record and the value does not.
+ */
+const REDACTED_SUBJECT = '(invalid)';
+
+let auditSink: EntitlementAuditSink | null = null;
+
+/** Install the host's logger. Pass null to go back to the console. */
+export const setEntitlementAuditSink = (sink: EntitlementAuditSink | null): void => {
+  auditSink = sink;
+};
+
+function emitAudit(event: EntitlementAuditEvent): void {
+  try {
+    if (auditSink !== null) auditSink(event);
+    else console.info('[ENTITLEMENT]', JSON.stringify(event));
+  } catch {
+    // An audit line is a RECORD, not a gate. A host whose logger throws must
+    // not turn every entitled read into a denial; that would be a fail-closed
+    // rule applied to the one thing it should never govern.
+  }
+}
+
+/** The answer, plus everything the record needs to say about how it was reached. */
+interface Decision {
   grants: readonly EntitlementName[];
+  decision: EntitlementDecision;
+  httpStatus?: number;
+  reason?: string;
+}
+
+interface CacheEntry extends Decision {
   expiresAt: number;
 }
 
 const cache = new Map<string, CacheEntry>();
-const inflight = new Map<string, Promise<readonly EntitlementName[]>>();
+const inflight = new Map<string, Promise<Decision>>();
 const counters = new Map<string, number>();
 let warnedUnconfigured = false;
 
@@ -89,7 +177,12 @@ const bump = (name: string): void => {
 /** Snapshot: `allow`, `deny`, `error`, `unconfigured`, `bad_subject`, `cache_hit`, `coalesced`, `evicted`, `reminted`. */
 export const entitlementGrantCounters = (): Readonly<Record<string, number>> => Object.fromEntries(counters);
 
-/** Test seam: drop the cache, the in-flight map, the counters and the one-shot warning. */
+/**
+ * Test seam: drop the cache, the in-flight map, the counters and the one-shot
+ * warning. The audit sink is NOT cleared — it is host wiring installed once at
+ * boot, not per-request state, and clearing it here would silently unwire the
+ * one thing a test might be asserting on.
+ */
 export const resetEntitlementGrantsForTest = (): void => {
   cache.clear();
   inflight.clear();
@@ -263,18 +356,47 @@ export async function grantsForSubject(
   nowMs: number = Date.now(),
   env: NodeJS.ProcessEnv = process.env
 ): Promise<readonly EntitlementName[]> {
+  const relation = INVENTORY_LEVELS;
+  const object = env.OPENFGA_APP_OBJECT?.trim() || DEFAULT_APP_OBJECT;
+  const modelId = env.OPENFGA_MODEL_ID?.trim();
+
+  /** One line per decision, whichever of the four paths reached it. */
+  const audit = (
+    who: string,
+    decision: Decision,
+    source: EntitlementAuditSource,
+    latencyMs: number,
+  ): void => {
+    emitAudit({
+      event: 'entitlement.check',
+      subject: who,
+      relation,
+      object,
+      decision: decision.decision,
+      source,
+      latency_ms: latencyMs,
+      ...(modelId ? { model_id: modelId } : {}),
+      ...(decision.httpStatus === undefined ? {} : { http_status: decision.httpStatus }),
+      ...(decision.reason === undefined ? {} : { reason: decision.reason }),
+    });
+  };
+
   // The subject shape is enforced HERE, before anything is asked of OpenFGA.
   // A differently-shaped identifier is not a question OpenFGA can answer wrong
   // — it is a question no tuple can ever match, so the answer is a permanent,
   // silent `false`. See ./subject.ts.
   if (!isEntitlementSubject(subject)) {
     bump('bad_subject');
+    audit(REDACTED_SUBJECT, { grants: NO_GRANTS, decision: 'bad_subject' }, 'none', 0);
     return NO_GRANTS;
   }
 
   const hit = cache.get(subject);
   if (hit !== undefined && nowMs < hit.expiresAt) {
     bump('cache_hit');
+    // The ORIGINAL decision, replayed. A cached error-deny reported as a plain
+    // deny reads like a revocation that never happened.
+    audit(subject, hit, 'cache', 0);
     return hit.grants;
   }
 
@@ -283,23 +405,53 @@ export async function grantsForSubject(
   const pending = inflight.get(subject);
   if (pending !== undefined) {
     bump('coalesced');
-    return pending;
+    const shared = await pending;
+    audit(subject, shared, 'coalesced', 0);
+    return shared.grants;
   }
 
-  const run = (async (): Promise<readonly EntitlementName[]> => {
-    const { allowed, errored } = await check(subject, env, nowMs);
-    const grants = allowed ? INVENTORY_GRANT : NO_GRANTS;
-    bump(errored ? 'error' : allowed ? 'allow' : 'deny');
-    const ttl = errored
+  const run = (async (): Promise<Decision> => {
+    // Wall clock, not the injected `nowMs`: this measures how long the hop took,
+    // and `nowMs` is a fixed instant the caller chose for cache arithmetic.
+    const startedAt = Date.now();
+    const outcome = await check(subject, env, nowMs);
+    const latencyMs = Date.now() - startedAt;
+
+    const grants = outcome.allowed ? INVENTORY_GRANT : NO_GRANTS;
+    // The counters keep their long-standing behaviour: an unconfigured client
+    // is counted by check() AND bumps `deny` here, exactly as before, so
+    // nothing that reads these numbers today changes. The AUDIT line is where
+    // the distinction is drawn, because that is the thing being added.
+    bump(outcome.errored ? 'error' : outcome.allowed ? 'allow' : 'deny');
+    const name: EntitlementDecision =
+      outcome.reason === 'unconfigured'
+        ? 'unconfigured'
+        : outcome.errored
+          ? 'error'
+          : outcome.allowed
+            ? 'allow'
+            : 'deny';
+
+    const decision: Decision = {
+      grants,
+      decision: name,
+      ...(outcome.httpStatus === undefined ? {} : { httpStatus: outcome.httpStatus }),
+      ...(outcome.reason === undefined || outcome.reason === 'unconfigured'
+        ? {}
+        : { reason: outcome.reason }),
+    };
+
+    const ttl = outcome.errored
       ? num(env.ENTITLEMENT_GRANT_ERROR_TTL_MS, DEFAULT_ERROR_TTL_MS)
       : num(env.ENTITLEMENT_GRANT_CACHE_TTL_MS, DEFAULT_CACHE_TTL_MS);
-    cacheSet(subject, { grants, expiresAt: nowMs + ttl }, nowMs, env);
-    return grants;
+    cacheSet(subject, { ...decision, expiresAt: nowMs + ttl }, nowMs, env);
+    audit(subject, decision, 'openfga', latencyMs);
+    return decision;
   })();
 
   inflight.set(subject, run);
   try {
-    return await run;
+    return (await run).grants;
   } finally {
     inflight.delete(subject);
   }
