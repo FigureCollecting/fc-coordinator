@@ -29,12 +29,21 @@ const MAX_LABEL_LENGTH = 100;
 
 export interface AuthRoutesOptions {
   runtime: AuthRuntime;
+  /**
+   * Mounted under this, so the whole surface moves with the edge. Written as a
+   * concatenation rather than an encapsulated `app.register({ prefix })` on
+   * purpose: these three routes are literal strings in this file, and keeping
+   * registration SYNCHRONOUS on the root instance preserves the one ordering
+   * rule the deny-by-default hook depends on. Empty serves them at the root.
+   */
+  prefix?: string;
 }
 
 export function registerAuthRoutes(app: FastifyInstance, options: AuthRoutesOptions): void {
   const { runtime } = options;
+  const at = (path: string): string => `${options.prefix ?? ''}${path}`;
 
-  app.post('/auth/devices', { config: { auth: 'enrolment' } }, async (request, reply) => {
+  app.post(at('/auth/devices'), { config: { auth: 'enrolment' } }, async (request, reply) => {
     const caller = request.callerIdentity!;
     const proof = request.dpopProof!;
 
@@ -72,7 +81,7 @@ export function registerAuthRoutes(app: FastifyInstance, options: AuthRoutesOpti
   });
 
   app.post<{ Params: { deviceId: string } }>(
-    '/auth/devices/:deviceId/revoke',
+    at('/auth/devices/:deviceId/revoke'),
     async (request, reply) => {
       const caller = request.callerIdentity!;
       const { deviceId } = request.params;
@@ -95,7 +104,7 @@ export function registerAuthRoutes(app: FastifyInstance, options: AuthRoutesOpti
     },
   );
 
-  app.get('/auth/session', async (request) => {
+  app.get(at('/auth/session'), async (request) => {
     const caller = request.callerIdentity!;
     return { userId: caller.sub, deviceId: caller.deviceId, jkt: caller.jkt };
   });

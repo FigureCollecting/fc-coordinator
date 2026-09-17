@@ -37,6 +37,22 @@ export interface ConnectOptions extends CompareRoutesDeps {
    * on first mint either way, so turning this off changes only the boot line.
    */
   initSigning?: boolean;
+  /**
+   * Mount the Connect surface under this path, so it is served NATIVELY at the
+   * public URL and the edge rewrites nothing. See src/auth/config.ts for why
+   * that is a requirement and not a preference.
+   *
+   * VERIFIED AGAINST THE PLUGIN'S SOURCE, because the obvious worry is real for
+   * other plugins: `fastifyConnectPlugin` is a plain plugin function, NOT
+   * wrapped in `fastify-plugin`, so `app.register` gives it an encapsulated
+   * context and Fastify applies the prefix to the `instance.all(requestPath)`
+   * calls it makes. Its own `addNoopContentTypeParsers` stays scoped to that
+   * context, which its comment already relies on, and the handler still writes
+   * through `reply.raw` — so `onSend` hooks still do not run on Connect
+   * responses and `onRequest` hooks, which is what the auth guard and the trace
+   * hook use, still do. A prefix changes none of that.
+   */
+  routePrefix?: string;
 }
 
 export function registerConnect(app: FastifyInstance, options: ConnectOptions): void {
@@ -45,6 +61,9 @@ export function registerConnect(app: FastifyInstance, options: ConnectOptions): 
   const resolveIdentity = options.resolveIdentity ?? decoratorIdentityResolver();
 
   void app.register(fastifyConnectPlugin, {
+    // `prefix` is read by Fastify's register, not by the plugin, which ignores
+    // the extra key. An empty string means no prefix.
+    prefix: options.routePrefix ?? '',
     routes: createCompareRoutes(options),
     // §A.5 rule 3, inbound half: continue the caller's trace and be a span in
     // it, so every log line the handler writes carries the trace tag and the

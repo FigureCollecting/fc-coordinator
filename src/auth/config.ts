@@ -34,6 +34,14 @@
 // the DPoP path would be catastrophic — the "public" JWK in the proof header
 // would BE the verification key, so anyone could mint a proof for any key. That
 // must fail at startup, loudly, not silently at the first request.
+//
+// THE ROUTE PREFIX LIVES HERE TOO, and it belongs beside the origin rather than
+// with the listen settings, because the two are one value: `htu` is compared as
+// COORDINATOR_PUBLIC_ORIGIN + the path THIS PROCESS RECEIVED. If the edge
+// strips `/api` before forwarding, every client signs a proof for a path the
+// server never sees and every request 401s naming nothing. Serving the prefix
+// natively is what makes "no rewrite at the edge" a property of the code
+// instead of a note in a runbook. See test/connect/prefix.test.ts.
 // ============================================================================
 
 export type Env = Record<string, string | undefined>;
@@ -108,6 +116,49 @@ function boolean(env: Env, key: string, fallback: boolean): boolean {
   if (raw.trim() === 'true') return true;
   if (raw.trim() === 'false') return false;
   throw new Error(`${key} must be 'true' or 'false', got '${raw}'`);
+}
+
+/**
+ * Where the service is mounted behind the public edge. `/api` in production
+ * (https://figurecollecting.com/api), because D23(a) chose a same-origin path
+ * prefix over a subdomain.
+ *
+ * The DEFAULT IS THE PRODUCTION VALUE, and unset is not the same as empty:
+ *
+ *   unset            -> `/api`, the shape the deployed edge forwards
+ *   set to ''        -> the root, which is what a local `npm run dev` wants
+ *
+ * Conflating the two would leave no way to ask for the root at all, and
+ * defaulting to the root would make "forgot to set the env" look like a working
+ * service that answers 401 to every real client.
+ */
+export const DEFAULT_ROUTE_PREFIX = '/api';
+
+/**
+ * A prefix Fastify can mount and `htu` can compare against, or a thrown error.
+ *
+ * Every rule here exists because the value is CONCATENATED with a route path:
+ * a missing leading slash or a trailing one produces `apicoordinator.v1…` or
+ * `/api//coordinator.v1…`, both of which are routes no client will ever hit and
+ * neither of which fails loudly at startup. A query or a fragment is worse than
+ * useless — `normalizeHtu` strips both from the incoming path before comparing,
+ * so a prefix carrying either could never match.
+ */
+export function validateRoutePrefix(raw: string, key = 'COORDINATOR_ROUTE_PREFIX'): string {
+  const value = raw.trim();
+  if (value === '') return '';
+  if (!value.startsWith('/')) throw new Error(`${key} must start with '/', got '${raw}'`);
+  if (value.endsWith('/')) throw new Error(`${key} must not end with '/', got '${raw}'`);
+  if (/[?#]/.test(value)) throw new Error(`${key} must not contain a query or fragment, got '${raw}'`);
+  if (value.includes('//')) throw new Error(`${key} must not contain an empty path segment, got '${raw}'`);
+  if (/\s/.test(value)) throw new Error(`${key} must not contain whitespace, got '${raw}'`);
+  return value;
+}
+
+/** The prefix this process serves under. See DEFAULT_ROUTE_PREFIX for unset vs empty. */
+export function resolveRoutePrefix(env: Env = process.env): string {
+  const raw = env.COORDINATOR_ROUTE_PREFIX;
+  return raw === undefined ? DEFAULT_ROUTE_PREFIX : validateRoutePrefix(raw);
 }
 
 export function resolveAuthConfig(env: Env = process.env): AuthConfig {

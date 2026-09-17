@@ -13,6 +13,8 @@
 //      OIDC_ISSUER / OIDC_AUDIENCE / OIDC_JWKS_URI / COORDINATOR_PUBLIC_ORIGIN
 //      (all REQUIRED, no defaults — see auth/config.ts for why) plus the
 //      optional DPOP_* and DEVICE_CACHE_TTL_SECONDS tuning knobs,
+//      COORDINATOR_ROUTE_PREFIX (default /api — everything except /healthz is
+//      served under it, and the edge must NOT rewrite it away),
 //      SPINE_READ_URL (+ SPINE_READ_TIMEOUT_MS) for the mesh hop, OPENFGA_* for
 //      the entitlement Check and ENTITLEMENT_SIGNING_* for the mint — each of
 //      which, left unset, degrades to a redacted read rather than an outage.
@@ -22,7 +24,7 @@
 // CNPG's own TLS via PGSSLMODE.
 // ============================================================================
 import { buildApp } from './app.js';
-import { resolveAuthConfig } from './auth/config.js';
+import { resolveAuthConfig, resolveRoutePrefix } from './auth/config.js';
 import { createAccessTokenVerifier, createRemoteJwks } from './auth/oidc.js';
 import { createDeviceStore } from './auth/plugin.js';
 import { createCoordinatorPool, describeTarget } from './db/pool.js';
@@ -39,11 +41,15 @@ const pool = createCoordinatorPool();
 // Resolved BEFORE listen: a missing or malformed setting must stop the process
 // here, not surface as a 401 storm once traffic arrives.
 const authConfig = resolveAuthConfig();
+// Defaults to `/api`, the shape the public edge forwards. Resolved here rather
+// than inside buildApp so the factory stays free of environment reads.
+const routePrefix = resolveRoutePrefix();
 
 const app = buildApp({
   db: pool,
   telemetry: telemetry.state,
   logLevel: (process.env['LOG_LEVEL'] as LogLevel | undefined) ?? 'info',
+  routePrefix,
   auth: {
     config: authConfig,
     devices: createDeviceStore(pool),
@@ -69,7 +75,13 @@ const app = buildApp({
 // route, and host:port/dbname is a map of the estate. Operators still get it,
 // once, here — the log is behind the same boundary as the process itself.
 app.log.info(
-  { db_target: describeTarget(), otel_exporter: telemetry.state.exporter },
+  {
+    db_target: describeTarget(),
+    otel_exporter: telemetry.state.exporter,
+    // The public shape, stated once: origin + prefix is exactly what a client's
+    // DPoP `htu` must name, so an operator can compare it against the edge.
+    public_base: `${authConfig.origin}${routePrefix}`,
+  },
   'coordinator starting',
 );
 
