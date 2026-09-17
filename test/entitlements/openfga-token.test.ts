@@ -567,6 +567,13 @@ describe('userinfo embedded in the token endpoint', () => {
     ['a protocol-relative URL, which has no scheme to parse', `//${USER}:${EMBEDDED}@auth.example.com/token`],
     ['a bare host:port, where the userinfo lands in an OPAQUE PATH', `${USER}:${EMBEDDED}@auth.example.com/token`],
     ['a data: URL, same shape, no authority at all', `data:text/plain,${USER}:${EMBEDDED}@auth.example.com`],
+    // The literal placeholder text, CONFIGURED. This is the one input on which
+    // branching on emptiness and branching on `endpoint === '(unset)'` differ,
+    // and it is what makes the emptiness form the testable one. Not a
+    // credential exposure either way — what the other form would print is this
+    // same literal string — but "you configured nothing" and "you configured
+    // something I will not repeat" are different diagnoses and must not merge.
+    ['the literal text (unset), actually configured', '(unset)'],
   ])('renders %s as (unparseable), never as its own text', (_label, endpoint) => {
     // The opaque-path case is the one a naive `origin + pathname` gets WRONG:
     // `new URL` accepts it, reports origin "null", and puts the whole rest —
@@ -591,18 +598,28 @@ describe('userinfo embedded in the token endpoint', () => {
     expect(described).not.toContain(EMBEDDED);
   });
 
-  it('falls back to the origin alone if an @ ever survives into the path', () => {
-    // A tripwire rather than a reachable case. With an authority present the
-    // URL parser cannot leave userinfo in `pathname`, so this asserts what
-    // happens if that ever stops being true: the line degrades to the origin,
-    // which still names the issuer, instead of printing a path on the strength
-    // of an assumption. A path that genuinely contains an @ is the price, and
-    // it is one no token endpoint is known to charge.
-    const described = describeOpenFgaAuth(endpointEnv(`https://auth.example.com/a@${EMBEDDED}/token`));
+  it.each([
+    ['a plain @ in the path', `https://auth.example.com/a@${EMBEDDED}/token`],
+    [
+      'a blob: URL, whose origin comes from the INNER url and whose path keeps its userinfo',
+      `blob:https://${USER}:${EMBEDDED}@auth.example.com/token`,
+    ],
+    [
+      'a slash inside the password, which makes the USERNAME parse as the host',
+      `https://${USER}:1234/${EMBEDDED}@auth.example.com/token`,
+    ],
+  ])('renders %s as (unparseable) — the origin is not safe either', (_label, endpoint) => {
+    // NOT A HYPOTHETICAL. The second and third are real inputs reaching the
+    // `@`-in-path branch, and the third is the one that settles the question of
+    // what to degrade TO: `https://svcuser:1234/...` parses `svcuser` as the
+    // host and `1234` as the port, so the ORIGIN itself is assembled out of a
+    // username and the head of a password. Printing it would echo the
+    // credential while calling it the issuer.
+    const described = describeOpenFgaAuth(endpointEnv(endpoint));
 
-    expect(described).toContain('token_endpoint=https://auth.example.com,');
+    expect(described).toContain('token_endpoint=(unparseable)');
     expect(described).not.toContain(EMBEDDED);
-    expect(described).toContain('complete');
+    expect(described).not.toContain('auth.example.com/');
   });
 
   // -------------------------------------------------------------------------

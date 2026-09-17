@@ -332,6 +332,14 @@ const UNPRINTABLE_ENDPOINT = '(unparseable)';
  * issuer, and both are as plausible a place to have parked a key as the
  * authority is.
  *
+ * THE PATH IS KEPT, and that asymmetry is deliberate rather than an oversight.
+ * The same argument would drop it — a secret parked at `/token/hunter2` is
+ * echoed — but the path is the DIAGNOSIS. `/application/o/token/` against
+ * `/oauth2/token` is how an operator tells a misconfigured issuer from a
+ * healthy one, and a line that prints only an origin cannot do the job this
+ * line exists for. A secret in the path is a secret written into the one field
+ * that has to be readable.
+ *
  * THE CASE A NAIVE VERSION GETS WRONG is a value with no authority at all.
  * `new URL('svcuser:pw@idp.example.com/token')` does not throw: it reports
  * scheme `svcuser:`, origin `"null"` and pathname `pw@idp.example.com/token` —
@@ -350,11 +358,23 @@ function printableEndpoint(raw: string): string {
   // `'null'` is the literal string the URL standard yields for a scheme that
   // has no authority to have an origin for — the opaque-path case above.
   if (url.origin === 'null') return UNPRINTABLE_ENDPOINT;
-  // A TRIPWIRE, not a case reachable today: with an authority present the
-  // parser cannot leave userinfo in the path. If an `@` ever appears here that
-  // assumption has stopped holding, so the value degrades to the origin — which
-  // still names the issuer — rather than being printed on the strength of it.
-  if (url.pathname.includes('@')) return url.origin;
+  // AN `@` IN THE PATH MEANS THE PARSE DID NOT GO WHERE IT LOOKS. Two real
+  // inputs reach here, and neither is safe to print any part of:
+  //
+  //   blob:https://svcuser:hunter2@idp.example.com/token
+  //     `origin` is computed from the INNER url and the whole inner url —
+  //     userinfo included — is left in `pathname`.
+  //
+  //   https://svcuser:1234/hunter2@idp.example.com/token
+  //     the `/` ends the authority early, so `svcuser` parses as the HOST and
+  //     `1234` as the PORT. `origin` is then built out of what was meant to be
+  //     a username and the numeric head of a password. Degrading to the origin
+  //     would print credential-derived material and call it the issuer.
+  //
+  // So: the placeholder, not the origin. The cost is an endpoint whose path
+  // genuinely contains an `@` rendering as `(unparseable)`, and no token
+  // endpoint is known to charge it.
+  if (url.pathname.includes('@')) return UNPRINTABLE_ENDPOINT;
   return `${url.origin}${url.pathname}`;
 }
 
