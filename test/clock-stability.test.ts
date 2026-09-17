@@ -33,6 +33,28 @@ import { describe, expect, it } from 'vitest';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+/**
+ * A child's output, with terminal colour removed.
+ *
+ * Both assertions below read a child process's stdout, and a child decides for
+ * itself whether to colour it. On a developer's machine, piped into a buffer,
+ * it does not; on the GitHub runner it does, and `1000` arrives as
+ * `\u001b[33m1000\u001b[39m`. That turned a passing child into a failing
+ * assertion here — the guard reporting red for a reason that had nothing to do
+ * with the property it guards, which is the mirror image of the fault it exists
+ * to prevent. The children are asked not to colour AND the output is stripped,
+ * because only the second of those is under this file's control.
+ */
+const plain = (text: string): string => text.replace(/\u001B\[[0-9;]*[A-Za-z]/g, '');
+
+/** Child environment: no colour, plus whatever the case under test needs. */
+const childEnv = (extra: Record<string, string>): NodeJS.ProcessEnv => ({
+  ...process.env,
+  NO_COLOR: '1',
+  FORCE_COLOR: '0',
+  ...extra,
+});
+
 /** Files that must not care what the wall clock does. See the header. */
 const CLOCK_INDEPENDENT = ['src/auth/dpop.test.ts', 'test/entitlements/fail-closed.test.ts'];
 
@@ -60,9 +82,9 @@ describe('the suite does not read the wall clock twice for one assertion', () =>
         cwd: REPO,
         encoding: 'utf8',
         timeout: 300_000,
-        env: { ...process.env, CLOCK_STEP_MS: step },
+        env: childEnv({ CLOCK_STEP_MS: step }),
       });
-      const output = `${run.stdout ?? ''}${run.stderr ?? ''}`;
+      const output = plain(`${run.stdout ?? ''}${run.stderr ?? ''}`);
 
       // The status alone would also be 0 if the child ran nothing at all, so
       // the count is asserted too — a filter typo must not read as a pass.
@@ -86,9 +108,15 @@ describe('the suite does not read the wall clock twice for one assertion', () =>
           '-e',
           "await import('./test/helpers/steppingClock.ts'); const a = Date.now(); const b = Date.now(); console.log(b - a);",
         ],
-        { cwd: REPO, encoding: 'utf8', timeout: 60_000, env: { ...process.env, CLOCK_STEP_MS: step } },
+        { cwd: REPO, encoding: 'utf8', timeout: 60_000, env: childEnv({ CLOCK_STEP_MS: step }) },
       );
-      return Number((run.stdout ?? '').trim());
+      // The LAST non-empty line, not the whole buffer: a runtime notice on
+      // stdout would otherwise be parsed as the measurement and come back NaN.
+      const lines = plain(run.stdout ?? '')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line !== '');
+      return Number(lines.at(-1));
     };
 
     // Two reads a second apart, in whichever direction was asked for...
