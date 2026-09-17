@@ -272,6 +272,17 @@ describe('acceptance — DPoP edge', () => {
   });
 
   it('A NONCE FROM THE PREVIOUS BUCKET of the same epoch is accepted', async () => {
+    // TWO CLOCK READS, KNOWINGLY. This mints against one `Date.now()` and the
+    // edge verifies against another a request later, so a bucket boundary
+    // falling between them would turn "previous" into "two ago" and fail. The
+    // margin is the whole 300 s period against a gap of about two milliseconds
+    // — four orders of magnitude wider than the one-second margins that
+    // actually flaked in dpop.test.ts, and it has never been observed to fire.
+    //
+    // It is NOT closed the way those were, because this is an acceptance test
+    // over the assembled edge and registerAuth takes no clock: see the comment
+    // at its construction, which declines that seam on purpose. Closing this
+    // means reversing that decision, which is a bigger question than a flake.
     const previous = h.runtime.nonce.mint(Date.now() - NONCE_PERIOD_MS);
     expect((await call(h, { token, key, nonce: previous })).statusCode).toBe(200);
   });

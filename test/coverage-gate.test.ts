@@ -53,6 +53,8 @@ describe('the coverage gate is per file, not a repo-wide average', () => {
       //                  Postgres; two minutes for zero src/ lines
       //   import-graph   rebuilds dist/ and measures it in a further child, so
       //                  it contributes no coverage to this process either way
+      //   clock-stability  spawns two further vitest runs of its own; nesting
+      //                  them three deep costs a minute for zero src/ coverage
       // The CLI `--exclude` replaces the config's, so node_modules and dist are
       // restated here.
       const run = spawnSync(
@@ -70,6 +72,7 @@ describe('the coverage gate is per file, not a repo-wide average', () => {
           '--exclude=test/coverage-gate.test.ts',
           '--exclude=test/migrations.test.ts',
           '--exclude=test/import-graph.test.ts',
+          '--exclude=test/clock-stability.test.ts',
         ],
         { cwd: REPO, encoding: 'utf8', timeout: 300_000 },
       );

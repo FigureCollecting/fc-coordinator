@@ -1,9 +1,13 @@
+// FIRST, and a side effect: an adversarial wall clock that is inert unless
+// CLOCK_STEP_MS is set. See the helper — it turns "this test flakes once in a
+// few hundred runs" into a thing that either happens or does not.
+import '../../test/helpers/steppingClock.js';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { resolveAuthConfig } from './config.js';
 import { createNonceEpoch, type NonceEpoch } from './nonce.js';
 import { createJtiWindow, type JtiWindow } from './replay.js';
 import { verifyDpopProof, type DpopVerifyInput } from './dpop.js';
-import { TEST_ORIGIN, accessTokenHash, makeDeviceKey, makeProof, type DeviceKey } from '../../test/helpers/auth.js';
+import { TEST_ORIGIN, accessTokenHash, makeDeviceKey, makeProof as signProof, type DeviceKey } from '../../test/helpers/auth.js';
 
 /**
  * A LOOSENED view of DpopOutcome. The production type is a discriminated union,
@@ -33,11 +37,46 @@ const DEVICE_ID = 'c9f0c6a5-9d06-4a5f-9b1f-6e3b9a4d0c21';
 let key: DeviceKey;
 let nonce: NonceEpoch;
 let jti: JtiWindow;
+/**
+ * THE ONLY WALL-CLOCK READ IN THIS FILE.
+ *
+ * What went wrong before it existed: a fixture read `Date.now()`, built a claim
+ * a fixed number of seconds either side of it, and the verifier then read the
+ * clock AGAIN to judge that claim. Two reads, and the assertions live one
+ * second from their boundary — a proof dated 31 s back against a 30 s window, 6
+ * s ahead against a 5 s skew. Any gap between the two reads that crosses a
+ * second boundary flips the answer.
+ *
+ * That is not only the non-monotonic step commit fef12ca fixed elsewhere (a
+ * measured `-933` on this estate's WSL2 hosts). An ORDINARY forward tick does
+ * it too, and the tick is certain to arrive eventually: the fixture signs a JWT
+ * between the two reads, so the gap is milliseconds, and under a loaded runner
+ * it is more. Both directions are reproducible on demand — see
+ * test/helpers/steppingClock.ts.
+ *
+ * So: one read per test, frozen, and everything time-dependent derives from it
+ * — the proof's iat, the nonce's bucket, and the window the verifier measures
+ * them against. The production code already takes `now` on all three; nothing
+ * here needed a new seam, only the discipline of using the ones there are.
+ */
+let frozenNow: number;
+
+/**
+ * `makeProof`, with the frozen clock as its default `iat`.
+ *
+ * The shared helper otherwise defaults to `Date.now()` of its own, which is the
+ * second read this file exists to have exactly one of. Shadowing the import
+ * rather than editing seven call sites is deliberate: the next proof written in
+ * this file gets the frozen clock without its author having to know why.
+ */
+const makeProof: typeof signProof = (key, fields) =>
+  signProof(key, { ...fields, iat: fields.iat ?? Math.floor(frozenNow / 1000) });
 
 beforeEach(async () => {
+  frozenNow = Date.now();
   key = await makeDeviceKey();
-  nonce = createNonceEpoch({ periodMs: PERIOD_MS });
-  jti = createJtiWindow({ ttlMs: 35_000, maxEntries: 100 });
+  nonce = createNonceEpoch({ periodMs: PERIOD_MS, now: () => frozenNow });
+  jti = createJtiWindow({ ttlMs: 35_000, maxEntries: 100, now: () => frozenNow });
 });
 
 /** Binding that accepts exactly the key under test — the enrolled-device case. */
@@ -67,6 +106,7 @@ async function input(overrides: Partial<DpopVerifyInput> = {}, proofOverrides = 
     maxAgeSeconds: 30,
     clockSkewSeconds: 5,
     requireNonce: true,
+    now: () => frozenNow,
     ...overrides,
   };
 }
@@ -253,17 +293,17 @@ describe('verifyDpopProof — steps 3 and 4, htm/htu then iat', () => {
   });
 
   it('rejects a proof older than the iat window', async () => {
-    const stale = Math.floor(Date.now() / 1000) - 31;
+    const stale = Math.floor(frozenNow / 1000) - 31;
     expect((await dpopVerify(await input({}, { iat: stale }))).reason).toBe('iat_out_of_window');
   });
 
   it('rejects a proof dated further into the future than the allowed skew', async () => {
-    const ahead = Math.floor(Date.now() / 1000) + 6;
+    const ahead = Math.floor(frozenNow / 1000) + 6;
     expect((await dpopVerify(await input({}, { iat: ahead }))).reason).toBe('iat_out_of_window');
   });
 
   it('accepts a proof inside the skew allowance on either side', async () => {
-    const now = Math.floor(Date.now() / 1000);
+    const now = Math.floor(frozenNow / 1000);
     expect((await dpopVerify(await input({}, { iat: now - 29 }))).ok).toBe(true);
     expect((await dpopVerify(await input({}, { iat: now + 4 }))).ok).toBe(true);
   });
@@ -298,12 +338,12 @@ describe('verifyDpopProof — step 6, the nonce, and it precedes the jti check',
   });
 
   it('accepts a nonce from the PREVIOUS bucket of the same epoch', async () => {
-    const previous = nonce.mint(Date.now() - PERIOD_MS);
+    const previous = nonce.mint(frozenNow - PERIOD_MS);
     expect((await dpopVerify(await input({}, { nonce: previous }))).ok).toBe(true);
   });
 
   it('REJECTS a nonce from a previous process epoch — the restart property', async () => {
-    const beforeRestart = createNonceEpoch({ periodMs: PERIOD_MS });
+    const beforeRestart = createNonceEpoch({ periodMs: PERIOD_MS, now: () => frozenNow });
     const carried = beforeRestart.mint();
     const result = await dpopVerify(await input({}, { nonce: carried }));
 
