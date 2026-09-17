@@ -356,6 +356,14 @@ describe('the static token path', () => {
 // THE BOOT LINE
 // ===========================================================================
 describe('the boot line', () => {
+  const httpsEnv = (endpoint: string): NodeJS.ProcessEnv =>
+    ({
+      OPENFGA_OIDC_TOKEN_ENDPOINT: endpoint,
+      OPENFGA_OIDC_CLIENT_ID: 'openfga',
+      OPENFGA_OIDC_USERNAME: USERNAME,
+      OPENFGA_OIDC_PASSWORD: PASSWORD,
+    }) as NodeJS.ProcessEnv;
+
   it('names the active path ONCE, not once per call', () => {
     expect(initOpenFgaAuth(oidcEnv())).toBe('oidc');
     initOpenFgaAuth(oidcEnv());
@@ -372,10 +380,37 @@ describe('the boot line', () => {
     expect(String(warns[0]?.[0])).toContain('none');
   });
 
-  it('says a provider is INCOMPLETE rather than reporting it healthy', () => {
+  it('says a provider is INCOMPLETE rather than reporting it healthy, AT ERROR LEVEL', () => {
+    // THE QUIETER FAILURE IS THE MORE DANGEROUS ONE, and that is the whole
+    // reason this asserts a level and not just a string. A provider with no
+    // configuration at all is obvious and gets `warn`. A HALF-configured one
+    // looks configured, mints nothing, and denies every read forever — so it
+    // must not be the one that whispers.
     initOpenFgaAuth(oidcEnv({ OPENFGA_OIDC_USERNAME: undefined }));
-    expect(String(logs[0]?.[0])).toContain('INCOMPLETE');
-    expect(String(logs[0]?.[0])).toContain('OPENFGA_OIDC_USERNAME');
+
+    expect(String(errors[0]?.[0])).toContain('INCOMPLETE');
+    expect(String(errors[0]?.[0])).toContain('OPENFGA_OIDC_USERNAME');
+    expect(logs).toHaveLength(0);
+    expect(warns).toHaveLength(0);
+  });
+
+  it('never announces an unusable provider more quietly than a missing one', () => {
+    // Stated as the ordering rather than case by case, because the bug this
+    // replaces was exactly an ordering slip: the comment promised the loudest
+    // level and the code handed it to one of the two unusable states.
+    initOpenFgaAuth(oidcEnv({ OPENFGA_OIDC_PASSWORD: undefined }));
+    expect(errors).toHaveLength(1);
+
+    resetOpenFgaTokenForTest();
+    errors.length = 0;
+    initOpenFgaAuth(httpsEnv('http://auth.example.com/token'));
+    expect(errors).toHaveLength(1);
+
+    resetOpenFgaTokenForTest();
+    errors.length = 0;
+    initOpenFgaAuth({} as NodeJS.ProcessEnv);
+    expect(errors).toHaveLength(0);
+    expect(warns).toHaveLength(1);
   });
 
   it('never prints a credential', () => {

@@ -170,9 +170,14 @@ export function initOpenFgaAuth(env: NodeJS.ProcessEnv = process.env): OpenFgaAu
     const described = describeOpenFgaAuth(env);
     const line = `[ENTITLEMENT] OpenFGA credential: ${described}`;
     // A provider that cannot be used is worse than no provider at all: it looks
-    // configured, mints nothing, and denies every read forever. It gets the
-    // loudest level, at BOOT, rather than waiting for the first Check.
-    if (described.includes('REFUSED')) console.error(line);
+    // configured, mints nothing, and denies every read forever. BOTH such
+    // states get the loudest level, at BOOT, rather than waiting for the first
+    // Check — an endpoint we refuse to post to, and a half-filled Secret.
+    //
+    // The ordering is the point, and it was wrong here once: `none` is the
+    // OBVIOUS failure and gets `warn`, so the two non-obvious ones must not be
+    // quieter than it. They were, by one word.
+    if (described.includes('REFUSED') || described.includes('INCOMPLETE')) console.error(line);
     else if (mode === 'none') console.warn(line);
     else console.log(line);
   }
