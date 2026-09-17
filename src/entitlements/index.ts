@@ -65,3 +65,12 @@ export {
   resetEntitlementSigningForTest,
   type MintRequest,
 } from './assertion.js';
+
+export {
+  initOpenFgaAuth,
+  describeOpenFgaAuth,
+  openFgaAuthMode,
+  openFgaTokenCounters,
+  resetOpenFgaTokenForTest,
+  type OpenFgaAuthMode,
+} from './openfgaToken.js';

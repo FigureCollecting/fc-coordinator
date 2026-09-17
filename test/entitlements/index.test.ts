@@ -22,14 +22,20 @@ const EXPECTED_FUNCTIONS = [
   'mintEntitlementAssertion',
   // boot
   'initEntitlementSigning',
+  'initOpenFgaAuth',
   // the identity rule, exported so a host can check its own source against it
   'isEntitlementSubject',
   // observability
   'entitlementGrantCounters',
   'entitlementMintCounters',
+  // the OpenFGA credential: which path is active, and its counters
+  'describeOpenFgaAuth',
+  'openFgaAuthMode',
+  'openFgaTokenCounters',
   // test seams
   'resetEntitlementGrantsForTest',
   'resetEntitlementSigningForTest',
+  'resetOpenFgaTokenForTest',
 ].sort();
 
 /** Exported values that are not functions. */

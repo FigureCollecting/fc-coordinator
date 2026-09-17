@@ -18,9 +18,28 @@ export interface FgaCall {
   body: unknown;
 }
 
+/** An answer that overrides `decide` — a status, a body, or both. */
+export interface FgaReply {
+  status?: number;
+  /** A string is sent verbatim, which is how a malformed body is exercised. */
+  body?: unknown;
+}
+
 export interface FakeOpenFga {
   baseUrl: string;
   calls: FgaCall[];
+  /**
+   * Override the next answers, or pass null to go back to `decide`. The Check's
+   * fail-closed rule is about NON-2xx and about wire surprises, and neither can
+   * be produced by a fake that only ever answers 200 with a boolean.
+   */
+  reply: (next: FgaReply | null) => void;
+  /**
+   * Answer the NEXT call this way, once, then fall back. A sticky override
+   * cannot express "401 first, then fine", and expressing that with a timer is
+   * a race dressed as a test.
+   */
+  replyOnce: (next: FgaReply) => void;
   close: () => Promise<void>;
 }
 
@@ -31,6 +50,8 @@ export async function startFakeOpenFga(
   decide: (call: FgaCall) => boolean,
 ): Promise<FakeOpenFga> {
   const calls: FgaCall[] = [];
+  let override: FgaReply | null = null;
+  const queued: FgaReply[] = [];
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on('data', (c) => chunks.push(c as Buffer));
@@ -49,6 +70,17 @@ export async function startFakeOpenFga(
         body,
       };
       calls.push(call);
+      const once = queued.shift();
+      if (once !== undefined) {
+        res.writeHead(once.status ?? 200, { 'content-type': 'application/json' });
+        res.end(typeof once.body === 'string' ? once.body : JSON.stringify(once.body ?? {}));
+        return;
+      }
+      if (override !== null) {
+        res.writeHead(override.status ?? 200, { 'content-type': 'application/json' });
+        res.end(typeof override.body === 'string' ? override.body : JSON.stringify(override.body ?? {}));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ allowed: decide(call), resolution: '' }));
     });
@@ -63,6 +95,12 @@ export async function startFakeOpenFga(
   return {
     baseUrl: `http://127.0.0.1:${port}`,
     calls,
+    reply: (next) => {
+      override = next;
+    },
+    replyOnce: (next) => {
+      queued.push(next);
+    },
     close: async () => {
       for (const s of sockets) s.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));

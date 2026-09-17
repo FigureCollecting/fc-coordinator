@@ -14,7 +14,7 @@
 // ============================================================================
 import { fastifyConnectPlugin } from '@connectrpc/connect-fastify';
 import type { FastifyInstance } from 'fastify';
-import { initEntitlementSigning } from '../entitlements/index.js';
+import { initEntitlementSigning, initOpenFgaAuth } from '../entitlements/index.js';
 import { createCompareRoutes, type CompareRoutesDeps } from './compare.js';
 import {
   decoratorIdentityResolver,
@@ -32,9 +32,16 @@ export interface ConnectOptions extends CompareRoutesDeps {
   resolveIdentity?: IdentityResolver;
   /**
    * Load the entitlement signing key at registration and log whether minting is
-   * on. Default true: a missing Secret should be visible at start rather than
-   * discovered by a user whose numbers quietly vanished. The key loads lazily
-   * on first mint either way, so turning this off changes only the boot line.
+   * on, and name which OpenFGA credential path is configured. Default true: a
+   * missing Secret should be visible at start rather than discovered by a user
+   * whose numbers quietly vanished. The key loads lazily on first mint either
+   * way, and the token is minted on first Check, so turning this off changes
+   * only the boot lines.
+   *
+   * BOTH LINES, because they answer one question between them — can this
+   * process ask the authorization question, and can it sign the answer? A
+   * ten-minute OpenFGA token that was never configured fails exactly the way a
+   * missing signing key does: a normal 200 with the magnitudes gone.
    */
   initSigning?: boolean;
   /**
@@ -56,7 +63,10 @@ export interface ConnectOptions extends CompareRoutesDeps {
 }
 
 export function registerConnect(app: FastifyInstance, options: ConnectOptions): void {
-  if (options.initSigning !== false) initEntitlementSigning();
+  if (options.initSigning !== false) {
+    initEntitlementSigning();
+    initOpenFgaAuth();
+  }
 
   const resolveIdentity = options.resolveIdentity ?? decoratorIdentityResolver();
 

@@ -48,6 +48,7 @@
 import axios from 'axios';
 import { INVENTORY_LEVELS, type EntitlementName } from '@figurecollecting/ingest-contract/entitlement';
 import { mintEntitlementAssertion } from './assertion.js';
+import { openFgaAuthHeaders, openFgaAuthMode } from './openfgaToken.js';
 import { isEntitlementSubject } from './subject.js';
 
 /** Nothing granted. A frozen shared value so a caller cannot mutate the denial. */
@@ -85,7 +86,7 @@ const bump = (name: string): void => {
   counters.set(name, (counters.get(name) ?? 0) + 1);
 };
 
-/** Snapshot: `allow`, `deny`, `error`, `unconfigured`, `bad_subject`, `cache_hit`, `coalesced`, `evicted`. */
+/** Snapshot: `allow`, `deny`, `error`, `unconfigured`, `bad_subject`, `cache_hit`, `coalesced`, `evicted`, `reminted`. */
 export const entitlementGrantCounters = (): Readonly<Record<string, number>> => Object.fromEntries(counters);
 
 /** Test seam: drop the cache, the in-flight map, the counters and the one-shot warning. */
@@ -111,12 +112,37 @@ const num = (raw: string | undefined, fallback: number): number => {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 };
 
+/** What one Check came back as. `errored` separates a sick dependency from a revoked user. */
+interface CheckOutcome {
+  allowed: boolean;
+  errored: boolean;
+  /** Present when OpenFGA answered at all, so a 504 is distinguishable from a 401. */
+  httpStatus?: number;
+  /** Why, when the reason is not simply the status. */
+  reason?: string;
+}
+
 /**
  * Ask OpenFGA. Resolves to `true` ONLY on an explicit `allowed: true`;
  * everything else resolves to `false` and is counted as an error rather than a
  * deny, so an operator can tell a revoked user apart from a sick dependency.
+ *
+ * NO `validateStatus`, AND THAT IS LOAD-BEARING. axios's default rejects on any
+ * non-2xx, which is what turns a proxy's fast 504 during a partition into an
+ * error-deny here. A partition does NOT surface as a transport exception — the
+ * sidecar answers — so fail-closed logic keying on a thrown connection error
+ * would sail straight past it. Setting `validateStatus` at all would move every
+ * non-2xx into the success branch, where the body has no boolean `allowed` and
+ * the outcome happens to stay a deny for the wrong reason. Pinned by
+ * test/entitlements/fail-closed.test.ts, both behaviourally and as source.
+ *
+ * ONE RETRY, ONLY ON 401, ONLY ON THE OIDC PATH. A cached token that expired or
+ * was rotated under us is the one failure a retry can fix, and it is bounded at
+ * one: re-mint, ask again, and if the answer is still 401 then the credential
+ * is wrong rather than stale, and looping would turn that into a request storm
+ * against the identity provider.
  */
-async function check(subject: string, env: NodeJS.ProcessEnv): Promise<{ allowed: boolean; errored: boolean }> {
+async function check(subject: string, env: NodeJS.ProcessEnv, nowMs: number): Promise<CheckOutcome> {
   const apiUrl = env.OPENFGA_API_URL?.trim();
   const storeId = env.OPENFGA_STORE_ID?.trim();
   if (!apiUrl || !storeId) {
@@ -127,7 +153,7 @@ async function check(subject: string, env: NodeJS.ProcessEnv): Promise<{ allowed
         '[ENTITLEMENT] OpenFGA is not configured (OPENFGA_API_URL / OPENFGA_STORE_ID) — every entitlement check denies and spine reads come back redacted. Expected until the authz substrate is wired.'
       );
     }
-    return { allowed: false, errored: false };
+    return { allowed: false, errored: false, reason: 'unconfigured' };
   }
 
   const body: Record<string, unknown> = {
@@ -142,33 +168,55 @@ async function check(subject: string, env: NodeJS.ProcessEnv): Promise<{ allowed
   const modelId = env.OPENFGA_MODEL_ID?.trim();
   if (modelId) body.authorization_model_id = modelId;
 
-  const token = env.OPENFGA_API_TOKEN?.trim();
-  try {
-    const response = await axios.post(`${apiUrl.replace(/\/+$/, '')}/stores/${storeId}/check`, body, {
-      timeout: num(env.OPENFGA_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
-      headers: {
-        'content-type': 'application/json',
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
-      },
-    });
-    const data: unknown = response.data;
-    if (typeof data !== 'object' || data === null || Array.isArray(data)) {
-      // A 200 carrying something that is not a Check response is a wire-level
-      // surprise, not a decision. Treated as a fault so it shows up as one.
-      console.error('[ENTITLEMENT] OpenFGA Check returned an unexpected body shape — denying');
-      return { allowed: false, errored: true };
+  const url = `${apiUrl.replace(/\/+$/, '')}/stores/${storeId}/check`;
+  const timeout = num(env.OPENFGA_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+  const canRemint = openFgaAuthMode(env) === 'oidc';
+  let reminted = false;
+
+  for (;;) {
+    const auth = await openFgaAuthHeaders(env, nowMs, { forceRefresh: reminted });
+    if (auth === undefined) {
+      // A credential IS configured and could not be obtained. Never fall
+      // through to an unauthenticated Check: OpenFGA would answer 401 and the
+      // outcome would be identical, but the record would name the wrong cause.
+      return { allowed: false, errored: true, reason: 'token_mint_failed' };
     }
-    const allowed = (data as { allowed?: unknown }).allowed;
-    if (typeof allowed !== 'boolean') {
-      console.error('[ENTITLEMENT] OpenFGA Check response has no boolean `allowed` — denying');
-      return { allowed: false, errored: true };
+
+    try {
+      const response = await axios.post(url, body, {
+        timeout,
+        headers: { 'content-type': 'application/json', ...auth },
+      });
+      const data: unknown = response.data;
+      if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+        // A 200 carrying something that is not a Check response is a wire-level
+        // surprise, not a decision. Treated as a fault so it shows up as one.
+        console.error('[ENTITLEMENT] OpenFGA Check returned an unexpected body shape — denying');
+        return { allowed: false, errored: true, httpStatus: response.status, reason: 'bad_body' };
+      }
+      const allowed = (data as { allowed?: unknown }).allowed;
+      if (typeof allowed !== 'boolean') {
+        console.error('[ENTITLEMENT] OpenFGA Check response has no boolean `allowed` — denying');
+        return { allowed: false, errored: true, httpStatus: response.status, reason: 'bad_body' };
+      }
+      return { allowed, errored: false, httpStatus: response.status };
+    } catch (err) {
+      const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+      if (status === 401 && canRemint && !reminted) {
+        reminted = true;
+        bump('reminted');
+        continue;
+      }
+      // The message ONLY. An axios error carries the full request config,
+      // headers included, so anything broader than this prints the credential.
+      console.error('[ENTITLEMENT] OpenFGA Check failed — denying:', (err as Error).message);
+      return {
+        allowed: false,
+        errored: true,
+        ...(status === undefined ? {} : { httpStatus: status }),
+        reason: status === undefined ? 'transport' : 'http_error',
+      };
     }
-    return { allowed, errored: false };
-  } catch (err) {
-    // The message ONLY. An axios error carries the full request config,
-    // headers included, so anything broader than this prints the preshared key.
-    console.error('[ENTITLEMENT] OpenFGA Check failed — denying:', (err as Error).message);
-    return { allowed: false, errored: true };
   }
 }
 
@@ -239,7 +287,7 @@ export async function grantsForSubject(
   }
 
   const run = (async (): Promise<readonly EntitlementName[]> => {
-    const { allowed, errored } = await check(subject, env);
+    const { allowed, errored } = await check(subject, env, nowMs);
     const grants = allowed ? INVENTORY_GRANT : NO_GRANTS;
     bump(errored ? 'error' : allowed ? 'allow' : 'deny');
     const ttl = errored
