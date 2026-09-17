@@ -228,21 +228,32 @@ run authenticates to GitHub Packages with a fork-held `read:packages` PAT in
 
 ### The image
 
-`ghcr.io/figurecollecting/fc-coordinator`, published by the `Build container
-image` job on **org push events only** — `develop`, `main` and a `v*` tag. A
-pull_request build stays `push: false` and never logs in to the registry, and a
-fork never publishes at all.
+`ghcr.io/figurecollecting/fc-coordinator`, built by the `Build container image`
+job and pushed by a separate `Publish container image` job on **org push events
+only**, meaning the two integration branches and a `v*` tag. A pull_request
+reaches the build job and not the publish job, so it never logs in to the
+registry, and a fork never publishes at all.
 
-Tags: the branch name (`develop`), the release tag when there is one, and
-`sha-<short>` on every publish. The job also emits the **digest** as a job
-output and into the run summary, because fc-infra pins the image by digest —
-`ghcr.io/figurecollecting/fc-coordinator:develop@sha256:…` — so a manifest
-cannot silently follow a retag.
+**Why two jobs.** GitHub's `permissions:` takes no expression, so one job cannot
+hold `packages: write` on a push and `packages: read` on a pull_request. Keeping
+the push in its own job is the only way the write scope is absent from the runs
+that can never use it. `Build container image` therefore holds `packages: read`
+and is the required check; `Publish container image` holds the write scope and
+runs on push alone.
 
-Order inside the job is load-first: the image is built with `load: true` and the
-non-root assertion runs against it **before** the publish step exists, so a root
-image cannot reach the registry ahead of the check that would have caught it.
-The publish step re-invokes buildx and is a cache hit on every layer.
+Tags: the branch name, the release tag when there is one, and `sha-<short>` on
+every publish. The publish job emits the **digest** as a job output and into the
+run summary, because fc-infra pins the image by digest rather than by tag, so a
+manifest cannot silently follow a retag.
+
+**The non-root assertion is made twice, against two different things.** The
+build job asserts it against its own `load: true` output, which is the
+pull_request gate. The publish job then **pulls the pushed digest back and
+asserts it again**, because the publish is a second buildx invocation and the
+claim that it is byte-identical rests on the GHA cache hitting. It normally
+will; an eviction, a concurrent run or a failed cache write is enough for it not
+to, and an assertion about the published artifact has to be made about the
+published artifact.
 
 The package inherits the org's no-public-packages policy, so it is private like
 scraper's and ingest-server's. The cluster pulls it with the `ghcr-pull`

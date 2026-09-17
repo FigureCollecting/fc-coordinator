@@ -19,11 +19,18 @@ on:
 #   owner != FigureCollecting, any other ref    -> RUN  (shift-left on fork features)
 #   owner == FigureCollecting, a v* TAG        -> RUN  (a release tag publishes)
 #
-# The image job PUBLISHES on org push events (develop, main, a v* tag) and on
-# nothing else: a pull_request build stays push:false, and a fork never logs in
-# to GHCR. The GHCR package inherits the org's no-public-packages policy, so it
-# is private and the cluster pulls it with the `ghcr-pull` imagePullSecret that
-# scraper, ingest-server and fc-backend already use.
+# TWO IMAGE JOBS, AND THE SPLIT IS THE POINT. `image` builds, loads and asserts
+# non-root; it runs on every pull_request and holds `packages: read`. `publish`
+# pushes; it runs on org push events only (the integration branches and a v*
+# tag) and is the only job that ever holds `packages: write`. They are separate
+# jobs because GitHub's `permissions:` takes no expression — a single job cannot
+# hold write on push and read on pull_request, so the scope would otherwise
+# stand on every PR run of a job that can never publish from one. `publish` then
+# pulls the pushed digest back and re-asserts non-root against those exact
+# bytes, because it is a second buildx invocation and "the cache will have hit"
+# is not an assertion. The GHCR package inherits the org's no-public-packages
+# policy, so it is private and the cluster pulls it with the `ghcr-pull`
+# imagePullSecret that scraper, ingest-server and fc-backend already use.
 #
 # Package auth: `npm ci` reads the PRIVATE @figurecollecting/fc-shared from
 # GitHub Packages via the repo .npmrc's ${NODE_AUTH_TOKEN} placeholder. A fork
@@ -95,13 +102,67 @@ jobs:
     if: github.repository_owner == 'FigureCollecting'
     permissions:
       contents: read
-      # write, not read: the publish step below pushes to ghcr.io. It is scoped
-      # to this job, so the test job still runs with packages: read.
+      # READ, and it stays read. This job never pushes, on any event, so it has
+      # no business holding a registry write scope — and it is the job that runs
+      # on every pull_request. `permissions` takes no expression, so the only
+      # way to keep write off pull_request runs is to keep the publish in a
+      # different job. That is the `publish` job below.
+      packages: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Read service version from package.json
+        id: service-version
+        run: echo "version=$(node -pe "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build production image
+        # Build and LOAD, never push. This is the pull_request gate: it proves
+        # the production target builds from this tree and that the result is
+        # not a root image, and it does so without a credential of any kind.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: production
+          push: false
+          load: true
+          tags: fc-coordinator:ci
+          build-args: |
+            SERVICE_VERSION=${{ steps.service-version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          secrets: |
+            node_auth_token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify the image runs as a non-root user
+        run: |
+          user=$(docker inspect fc-coordinator:ci --format '{{.Config.User}}')
+          echo "image user: ${user}"
+          if [ -z "$user" ] || [ "$user" = "root" ] || [ "$user" = "0" ]; then
+            echo "::error::fc-coordinator image runs as root"
+            exit 1
+          fi
+
+  publish:
+    name: Publish container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: image
+    # PUSH EVENTS ONLY. The entry job's gate has already narrowed org push
+    # events to develop, main and v* tags, and `needs: image` inherits the
+    # org-only condition, so this is the whole remaining test. A pull_request
+    # never reaches this job at all — not its login, not its push, and not the
+    # `packages: write` scope it declares.
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
       packages: write
     outputs:
       # THE VALUE THE DEPLOY PINS. fc-infra references this image by digest, not
-      # by tag, so a manifest cannot silently follow a retag. Published in the
-      # job summary too, so it is readable without opening the raw log.
+      # by tag, so a manifest cannot silently follow a retag.
       digest: ${{ steps.publish.outputs.digest }}
       tags: ${{ steps.meta.outputs.tags }}
     steps:
@@ -130,42 +191,7 @@ jobs:
             # the immutable per-commit tag an operator can correlate by eye
             type=sha,format=short,prefix=sha-
 
-      - name: Build production image
-        # STILL push:false, and that is deliberate: the image is built and
-        # LOADED first so the non-root assertion below runs BEFORE anything can
-        # reach the registry. The publish step re-invokes buildx, which is a
-        # cache hit on every layer and therefore just the push.
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          target: production
-          push: false
-          load: true
-          tags: fc-coordinator:ci
-          build-args: |
-            SERVICE_VERSION=${{ steps.service-version.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          secrets: |
-            node_auth_token=${{ secrets.GITHUB_TOKEN }}
-
-      - name: Verify the image runs as a non-root user
-        run: |
-          user=$(docker inspect fc-coordinator:ci --format '{{.Config.User}}')
-          echo "image user: ${user}"
-          if [ -z "$user" ] || [ "$user" = "root" ] || [ "$user" = "0" ]; then
-            echo "::error::fc-coordinator image runs as root"
-            exit 1
-          fi
-
-      # ---- publish, org push events only -----------------------------------
-      # A pull_request never reaches these three steps, so a PR build neither
-      # authenticates to GHCR nor pushes anything. `github.event_name == 'push'`
-      # is the whole condition: the job-level `if` has already restricted this
-      # job to the org, and the entry job's gate has already restricted org push
-      # events to develop, main and v* tags.
       - name: Log in to GitHub Container Registry
-        if: github.event_name == 'push'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -174,7 +200,6 @@ jobs:
 
       - name: Publish the image to GHCR
         id: publish
-        if: github.event_name == 'push'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -189,8 +214,30 @@ jobs:
           secrets: |
             node_auth_token=${{ secrets.GITHUB_TOKEN }}
 
+      - name: Verify the PUBLISHED image runs as a non-root user
+        # THE BYTES THAT WERE PUSHED, not a sibling build that ought to match.
+        #
+        # The `image` job asserts non-root against its own `load: true` output,
+        # which is the right gate for a pull_request but proves nothing about
+        # THIS artifact: this is a second buildx invocation, and the argument
+        # that it is identical rests on the GHA cache hitting. It normally will.
+        # If it does not — an eviction, a concurrent run, a failed cache write —
+        # the published image would never have been asserted at all. So it is
+        # pulled back by digest and inspected. An assertion about the artifact
+        # has to be made about the artifact.
+        run: |
+          set -euo pipefail
+          ref="ghcr.io/figurecollecting/fc-coordinator@${{ steps.publish.outputs.digest }}"
+          echo "inspecting ${ref}"
+          docker pull --quiet "${ref}"
+          user=$(docker inspect "${ref}" --format '{{.Config.User}}')
+          echo "published image user: ${user}"
+          if [ -z "$user" ] || [ "$user" = "root" ] || [ "$user" = "0" ]; then
+            echo "::error::the PUBLISHED fc-coordinator image runs as root"
+            exit 1
+          fi
+
       - name: Report the published digest
-        if: github.event_name == 'push'
         run: |
           {
             echo "### fc-coordinator image published"
