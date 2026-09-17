@@ -567,6 +567,17 @@ describe('userinfo embedded in the token endpoint', () => {
     ['a protocol-relative URL, which has no scheme to parse', `//${USER}:${EMBEDDED}@auth.example.com/token`],
     ['a bare host:port, where the userinfo lands in an OPAQUE PATH', `${USER}:${EMBEDDED}@auth.example.com/token`],
     ['a data: URL, same shape, no authority at all', `data:text/plain,${USER}:${EMBEDDED}@auth.example.com`],
+    // THE THREE BELOW CARRY NO `@`, and that is the whole reason they are here.
+    // Every opaque input above happens to contain one, so once the at-sign
+    // guard was added it answered first and the null-origin guard behind it
+    // stopped being pinned by anything: deleting that guard left the suite
+    // green. These are what an opaque endpoint looks like when the at-sign
+    // guard cannot help, and with the null-origin check gone they render as
+    // `null` concatenated to a path holding the secret — `nullhunter2/token`.
+    // A guard that no test can break is a guard nobody will keep.
+    ['an opaque URL with no @ anywhere, so only the null origin can catch it', `${USER}:${EMBEDDED}/token`],
+    ['a mailto:, which is an opaque path and nothing else', `mailto:${EMBEDDED}`],
+    ['a blob: with no inner URL to take an origin from', `blob:${EMBEDDED}`],
     // The literal placeholder text, CONFIGURED. This is the one input on which
     // branching on emptiness and branching on `endpoint === '(unset)'` differ,
     // and it is what makes the emptiness form the testable one. Not a
@@ -584,6 +595,13 @@ describe('userinfo embedded in the token endpoint', () => {
     expect(described).toContain('token_endpoint=(unparseable)');
     expect(described).not.toContain(EMBEDDED);
     expect(described).not.toContain('(unset)');
+
+    // And through the boot line as well, at every level. `describeOpenFgaAuth`
+    // returns a string; what matters is that the string reaches a console
+    // without the secret in it, whichever level the state routes it to.
+    initOpenFgaAuth(endpointEnv(endpoint));
+    expect(printed()).toContain('(unparseable)');
+    expect(printed()).not.toContain(EMBEDDED);
   });
 
   it('drops the query and the fragment, which are not part of identifying the issuer', () => {

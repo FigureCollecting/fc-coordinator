@@ -223,6 +223,17 @@ export const invalidateOpenFgaToken = (presented?: string): void => {
     // SUPERSEDED. Someone else's re-mint already landed and this caller has
     // not tried it. Leave the cache alone — including `invalidateRequested`,
     // because no mint is being asked for here.
+    //
+    // WHAT THE AUDIT RECORD CANNOT SEE, and it is worth knowing before anyone
+    // reads one during an incident: a subject that denies after standing down
+    // here and a subject that denies having minted a token of its own produce
+    // the SAME entitlement.check line. Both retried once, both were refused
+    // twice, and `decision`, `reason` and `httpStatus` are identical — the
+    // difference lives only in these process-wide counters, which are per
+    // process and not per subject. So "how many of these denials cost a grant?"
+    // is answerable in aggregate and not per record. Carrying it down to the
+    // record means a field on the audit event, which is a contract change; it
+    // belongs with the sequential-shape unit rather than here.
     bump('token_refresh_superseded');
     return;
   } else {
