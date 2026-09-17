@@ -471,3 +471,450 @@ describe('the token endpoint scheme', () => {
     expect(JSON.stringify(errors)).toContain('REFUSED');
   });
 });
+
+// ===========================================================================
+// USERINFO EMBEDDED IN THE TOKEN ENDPOINT
+//
+// Every OTHER credential in this module arrives through its own variable and is
+// asserted never to be logged. The token endpoint is the exception in both
+// directions: it is the one value the boot line is SUPPOSED to print, and a URL
+// is allowed to carry a password inside it. So the one place a secret is meant
+// to be echoed is also the one place a secret can arrive unannounced.
+//
+// Nothing in the estate configures it this way. That is what makes it worth a
+// test rather than a fix alone — a latent leak has no operator to notice it.
+// ===========================================================================
+describe('userinfo embedded in the token endpoint', () => {
+  // Deliberately not the word "secret": the assertion must fail on THIS value
+  // and not on some unrelated line that happens to use the noun.
+  const EMBEDDED = 'hunter2-never-print-me';
+  const USER = 'svcuser';
+
+  const endpointEnv = (
+    endpoint: string,
+    over: Record<string, string | undefined> = {},
+  ): NodeJS.ProcessEnv =>
+    ({
+      OPENFGA_OIDC_TOKEN_ENDPOINT: endpoint,
+      OPENFGA_OIDC_CLIENT_ID: 'openfga',
+      OPENFGA_OIDC_USERNAME: USERNAME,
+      OPENFGA_OIDC_PASSWORD: PASSWORD,
+      ...over,
+    }) as NodeJS.ProcessEnv;
+
+  const HTTPS = `https://${USER}:${EMBEDDED}@auth.example.com/application/o/token/`;
+  /** The fixture endpoint, reachable, with userinfo bolted on. Loopback, so not REFUSED. */
+  const loopbackWithUserinfo = (): string => idp.url.replace('http://', `http://${USER}:${EMBEDDED}@`);
+
+  const printed = (): string => JSON.stringify([...logs, ...warns, ...errors]);
+
+  // -------------------------------------------------------------------------
+  // THE BOOT LINE
+  // -------------------------------------------------------------------------
+
+  // All four boot states, because the printed value is assembled once and
+  // reused by every one of them — and the three unusable states are reached by
+  // different branches, at three different console levels.
+  it.each([
+    ['complete', (): NodeJS.ProcessEnv => endpointEnv(HTTPS)],
+    ['INCOMPLETE', (): NodeJS.ProcessEnv => endpointEnv(HTTPS, { OPENFGA_OIDC_USERNAME: undefined })],
+    ['REFUSED, plaintext', (): NodeJS.ProcessEnv => endpointEnv(`http://${USER}:${EMBEDDED}@auth.example.com/token`)],
+    ['REFUSED, not an absolute URL', (): NodeJS.ProcessEnv => endpointEnv(`//${USER}:${EMBEDDED}@auth.example.com/token`)],
+    ['REFUSED, no scheme so the host lands in an opaque path', (): NodeJS.ProcessEnv => endpointEnv(`${USER}:${EMBEDDED}@auth.example.com/token`)],
+  ])('never prints it at boot in the %s state', (_label, build) => {
+    initOpenFgaAuth(build());
+
+    // EVERY level, not the one this state is expected to use: a fix that moved
+    // the leak from console.log to console.error would otherwise pass.
+    expect(printed()).not.toContain(EMBEDDED);
+  });
+
+  it('still identifies WHICH endpoint is configured, by origin and path', () => {
+    // Stripping must not turn the line into a shrug. An operator reads this to
+    // confirm the Secret points at the right issuer.
+    const described = describeOpenFgaAuth(endpointEnv(HTTPS));
+
+    expect(described).toContain('token_endpoint=https://auth.example.com/application/o/token/');
+    expect(described).not.toContain(EMBEDDED);
+    expect(described).not.toContain(USER);
+    expect(described).toContain('complete');
+  });
+
+  it('keeps every boot state exactly where it was, so stripping hid no misconfiguration', () => {
+    // The risk of a redaction is that it redacts the DIAGNOSIS too. The state
+    // word is the diagnosis, so it is pinned alongside the secret's absence.
+    expect(describeOpenFgaAuth(endpointEnv(HTTPS))).toContain('complete');
+    expect(describeOpenFgaAuth(endpointEnv(HTTPS, { OPENFGA_OIDC_PASSWORD: undefined }))).toContain('INCOMPLETE');
+    expect(describeOpenFgaAuth(endpointEnv(`http://${USER}:${EMBEDDED}@auth.example.com/token`))).toContain('REFUSED');
+    expect(describeOpenFgaAuth(endpointEnv(`//${USER}:${EMBEDDED}@auth.example.com/token`))).toContain('REFUSED');
+  });
+
+  // -------------------------------------------------------------------------
+  // THE TWO PLACEHOLDERS ARE DIFFERENT OPERATOR PROBLEMS
+  // -------------------------------------------------------------------------
+
+  it('still says (unset) rather than (unparseable) when the endpoint is simply absent', () => {
+    // An absent endpoint and an unrenderable one are different operator
+    // problems and the line must not collapse them.
+    const described = describeOpenFgaAuth(endpointEnv('', { OPENFGA_OIDC_TOKEN_ENDPOINT: undefined }));
+
+    expect(described).toContain('token_endpoint=(unset)');
+    expect(described).not.toContain('(unparseable)');
+    expect(described).toContain('INCOMPLETE');
+  });
+
+  it.each([
+    ['a protocol-relative URL, which has no scheme to parse', `//${USER}:${EMBEDDED}@auth.example.com/token`],
+    ['a bare host:port, where the userinfo lands in an OPAQUE PATH', `${USER}:${EMBEDDED}@auth.example.com/token`],
+    ['a data: URL, same shape, no authority at all', `data:text/plain,${USER}:${EMBEDDED}@auth.example.com`],
+    // THE THREE BELOW CARRY NO `@`, and that is the whole reason they are here.
+    // Every opaque input above happens to contain one, so once the at-sign
+    // guard was added it answered first and the null-origin guard behind it
+    // stopped being pinned by anything: deleting that guard left the suite
+    // green. These are what an opaque endpoint looks like when the at-sign
+    // guard cannot help, and with the null-origin check gone they render as
+    // `null` concatenated to a path holding the secret — `nullhunter2/token`.
+    // A guard that no test can break is a guard nobody will keep.
+    ['an opaque URL with no @ anywhere, so only the null origin can catch it', `${USER}:${EMBEDDED}/token`],
+    ['a mailto:, which is an opaque path and nothing else', `mailto:${EMBEDDED}`],
+    ['a blob: with no inner URL to take an origin from', `blob:${EMBEDDED}`],
+    // The literal placeholder text, CONFIGURED. This is the one input on which
+    // branching on emptiness and branching on `endpoint === '(unset)'` differ,
+    // and it is what makes the emptiness form the testable one. Not a
+    // credential exposure either way — what the other form would print is this
+    // same literal string — but "you configured nothing" and "you configured
+    // something I will not repeat" are different diagnoses and must not merge.
+    ['the literal text (unset), actually configured', '(unset)'],
+  ])('renders %s as (unparseable), never as its own text', (_label, endpoint) => {
+    // The opaque-path case is the one a naive `origin + pathname` gets WRONG:
+    // `new URL` accepts it, reports origin "null", and puts the whole rest —
+    // userinfo included — in `pathname`. Parsing successfully is not the same
+    // as being safe to print.
+    const described = describeOpenFgaAuth(endpointEnv(endpoint));
+
+    expect(described).toContain('token_endpoint=(unparseable)');
+    expect(described).not.toContain(EMBEDDED);
+    expect(described).not.toContain('(unset)');
+
+    // And through the boot line as well, at every level. `describeOpenFgaAuth`
+    // returns a string; what matters is that the string reaches a console
+    // without the secret in it, whichever level the state routes it to.
+    initOpenFgaAuth(endpointEnv(endpoint));
+    expect(printed()).toContain('(unparseable)');
+    expect(printed()).not.toContain(EMBEDDED);
+  });
+
+  it('drops the query and the fragment, which are not part of identifying the issuer', () => {
+    // Not userinfo, but the same argument: neither is needed to recognise the
+    // endpoint, and a token endpoint carrying a query string is as plausible a
+    // place to have parked a secret as the authority is.
+    const described = describeOpenFgaAuth(
+      endpointEnv(`https://auth.example.com/token?api_key=${EMBEDDED}#${EMBEDDED}`),
+    );
+
+    expect(described).toContain('token_endpoint=https://auth.example.com/token,');
+    expect(described).not.toContain(EMBEDDED);
+  });
+
+  it.each([
+    ['a plain @ in the path', `https://auth.example.com/a@${EMBEDDED}/token`],
+    [
+      'a blob: URL, whose origin comes from the INNER url and whose path keeps its userinfo',
+      `blob:https://${USER}:${EMBEDDED}@auth.example.com/token`,
+    ],
+    [
+      'a slash inside the password, which makes the USERNAME parse as the host',
+      `https://${USER}:1234/${EMBEDDED}@auth.example.com/token`,
+    ],
+  ])('renders %s as (unparseable) — the origin is not safe either', (_label, endpoint) => {
+    // NOT A HYPOTHETICAL. The second and third are real inputs reaching the
+    // `@`-in-path branch, and the third is the one that settles the question of
+    // what to degrade TO: `https://svcuser:1234/...` parses `svcuser` as the
+    // host and `1234` as the port, so the ORIGIN itself is assembled out of a
+    // username and the head of a password. Printing it would echo the
+    // credential while calling it the issuer.
+    const described = describeOpenFgaAuth(endpointEnv(endpoint));
+
+    expect(described).toContain('token_endpoint=(unparseable)');
+    expect(described).not.toContain(EMBEDDED);
+    expect(described).not.toContain('auth.example.com/');
+  });
+
+  // -------------------------------------------------------------------------
+  // EVERY OTHER CONSOLE SITE IN THE MODULE
+  //
+  // The boot line is where the leak was FOUND. It is not the only place the
+  // configured endpoint can be reached from, so the property is asserted over
+  // every branch in the file that writes to a console sink, driven with a
+  // userinfo-bearing endpoint in each.
+  // -------------------------------------------------------------------------
+  it.each([
+    [
+      'the REFUSED mint path, which reports its own reason at the first mint',
+      async (): Promise<void> => {
+        expect(await getOpenFgaToken(endpointEnv(`//${USER}:${EMBEDDED}@auth.example.com/token`), T0)).toBeNull();
+      },
+    ],
+    [
+      'the INCOMPLETE mint path',
+      async (): Promise<void> => {
+        expect(
+          await getOpenFgaToken(endpointEnv(HTTPS, { OPENFGA_OIDC_PASSWORD: undefined }), T0),
+        ).toBeNull();
+      },
+    ],
+    [
+      'the shadowed-static warning, the one console.warn the oidc path can reach',
+      async (): Promise<void> => {
+        await openFgaAuthHeaders(endpointEnv(loopbackWithUserinfo(), { OPENFGA_API_TOKEN: 'stale' }), T0);
+        expect(warns.length).toBeGreaterThan(0);
+      },
+    ],
+    [
+      'a mint that SUCCEEDS over an endpoint carrying userinfo',
+      async (): Promise<void> => {
+        expect(await getOpenFgaToken(endpointEnv(loopbackWithUserinfo()), T0)).toBe('token-1');
+      },
+    ],
+    [
+      'a mint whose response body is not an object',
+      async (): Promise<void> => {
+        idp.reply({ body: '[]' });
+        expect(await getOpenFgaToken(endpointEnv(loopbackWithUserinfo()), T0)).toBeNull();
+        expect(errors.length).toBeGreaterThan(0);
+      },
+    ],
+    [
+      'a mint whose response carries no access_token',
+      async (): Promise<void> => {
+        idp.reply({ body: { token_type: 'Bearer' } });
+        expect(await getOpenFgaToken(endpointEnv(loopbackWithUserinfo()), T0)).toBeNull();
+        expect(errors.length).toBeGreaterThan(0);
+      },
+    ],
+    [
+      'a mint the provider answers with a 500, so the axios error is the one being printed',
+      async (): Promise<void> => {
+        idp.reply({ status: 500, body: { error: 'boom' } });
+        expect(await getOpenFgaToken(endpointEnv(loopbackWithUserinfo()), T0)).toBeNull();
+        expect(errors.length).toBeGreaterThan(0);
+      },
+    ],
+    [
+      'a mint against a socket that refuses, the transport-error branch',
+      async (): Promise<void> => {
+        expect(
+          await getOpenFgaToken(endpointEnv(`https://${USER}:${EMBEDDED}@127.0.0.2:1/token`), T0),
+        ).toBeNull();
+        expect(errors.length).toBeGreaterThan(0);
+      },
+    ],
+  ])('leaks nothing through %s', async (_label, drive) => {
+    await drive();
+
+    expect(printed()).not.toContain(EMBEDDED);
+    // The other two credentials are asserted elsewhere; re-asserted here because
+    // this suite is the one that drives every console branch in one place.
+    expect(printed()).not.toContain(PASSWORD);
+  });
+
+  it('names the endpoint on the mint-failure line, so the failure says WHICH issuer', async () => {
+    // Redaction must not cost the diagnosis. Before this, a mint failure named
+    // no endpoint at all; it names one now, and the safe form is the one it can
+    // afford to name.
+    idp.reply({ status: 500, body: { error: 'boom' } });
+    expect(await getOpenFgaToken(endpointEnv(loopbackWithUserinfo()), T0)).toBeNull();
+
+    const text = JSON.stringify(errors);
+    expect(text).toContain('minting the OpenFGA token failed');
+    expect(text).toContain(new URL(idp.url).origin);
+    expect(text).not.toContain(EMBEDDED);
+  });
+});
+
+// ===========================================================================
+// WHY A MINT HAPPENED
+//
+// The module could already say HOW MANY tokens it minted. It could not say
+// what for, and that turned out to matter: a review measured 26 mints for 50
+// subjects against a permanent 401 where the per-subject reasoning predicted
+// two, and the first fix attempted for it measured identical — because nobody
+// could see which of the three reasons the extra mints were arriving under.
+//
+// So every mint now names its cause, a forced refresh says whether it actually
+// threw anything away, and the single-flight pile-up records how deep it got.
+// These are the numbers test/entitlements/mint-storm.test.ts reads.
+// ===========================================================================
+describe('the mint counters say WHY, not just how many', () => {
+  it('calls the first mint of a process cold', async () => {
+    expect(await getOpenFgaToken(oidcEnv(), T0)).toBe('token-1');
+
+    const c = openFgaTokenCounters();
+    expect(c['token_mint']).toBe(1);
+    expect(c['token_mint_cold']).toBe(1);
+    expect(c['token_mint_expired']).toBeUndefined();
+    expect(c['token_mint_forced']).toBeUndefined();
+  });
+
+  it('calls a mint past the refresh point expired', async () => {
+    const env = oidcEnv();
+    await getOpenFgaToken(env, T0);
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+
+    // 600 s lifetime, 120 s skew -> the refresh point is 480 s in.
+    expect(await getOpenFgaToken(env, T0 + 480_000)).toBe('token-2');
+
+    const c = openFgaTokenCounters();
+    expect(c['token_mint']).toBe(2);
+    expect(c['token_mint_cold']).toBe(1);
+    expect(c['token_mint_expired']).toBe(1);
+  });
+
+  it('re-mints when the caller names the token that is actually cached', async () => {
+    // THE STORM PATH, and the legitimate half of it. The caller was refused
+    // holding token-1, token-1 is what the cache holds, so nobody else has
+    // replaced it yet and this really is the re-mint that has to happen.
+    const env = oidcEnv();
+    await openFgaAuthHeaders(env, T0);
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+
+    expect(
+      await openFgaAuthHeaders(env, T0, { forceRefresh: true, presentedToken: 'token-1' }),
+    ).toEqual({ authorization: 'Bearer token-2' });
+
+    const c = openFgaTokenCounters();
+    expect(c['token_mint']).toBe(2);
+    expect(c['token_mint_forced']).toBe(1);
+    expect(c['token_refresh_requested']).toBe(1);
+    expect(c['token_refresh_discarded']).toBe(1);
+  });
+
+  it('STANDS DOWN when the cache has already moved past the token that was refused', async () => {
+    // THE FIX. A caller refused holding token-1 arrives to find token-2 in the
+    // cache — someone else's re-mint landed first. There is nothing to re-mint:
+    // token-2 has not been tried. It takes token-2 and the identity provider is
+    // never called. Fifty subjects refused together used to cost 26 mints and
+    // now cost 2, entirely through this branch.
+    const env = oidcEnv();
+    await openFgaAuthHeaders(env, T0);
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+    await openFgaAuthHeaders(env, T0, { forceRefresh: true, presentedToken: 'token-1' });
+    const mintsBefore = idp.calls.length;
+
+    expect(
+      await openFgaAuthHeaders(env, T0, { forceRefresh: true, presentedToken: 'token-1' }),
+    ).toEqual({ authorization: 'Bearer token-2' });
+
+    expect(idp.calls).toHaveLength(mintsBefore);
+    const c = openFgaTokenCounters();
+    expect(c['token_refresh_superseded']).toBe(1);
+    expect(c['token_mint']).toBe(2);
+    expect(c['token_cache_hit']).toBe(1);
+  });
+
+  it('clears the cache on trust when the caller can name no token, and says so', async () => {
+    // THE PRE-FIX BEHAVIOUR, kept reachable for a caller with no token to name
+    // and counted separately so it cannot creep back in unnoticed. grants.ts
+    // always names one; mint-storm.test.ts pins this counter at zero.
+    const env = oidcEnv();
+    await openFgaAuthHeaders(env, T0);
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+
+    expect(await openFgaAuthHeaders(env, T0, { forceRefresh: true })).toEqual({
+      authorization: 'Bearer token-2',
+    });
+
+    const c = openFgaTokenCounters();
+    expect(c['token_refresh_blind']).toBe(1);
+    expect(c['token_refresh_discarded']).toBeUndefined();
+    expect(c['token_mint_forced']).toBe(1);
+  });
+
+  it('accounts for every refresh request across the four outcomes', async () => {
+    // An invariant over the split, for the same reason the mint reasons have
+    // one: a request landing in no bucket, or two, makes every ratio built on
+    // these numbers wrong without making any single count look wrong.
+    const env = oidcEnv();
+    await openFgaAuthHeaders(env, T0, { forceRefresh: true, presentedToken: 'nothing-cached-yet' });
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+    await openFgaAuthHeaders(env, T0, { forceRefresh: true, presentedToken: 'token-1' });
+    await openFgaAuthHeaders(env, T0, { forceRefresh: true, presentedToken: 'token-1' });
+    await openFgaAuthHeaders(env, T0, { forceRefresh: true });
+
+    const c = openFgaTokenCounters();
+    const byOutcome =
+      (c['token_refresh_discarded'] ?? 0) +
+      (c['token_refresh_superseded'] ?? 0) +
+      (c['token_refresh_empty'] ?? 0) +
+      (c['token_refresh_blind'] ?? 0);
+    expect(byOutcome).toBe(c['token_refresh_requested']);
+    expect(c['token_refresh_requested']).toBe(4);
+  });
+
+  it('separates a refresh that threw a token away from one that found nothing', async () => {
+    // Asked for and acted on are different numbers, and the gap between them is
+    // the interesting one: a refresh that discards nothing is a caller whose
+    // token was ALREADY replaced by someone else's re-mint, which is exactly
+    // the coordination the storm lacks.
+    const env = oidcEnv();
+
+    expect(await openFgaAuthHeaders(env, T0, { forceRefresh: true })).toEqual({
+      authorization: 'Bearer token-1',
+    });
+
+    const c = openFgaTokenCounters();
+    expect(c['token_refresh_requested']).toBe(1);
+    expect(c['token_refresh_empty']).toBe(1);
+    expect(c['token_refresh_discarded']).toBeUndefined();
+    // Still attributed to the refresh, because that is what the caller asked
+    // for — the outcome split, not the reason, is what says it found nothing.
+    expect(c['token_mint_forced']).toBe(1);
+    expect(c['token_mint_cold']).toBeUndefined();
+  });
+
+  it('accounts for every mint exactly once across the three reasons', async () => {
+    // An invariant, not a scenario: a reason that stops being assigned, or one
+    // assigned twice, makes every ratio built on these numbers wrong without
+    // making any single count look wrong.
+    const env = oidcEnv();
+    await getOpenFgaToken(env, T0);
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+    await getOpenFgaToken(env, T0 + 480_000);
+    await openFgaAuthHeaders(env, T0 + 480_000, { forceRefresh: true });
+
+    const c = openFgaTokenCounters();
+    const byReason =
+      (c['token_mint_cold'] ?? 0) + (c['token_mint_expired'] ?? 0) + (c['token_mint_forced'] ?? 0);
+    expect(byReason).toBe(c['token_mint']);
+    expect(c['token_mint']).toBe(3);
+  });
+
+  it('records how deep the single-flight pile-up got, not just that there was one', async () => {
+    // `token_coalesced` is a running total over the process; the peak is what
+    // says whether fifty callers arrived together or two did, twenty-five
+    // times. Those are the same total and different incidents.
+    const env = oidcEnv();
+    await Promise.all(Array.from({ length: 50 }, () => getOpenFgaToken(env, T0)));
+
+    const c = openFgaTokenCounters();
+    expect(c['token_mint']).toBe(1);
+    expect(c['token_coalesced']).toBe(49);
+    expect(c['token_inflight_peak']).toBe(50);
+  });
+
+  it('reports the peak as a high-water mark, not a sum of separate pile-ups', async () => {
+    const env = oidcEnv();
+    await Promise.all(Array.from({ length: 4 }, () => getOpenFgaToken(env, T0)));
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+    await Promise.all(Array.from({ length: 3 }, () => getOpenFgaToken(env, T0 + 480_000)));
+
+    const c = openFgaTokenCounters();
+    expect(c['token_coalesced']).toBe(5);
+    expect(c['token_inflight_peak']).toBe(4);
+  });
+
+  it('clears the reasons with the rest of the state, so one test cannot read another', () => {
+    resetOpenFgaTokenForTest();
+    expect(openFgaTokenCounters()).toEqual({});
+  });
+});

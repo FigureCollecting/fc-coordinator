@@ -24,6 +24,8 @@
  * fake's body would slip past it. So the code is asserted to contain no
  * `validateStatus` at all.
  */
+// Inert unless CLOCK_STEP_MS is set — see the helper.
+import '../helpers/steppingClock.js';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
 import type { AddressInfo, Socket } from 'node:net';
@@ -220,7 +222,13 @@ describe('OPENFGA_TIMEOUT_MS', () => {
     // resolving to a deny at the 2 s default.
     const silent = await startSilentServer();
     try {
-      const started = Date.now();
+      // performance.now(), NOT Date.now(): this is an ELAPSED-TIME measurement
+      // and Date.now() is not monotonic. The same substitution commit fef12ca
+      // made in grants.test.ts, for the same measured reason — a backwards step
+      // on this estate's WSL2 hosts subtracts from the elapsed figure, and this
+      // assertion sits one second from its boundary. Reproducible on demand:
+      // CLOCK_STEP_MS=-2000 turns it red on the Date.now() version.
+      const started = performance.now();
       const grants = await grantsForSubject(SUB, T0, {
         OPENFGA_API_URL: silent.baseUrl,
         OPENFGA_STORE_ID: STORE,
@@ -232,7 +240,7 @@ describe('OPENFGA_TIMEOUT_MS', () => {
       // It ended because the 2 s default bit, not because the socket did
       // something else: anything under a second would mean the deadline was
       // never what stopped it.
-      expect(Date.now() - started).toBeGreaterThan(1_000);
+      expect(performance.now() - started).toBeGreaterThan(1_000);
     } finally {
       await silent.close();
     }

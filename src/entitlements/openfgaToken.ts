@@ -31,6 +31,12 @@
  *   provider is a cross-cluster hop, and one request per concurrent read is
  *   how a busy page becomes an outage upstream.
  *
+ *   ONE RE-MINT PER REJECTED TOKEN, not one per rejected CALLER. Single flight
+ *   only collapses callers that overlap, and 401s arrive one at a time, so a
+ *   fleet retrying together used to mint once per subject. A refresh now names
+ *   the token it was refused with and stands down if the cache has already
+ *   moved on. Measured: 26 mints for 50 concurrent subjects, down to 2.
+ *
  *   FAIL CLOSED. A mint failure returns null and the caller DENIES. It must
  *   never fall through to an unauthenticated Check: OpenFGA would answer 401
  *   and the user-visible outcome would be identical, but the log would name
@@ -42,6 +48,9 @@
  *   NOTHING LEAKS. Not the password, not the client secret, not the token, and
  *   never an axios error object — which serialises the whole request config,
  *   the form body included. The message only, the same rule the Check follows.
+ *   The token endpoint is the one value that IS printed, so it goes through
+ *   `printableEndpoint` everywhere: a URL may carry `user:password@` and that
+ *   would otherwise be a credential arriving inside a value meant for the log.
  *
  * NO BACKOFF LAYER HERE, deliberately. A mint outage is already damped twice:
  * single-flight collapses concurrent attempts, and the grant cache remembers an
@@ -86,8 +95,21 @@ interface CachedToken {
   refreshAtMs: number;
 }
 
+/** Why the mint about to happen is happening. See `openFgaTokenCounters`. */
+type MintReason = 'cold' | 'expired' | 'forced';
+
 let cached: CachedToken | null = null;
 let inflight: Promise<string | null> | null = null;
+/**
+ * Set by `invalidateOpenFgaToken`, read by the mint that follows it.
+ *
+ * Without it a forced re-mint is indistinguishable from a cold start, because
+ * both of them find an empty cache — and telling those two apart is the whole
+ * question behind the 401 storm.
+ */
+let invalidateRequested = false;
+/** Callers currently waiting on one in-flight mint, for the high-water mark. */
+let inflightWaiters = 0;
 let warnedShadowedStatic = false;
 let warnedIncomplete = false;
 let warnedEndpoint = false;
@@ -98,13 +120,68 @@ const bump = (name: string): void => {
   counters.set(name, (counters.get(name) ?? 0) + 1);
 };
 
-/** Snapshot: `token_mint`, `token_cache_hit`, `token_coalesced`, `token_mint_failed`. */
+/**
+ * A high-water mark, not a running total: the deepest single-flight pile-up
+ * seen so far. `token_coalesced` counts every caller that ever joined one;
+ * fifty arriving together and two arriving twenty-five times give the same
+ * total and are different incidents.
+ */
+const recordInflightPeak = (): void => {
+  if (inflightWaiters > (counters.get('token_inflight_peak') ?? 0)) {
+    counters.set('token_inflight_peak', inflightWaiters);
+  }
+};
+
+/**
+ * Snapshot of everything this module counts.
+ *
+ *   token_mint               tokens successfully minted
+ *   token_mint_cold          ...of which: nothing was cached and no refresh
+ *                            had been asked for — a process start, or the
+ *                            first call after a failed mint
+ *   token_mint_expired       ...of which: a cached token had reached its
+ *                            refresh point. The healthy, scheduled case.
+ *   token_mint_forced        ...of which: a caller asked for a refresh, which
+ *                            in this service means the Check's 401 retry.
+ *                            These three add up to token_mint exactly.
+ *   token_mint_failed        mints that returned nothing
+ *   token_cache_hit          calls served from the cache
+ *   token_coalesced          calls that joined a mint already in flight
+ *   token_inflight_peak      the deepest such pile-up (a gauge, not a total)
+ *   token_refresh_requested  forced refreshes asked for, which splits four ways
+ *   token_refresh_discarded  ...the caller held the cached token; it was
+ *                            dropped and re-minted. The legitimate one.
+ *   token_refresh_superseded ...the cache already held a token this caller had
+ *                            not tried, so it took that one instead. Every one
+ *                            of these is a mint that did not happen.
+ *   token_refresh_empty      ...a re-mint was already in flight; the caller
+ *                            joined it.
+ *   token_refresh_blind      ...the caller named no token, so the cache was
+ *                            dropped on trust. The pre-fix behaviour, kept
+ *                            reachable and counted so it cannot creep back.
+ *
+ * WHAT THESE ARE FOR, and it is narrower than "operator visibility": nothing in
+ * this service reads them. There is no /metrics route — /healthz is the entire
+ * public allowlist — and `openFgaTokenCounters` is re-exported through
+ * ./index.ts without a consumer. They are a MEASUREMENT SEAM, for the tests in
+ * test/entitlements/mint-storm.test.ts and for whoever takes the sequential
+ * shape next. Operator visibility would go through the audit sink wired at
+ * src/connect/register.ts, and that is a separate piece of work.
+ *
+ * They earned their place already. A review measured 26 mints for 50 subjects
+ * against a permanent OpenFGA 401 where the per-subject reasoning predicts two,
+ * and the split above is what showed where the extra 25 came from: a forced
+ * refresh per subject, each discarding a token its neighbours were about to
+ * use. `token_refresh_superseded` is the counter that goes up when that stops.
+ */
 export const openFgaTokenCounters = (): Readonly<Record<string, number>> => Object.fromEntries(counters);
 
 /** Test seam: drop the cached token, the in-flight mint, the counters and the one-shot warnings. */
 export const resetOpenFgaTokenForTest = (): void => {
   cached = null;
   inflight = null;
+  invalidateRequested = false;
+  inflightWaiters = 0;
   counters.clear();
   warnedShadowedStatic = false;
   warnedIncomplete = false;
@@ -112,9 +189,60 @@ export const resetOpenFgaTokenForTest = (): void => {
   loggedBootLine = false;
 };
 
-/** Drop the cached token. The 401 path calls this to force exactly one re-mint. */
-export const invalidateOpenFgaToken = (): void => {
+/**
+ * Throw away the token a caller was REFUSED WITH, so the 401 path re-mints once.
+ *
+ * `presented` is the token that came back 401. Naming it is the whole point,
+ * and skipping the discard when the cache holds something else is the fix for
+ * the mint storm:
+ *
+ *   Fifty subjects are refused holding the same token T1. The first to retry
+ *   finds T1 in the cache, discards it and mints T2. Every other retry was ALSO
+ *   refused holding T1 — but the cache now holds T2, which nothing has tried
+ *   yet, so there is nothing for them to re-mint. They take T2 and retry with
+ *   it. One re-mint serves all fifty instead of one re-mint per subject.
+ *
+ * WITHOUT the argument the cache is cleared on trust, which is how a caller
+ * ends up destroying a token twenty-five of its neighbours were about to use.
+ * That path stays reachable for a caller with no token to name, and it is
+ * counted separately as `token_refresh_blind` so it cannot creep back unseen.
+ *
+ * THIS DOES NOT HELP A SEQUENTIAL FLEET, and the measurement says so plainly:
+ * a subject arriving after the previous one finished reads the current token
+ * out of the cache, is refused with it, and so IS holding the cached one. See
+ * test/entitlements/mint-storm.test.ts.
+ */
+export const invalidateOpenFgaToken = (presented?: string): void => {
+  bump('token_refresh_requested');
+  if (cached === null) {
+    // Nothing held: a re-mint is already in flight and this caller joins it.
+    bump('token_refresh_empty');
+  } else if (presented === undefined) {
+    bump('token_refresh_blind');
+  } else if (cached.token !== presented) {
+    // SUPERSEDED. Someone else's re-mint already landed and this caller has
+    // not tried it. Leave the cache alone — including `invalidateRequested`,
+    // because no mint is being asked for here.
+    //
+    // WHAT THE AUDIT RECORD CANNOT SEE, and it is worth knowing before anyone
+    // reads one during an incident: a subject that denies after standing down
+    // here and a subject that denies having minted a token of its own produce
+    // the SAME entitlement.check line. Both retried once, both were refused
+    // twice, and `decision`, `reason` and `httpStatus` are identical — the
+    // difference lives only in these process-wide counters, which are per
+    // process and not per subject. So "how many of these denials cost a grant?"
+    // is answerable in aggregate and not per record. Carrying it down to the
+    // record means a field on the audit event, which is a contract change; it
+    // belongs with the sequential-shape unit rather than here.
+    bump('token_refresh_superseded');
+    return;
+  } else {
+    bump('token_refresh_discarded');
+  }
   cached = null;
+  // So the mint that follows is attributed to the refresh instead of looking
+  // like a cold start — which is what an empty cache otherwise looks like.
+  invalidateRequested = true;
 };
 
 const trimmed = (raw: string | undefined): string => raw?.trim() ?? '';
@@ -143,16 +271,22 @@ export function describeOpenFgaAuth(env: NodeJS.ProcessEnv): string {
   const mode = openFgaAuthMode(env);
   if (mode === 'oidc') {
     const missing = OIDC_KEYS.filter((key) => trimmed(env[key]) === '');
-    const endpoint = trimmed(env.OPENFGA_OIDC_TOKEN_ENDPOINT) || '(unset)';
+    const rawEndpoint = trimmed(env.OPENFGA_OIDC_TOKEN_ENDPOINT);
+    const endpoint = rawEndpoint || '(unset)';
     const clientId = trimmed(env.OPENFGA_OIDC_CLIENT_ID) || '(unset)';
     const rejected = missing.length === 0 ? rejectEndpoint(endpoint) : null;
+    // The RAW value is what gets validated; the PRINTABLE one is what gets
+    // shown. The branch is on emptiness rather than on the placeholder's text,
+    // so an endpoint literally configured as `(unset)` is still put through the
+    // redaction and comes back `(unparseable)`.
+    const shownEndpoint = rawEndpoint === '' ? '(unset)' : printableEndpoint(rawEndpoint);
     const state =
       missing.length > 0
         ? `INCOMPLETE, missing ${missing.join(', ')}`
         : rejected !== null
           ? `REFUSED — ${rejected}`
           : 'complete';
-    return `oidc client_credentials (${state}; token_endpoint=${endpoint}, client_id=${clientId})`;
+    return `oidc client_credentials (${state}; token_endpoint=${shownEndpoint}, client_id=${clientId})`;
   }
   if (mode === 'static') return 'static preshared token (OPENFGA_API_TOKEN)';
   return 'none — no credential configured, so every entitlement check denies';
@@ -185,6 +319,77 @@ export function initOpenFgaAuth(env: NodeJS.ProcessEnv = process.env): OpenFgaAu
 }
 
 /**
+ * Rendered in place of an endpoint that cannot be shown without risking the
+ * value inside it. Distinct from `(unset)` deliberately: "you configured
+ * nothing" and "you configured something I will not repeat" are different
+ * operator problems, and one boot line that says both says neither.
+ */
+const UNPRINTABLE_ENDPOINT = '(unparseable)';
+
+/**
+ * The configured token endpoint, in a form that is safe to put in a log line.
+ *
+ * WHY THIS EXISTS. This module's stated property is that nothing leaks, and
+ * every other credential it handles arrives in a variable of its own that is
+ * simply never printed. The endpoint is the exception in BOTH directions: it is
+ * the one value the boot line is SUPPOSED to print — an operator reads it to
+ * confirm the Secret points at the right issuer — and a URL is allowed to carry
+ * `user:password@` in its authority. So the one value meant to be echoed is
+ * also the one place a secret can arrive without announcing itself as one.
+ *
+ * ORIGIN PLUS PATH, and `origin` does the real work: it is the one part of a
+ * parsed URL guaranteed to exclude userinfo, so scheme, host and port survive
+ * and a credential cannot. Query and fragment go too — neither identifies the
+ * issuer, and both are as plausible a place to have parked a key as the
+ * authority is.
+ *
+ * THE PATH IS KEPT, and that asymmetry is deliberate rather than an oversight.
+ * The same argument would drop it — a secret parked at `/token/hunter2` is
+ * echoed — but the path is the DIAGNOSIS. `/application/o/token/` against
+ * `/oauth2/token` is how an operator tells a misconfigured issuer from a
+ * healthy one, and a line that prints only an origin cannot do the job this
+ * line exists for. A secret in the path is a secret written into the one field
+ * that has to be readable.
+ *
+ * THE CASE A NAIVE VERSION GETS WRONG is a value with no authority at all.
+ * `new URL('svcuser:pw@idp.example.com/token')` does not throw: it reports
+ * scheme `svcuser:`, origin `"null"` and pathname `pw@idp.example.com/token` —
+ * the whole credential, sitting in the field this function would otherwise
+ * print. Parsing successfully is not the same as being safe to print, so a null
+ * origin renders as the placeholder rather than as anything derived from the
+ * input.
+ */
+function printableEndpoint(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return UNPRINTABLE_ENDPOINT;
+  }
+  // `'null'` is the literal string the URL standard yields for a scheme that
+  // has no authority to have an origin for — the opaque-path case above.
+  if (url.origin === 'null') return UNPRINTABLE_ENDPOINT;
+  // AN `@` IN THE PATH MEANS THE PARSE DID NOT GO WHERE IT LOOKS. Two real
+  // inputs reach here, and neither is safe to print any part of:
+  //
+  //   blob:https://svcuser:hunter2@idp.example.com/token
+  //     `origin` is computed from the INNER url and the whole inner url —
+  //     userinfo included — is left in `pathname`.
+  //
+  //   https://svcuser:1234/hunter2@idp.example.com/token
+  //     the `/` ends the authority early, so `svcuser` parses as the HOST and
+  //     `1234` as the PORT. `origin` is then built out of what was meant to be
+  //     a username and the numeric head of a password. Degrading to the origin
+  //     would print credential-derived material and call it the issuer.
+  //
+  // So: the placeholder, not the origin. The cost is an endpoint whose path
+  // genuinely contains an `@` rendering as `(unparseable)`, and no token
+  // endpoint is known to charge it.
+  if (url.pathname.includes('@')) return UNPRINTABLE_ENDPOINT;
+  return `${url.origin}${url.pathname}`;
+}
+
+/**
  * Is this an endpoint the service account's password may be sent to?
  *
  * WHY THE RULE IS HERE AT ALL. `resolveAuthConfig` already refuses a non-https
@@ -207,7 +412,11 @@ function rejectEndpoint(raw: string): string | null {
   try {
     url = new URL(raw);
   } catch {
-    return `OPENFGA_OIDC_TOKEN_ENDPOINT must be an absolute URL, got '${raw}'`;
+    // The configured value is NOT echoed raw here, unlike the same message in
+    // auth/config.ts. That one is about OIDC_JWKS_URI, which carries public
+    // keys; this one is about the endpoint the service account's password is
+    // posted to, and a URL may carry a second credential inside it.
+    return `OPENFGA_OIDC_TOKEN_ENDPOINT must be an absolute URL, got ${printableEndpoint(raw)}`;
   }
   if (url.protocol !== 'https:' && !LOOPBACK_HOSTS.has(url.hostname)) {
     return `OPENFGA_OIDC_TOKEN_ENDPOINT must use https (got '${url.protocol}') unless it is loopback — the service account's password is sent to it`;
@@ -268,7 +477,7 @@ function refreshAtMs(expiresInSeconds: number, skewSeconds: number, nowMs: numbe
   return nowMs + ahead * 1000;
 }
 
-async function mint(config: OidcConfig, nowMs: number): Promise<string | null> {
+async function mint(config: OidcConfig, nowMs: number, reason: MintReason): Promise<string | null> {
   // URLSearchParams percent-encodes every value, which is the whole point: a
   // password with `&` or `=` in it would otherwise split into extra fields.
   const form = new URLSearchParams({
@@ -322,12 +531,21 @@ async function mint(config: OidcConfig, nowMs: number): Promise<string | null> {
     const expiresIn = typeof body.expires_in === 'number' && Number.isFinite(body.expires_in) ? body.expires_in : 0;
     cached = { token: body.access_token, refreshAtMs: refreshAtMs(expiresIn, config.skewSeconds, nowMs) };
     bump('token_mint');
+    // Beside the total, never instead of it: the three reasons must add up to
+    // it, and they only do if both are bumped on the same successful path.
+    bump(`token_mint_${reason}`);
     return cached.token;
   } catch (err) {
     // The MESSAGE only. An axios error carries the request config, and this
     // request's body is the service account's password.
     bump('token_mint_failed');
-    console.error('[ENTITLEMENT] minting the OpenFGA token failed — denying:', (err as Error).message);
+    // Naming the endpoint is the difference between "the provider is down" and
+    // "the Secret points at the wrong provider", and the printable form is one
+    // this line can afford to name. The MESSAGE only from the error itself.
+    console.error(
+      `[ENTITLEMENT] minting the OpenFGA token failed at ${printableEndpoint(config.endpoint)} — denying:`,
+      (err as Error).message,
+    );
     return null;
   }
 }
@@ -343,6 +561,12 @@ export async function getOpenFgaToken(
   const config = oidcConfig(env);
   if (config === null) return null;
 
+  // CONSUMED HERE, on every path out of this function. A refresh that ends in a
+  // cache hit or a coalesce asked for no mint of its own, and leaving the flag
+  // set would hand its reason to an unrelated mint later on.
+  const refreshWasRequested = invalidateRequested;
+  invalidateRequested = false;
+
   if (cached !== null && nowMs < cached.refreshAtMs) {
     bump('token_cache_hit');
     return cached.token;
@@ -353,15 +577,24 @@ export async function getOpenFgaToken(
   const pending = inflight;
   if (pending !== null) {
     bump('token_coalesced');
+    inflightWaiters += 1;
+    recordInflightPeak();
     return pending;
   }
 
-  const run = mint(config, nowMs);
+  // A cache that still holds something reached its refresh point; an empty one
+  // either was emptied by a forced refresh or was never filled.
+  const reason: MintReason = cached !== null ? 'expired' : refreshWasRequested ? 'forced' : 'cold';
+
+  const run = mint(config, nowMs, reason);
   inflight = run;
+  inflightWaiters = 1;
+  recordInflightPeak();
   try {
     return await run;
   } finally {
     inflight = null;
+    inflightWaiters = 0;
   }
 }
 
@@ -380,7 +613,7 @@ export async function getOpenFgaToken(
 export async function openFgaAuthHeaders(
   env: NodeJS.ProcessEnv,
   nowMs: number = Date.now(),
-  options: { forceRefresh?: boolean } = {},
+  options: { forceRefresh?: boolean; presentedToken?: string } = {},
 ): Promise<Record<string, string> | undefined> {
   const mode = openFgaAuthMode(env);
 
@@ -395,7 +628,9 @@ export async function openFgaAuthHeaders(
     );
   }
 
-  if (options.forceRefresh === true) invalidateOpenFgaToken();
+  // `presentedToken` is the bearer the caller was refused with — never logged,
+  // never stored, compared and dropped. See invalidateOpenFgaToken.
+  if (options.forceRefresh === true) invalidateOpenFgaToken(options.presentedToken);
 
   const token = await getOpenFgaToken(env, nowMs);
   if (token === null) return undefined;
