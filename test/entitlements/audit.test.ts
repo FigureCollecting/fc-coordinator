@@ -149,14 +149,48 @@ describe('a Check that could not be made', () => {
     idp.reply({ status: 500, body: { error: 'server_error' } });
 
     await grantsForSubject(SUB, T0, oidcEnv());
-    expect(events[0]).toMatchObject({ decision: 'error', reason: 'token_mint_failed' });
+    expect(events[0]).toMatchObject({
+      decision: 'error',
+      reason: 'token_mint_failed',
+      // NO CALL WAS MADE, so `source` must not claim one. This is the single
+      // field an operator uses to separate "OpenFGA said no" from "we never
+      // asked it", and anyone counting OpenFGA traffic by source=openfga would
+      // otherwise over-count by exactly the outage they are diagnosing.
+      source: 'none',
+      latency_ms: 0,
+    });
     expect(events[0]?.http_status).toBeUndefined();
     expect(fga.calls).toHaveLength(0);
   });
 
-  it('records an unconfigured client distinctly from a deny', async () => {
+  it('records an unconfigured client distinctly from a deny, and as an UNASKED question', async () => {
     await grantsForSubject(SUB, T0, {} as NodeJS.ProcessEnv);
-    expect(events[0]).toMatchObject({ decision: 'unconfigured', source: 'openfga' });
+    expect(events[0]).toMatchObject({
+      decision: 'unconfigured',
+      source: 'none',
+      latency_ms: 0,
+    });
+  });
+
+  it('reserves source "openfga" for decisions OpenFGA actually made', async () => {
+    // Stated once as a rule rather than only case by case: every event whose
+    // source is `openfga` corresponds to a request on the wire, and the
+    // request count is the proof.
+    // One real Check, then the three paths that never make one.
+    await grantsForSubject(SUB, T0, env());
+    idp.reply({ status: 500, body: { error: 'server_error' } });
+    await grantsForSubject('1f3a1c62-9d44-4e51-8b0a-2c6d5e1f9a33', T0, oidcEnv());
+    await grantsForSubject('2f3a1c62-9d44-4e51-8b0a-2c6d5e1f9a33', T0, {} as NodeJS.ProcessEnv);
+    await grantsForSubject('not-a-uuid', T0, env());
+
+    expect(events).toHaveLength(4);
+    expect(fga.calls).toHaveLength(1);
+    expect(events.filter((e) => e.source === 'openfga')).toHaveLength(fga.calls.length);
+    expect(events.filter((e) => e.source === 'none').map((e) => e.decision).sort()).toEqual([
+      'bad_subject',
+      'error',
+      'unconfigured',
+    ]);
   });
 });
 

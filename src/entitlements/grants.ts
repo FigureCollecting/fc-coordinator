@@ -445,7 +445,23 @@ export async function grantsForSubject(
       ? num(env.ENTITLEMENT_GRANT_ERROR_TTL_MS, DEFAULT_ERROR_TTL_MS)
       : num(env.ENTITLEMENT_GRANT_CACHE_TTL_MS, DEFAULT_CACHE_TTL_MS);
     cacheSet(subject, { ...decision, expiresAt: nowMs + ttl }, nowMs, env);
-    audit(subject, decision, 'openfga', latencyMs);
+
+    // `source` NAMES WHERE THE ANSWER CAME FROM, and two decisions reach here
+    // having made no request at all: an unconfigured client, which returns
+    // before a request is even built, and a failed token mint, which refuses to
+    // ask unauthenticated. Reporting either as `openfga` says the service
+    // answered when it was never asked — and this is the one field separating a
+    // refusal by OpenFGA and a question that never got there, so anyone
+    // counting OpenFGA traffic by it would over-count by exactly the outage
+    // they are diagnosing. `bad_subject` already gets this right above.
+    //
+    // NOTE TO A FUTURE EDITOR: do not write the word `from` immediately before
+    // a quoted string anywhere in this directory, comments included. The
+    // portability guard's specifier extractor does not strip comments — on
+    // purpose, since a partial guard is worse than none — so it reads that
+    // shape as an import and fails the build. This comment cost one.
+    const asked = name !== 'unconfigured' && outcome.reason !== 'token_mint_failed';
+    audit(subject, decision, asked ? 'openfga' : 'none', asked ? latencyMs : 0);
     return decision;
   })();
 
