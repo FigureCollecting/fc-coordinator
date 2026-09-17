@@ -63,6 +63,8 @@ const DEFAULT_CACHE_TTL_MS = 30_000;
 const DEFAULT_ERROR_TTL_MS = 5_000;
 /** Tight by intent: this is a blocking hop inside a user-facing read. */
 const DEFAULT_TIMEOUT_MS = 2_000;
+/** The one scheme this Check presents, and the prefix a 401 has to strip back off. */
+const BEARER = 'Bearer ';
 /**
  * Hard ceiling on cached subjects. The cache is keyed by subject and nothing
  * ever removed an entry, so it grew with every distinct identity the process
@@ -265,15 +267,32 @@ async function check(subject: string, env: NodeJS.ProcessEnv, nowMs: number): Pr
   const timeout = num(env.OPENFGA_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
   const canRemint = openFgaAuthMode(env) === 'oidc';
   let reminted = false;
+  /**
+   * The bearer this Check last put on the wire, so a 401 can say WHICH token
+   * was refused rather than only that one was.
+   *
+   * Without it the retry clears whatever the shared cache happens to hold, and
+   * a fleet of subjects being refused together each destroys the token the
+   * others were about to use — 26 mints for 50 subjects, measured. It is a
+   * credential in a local, never logged and never stored beyond this call.
+   */
+  let presentedToken: string | undefined;
 
   for (;;) {
-    const auth = await openFgaAuthHeaders(env, nowMs, { forceRefresh: reminted });
+    const auth = await openFgaAuthHeaders(
+      env,
+      nowMs,
+      reminted ? { forceRefresh: true, presentedToken } : {},
+    );
     if (auth === undefined) {
       // A credential IS configured and could not be obtained. Never fall
       // through to an unauthenticated Check: OpenFGA would answer 401 and the
       // outcome would be identical, but the record would name the wrong cause.
       return { allowed: false, errored: true, reason: 'token_mint_failed' };
     }
+
+    const bearer = auth['authorization'];
+    presentedToken = bearer?.startsWith(BEARER) === true ? bearer.slice(BEARER.length) : undefined;
 
     try {
       const response = await axios.post(url, body, {

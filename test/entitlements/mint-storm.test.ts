@@ -1,52 +1,40 @@
 /**
- * THE 401 MINT STORM, MEASURED AND PINNED.
+ * THE 401 MINT STORM — MEASURED, HALF FIXED, AND PINNED BOTH WAYS.
  *
  * A review measured 50 distinct subjects against a permanently-401 OpenFGA and
  * counted 26 token mints. The per-subject reasoning predicts two: one cold
  * mint, one forced re-mint, then the retry is spent and the subject denies.
  * Two is true of ONE subject and is what the unit test for it measures. It is
- * not true of a fleet, and the fleet number is what an identity provider's
- * capacity has to be planned against.
+ * not true of a fleet, and the fleet number is what a shared identity provider
+ * has to be sized for.
  *
- * WHAT THE COUNTERS SAY, and they are the reason this file exists rather than
- * another round of reasoning. Measured here, identically on 24 consecutive
- * runs including under two concurrent full suites:
+ * THE MECHANISM. Every subject's 401 retry asked for a refresh, and a refresh
+ * threw away the PROCESS-WIDE token — including the one a neighbour had just
+ * minted and twenty-five others were about to use.
  *
- *   CONCURRENT   50 subjects, one tick apart
- *     checks 100   mints 26   cold 1   forced 25
- *     refresh_requested 50   refresh_discarded 25   coalesced 74   peak 50
+ * A NOTE ON HOW THIS WAS GOT WRONG ONCE, because the correction is the
+ * interesting part. The first pass concluded that targeting the invalidation —
+ * discard only the token the caller was actually refused with — could not help,
+ * on the grounds that every caller holds the cached token anyway. That was an
+ * artifact of the harness: test/helpers/fakeTokenEndpoint.ts handed out the
+ * constant `token-1` on every request, so "is the cached token the one I
+ * presented?" answered yes by string identity whatever had happened in between.
+ * Authentik issues a distinct JWT per grant. Re-measured against distinct
+ * tokens the same change takes the concurrent shape from 26 mints to 2, and the
+ * numbers below are that measurement. The fake now mints distinct tokens by
+ * default and this file asserts that it does, because the assumption that hid a
+ * working fix is exactly the kind that should not be left implicit.
  *
- *   SEQUENTIAL   50 subjects, one after another
- *     checks 100   mints 51   cold 1   forced 50
- *     refresh_requested 50   refresh_discarded 50   cache_hit 49   peak 1
+ * WHAT IS FIXED, and what is not. Concurrently, one re-mint now serves the
+ * whole fleet: the first retry discards the token it was refused with, and the
+ * other forty-nine find a token they have not tried and take it. Sequentially
+ * nothing is fixed and nothing can be by this change — a subject arriving after
+ * the previous one finished reads the current token out of the cache, is
+ * refused with it, and so genuinely IS holding the cached one. That shape still
+ * costs one mint per subject and is pinned below as open.
  *
- * THE MECHANISM, which the `refresh_discarded` column settles. Every subject's
- * 401 retry calls for a refresh, and a refresh throws away the PROCESS-WIDE
- * token. Concurrently, half those callers arrive while someone else's re-mint
- * is still in flight, find an empty cache, and coalesce — so the storm is
- * damped to one mint per two subjects by nothing but arrival timing.
- * Sequentially there is no such accident: each subject reads the previous
- * subject's fresh token out of the cache (`cache_hit` 49), is refused with it,
- * and throws it away (`refresh_discarded` 50). One mint per subject, plus the
- * cold one.
- *
- * WHY THE OBVIOUS FIX MEASURED IDENTICAL. The candidate was "invalidate the
- * caller's own token, not the process-wide one". Its predicate is
- * `the cached token is the one I presented` — and these numbers show that is
- * TRUE for every caller in both shapes: concurrently they all hold the single
- * wave-one token, sequentially each holds the one it just cache-hit. A
- * predicate that is always true is a no-op, which is exactly what "measured
- * identical" means. It was not a failed fix; it was not a fix.
- *
- * THIS FILE DOES NOT FIX IT. It pins the shape so that a change to the retry
- * path cannot move these numbers silently, in either direction — the target of
- * one mint per five subjects is asserted as NOT met, so reaching it turns this
- * file red and whoever reaches it has to say so here.
- *
- * NOTHING FAILS OPEN. Every one of these requests denies; the per-subject retry
- * bound is honoured exactly (100 checks for 50 subjects, never a loop). This is
- * a load fact about the identity provider, not a correctness or security
- * defect.
+ * NOTHING FAILS OPEN. Every one of these requests denies and the per-subject
+ * retry bound holds exactly — 100 checks for 50 subjects, never a loop.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -64,8 +52,13 @@ import { startFakeTokenEndpoint, type FakeTokenEndpoint } from '../helpers/fakeT
 const STORE = '01KXA5NRJYR0GYKX4NWQ2ANDZS';
 const T0 = 1_780_000_000_000;
 const SUBJECTS = 50;
-/** The fleet target: no more than one mint per five subjects under a 401. NOT met. */
-const TARGET_MINT_FRACTION = 0.4;
+/**
+ * The ceiling for the concurrent shape. Measured 2 — one cold mint and one
+ * re-mint — and pinned with headroom rather than exactly, because the retry
+ * wave's interleaving is a runner's business. Two is also the FLOOR: the
+ * credential is genuinely being refused, so one re-mint has to happen.
+ */
+const CONCURRENT_MINT_CEILING = 5;
 const PASSWORD = 'app-password-never-print-me';
 
 let fga: FakeOpenFga;
@@ -122,26 +115,23 @@ afterEach(async () => {
 describe('50 subjects against a permanently unauthenticated OpenFGA', () => {
   it('is measured against an IdP that mints a DISTINCT token per grant', async () => {
     // THE PREMISE OF EVERY OTHER CASE IN THIS FILE, asserted rather than
-    // assumed. It was assumed once, wrongly: the fake handed out one constant
-    // token, so "is the cached token the one I was refused with?" answered yes
-    // for every caller by string identity, and a fix turning on exactly that
-    // question looked like a no-op. Authentik issues a separate JWT per grant.
-    // If this file is ever re-pointed at a pinned reply, this is what says so.
+    // assumed. It was assumed once, wrongly, and a constant-token fake turned a
+    // working fix into an apparent no-op — see the header. If this file is ever
+    // re-pointed at a pinned reply, this is what says so.
     await stormConcurrent();
 
     expect(idp.issued.length).toBe(idp.calls.length);
     expect(new Set(idp.issued).size).toBe(idp.issued.length);
 
     // And the module's own counter agrees with the socket's request log, so a
-    // mis-attributed or double-bumped counter cannot hide behind it. The
+    // mis-attributed or double-bumped counter cannot hide behind it. Every
     // headline number in this file is the SOCKET's, never the module's.
     expect(openFgaTokenCounters()['token_mint']).toBe(idp.calls.length);
   }, 60_000);
 
-  it('honours the per-subject retry bound exactly — the storm is in mints, not checks', async () => {
-    // FIRST, because it is the part that is NOT broken and the part a reader
-    // will otherwise assume is. Two checks per subject, no loop, every subject
-    // denied. Whatever the mint count does, this is the bound that holds.
+  it('honours the per-subject retry bound exactly — the storm was in mints, not checks', async () => {
+    // The part that was never broken, first, because a reader will otherwise
+    // assume it was. Two checks per subject, no loop, every subject denied.
     const results = await stormConcurrent();
 
     expect(results.every((grants) => grants.length === 0)).toBe(true);
@@ -150,76 +140,79 @@ describe('50 subjects against a permanently unauthenticated OpenFGA', () => {
     expect(entitlementGrantCounters()['error']).toBe(SUBJECTS);
   }, 60_000);
 
-  it('CONCURRENT: costs one mint per two subjects, and misses the one-per-five target', async () => {
+  it('CONCURRENT: one re-mint serves the whole fleet — was 26, now 2', async () => {
     await stormConcurrent();
 
-    // The headline, as a band rather than a point: the interleaving is driven
-    // by socket-callback ordering and measured identically 24 times here, but
-    // this must not go red on a runner that schedules two callbacks
-    // differently. What it must NOT tolerate is the target being met — see the
-    // next assertion.
-    expect(idp.calls.length).toBeGreaterThan(SUBJECTS * 0.4);
-    expect(idp.calls.length).toBeLessThanOrEqual(SUBJECTS * 0.6);
-
-    // THE TARGET IS PINNED AS UNMET. When someone fixes the retry path this
-    // line is what turns red, which is the point: a fix must arrive with a
-    // measurement, not as a quiet improvement nobody recorded.
-    expect(idp.calls.length).toBeGreaterThan(SUBJECTS * TARGET_MINT_FRACTION);
+    // The headline. A band, not a point: the lower bound catches a fake that
+    // stopped being called at all, the upper one catches the storm coming back.
+    expect(idp.calls.length).toBeGreaterThanOrEqual(2);
+    expect(idp.calls.length).toBeLessThanOrEqual(CONCURRENT_MINT_CEILING);
   }, 60_000);
 
-  it('CONCURRENT: every extra mint is a forced refresh that took a live token off someone', async () => {
+  it('CONCURRENT: no refresh throws away a token it cannot show was its own', async () => {
     await stormConcurrent();
     const c = openFgaTokenCounters();
 
-    // Deterministic regardless of interleaving: one refresh per retrying
-    // subject, exactly one cold mint, and the rest of the mints forced.
+    // THE PROPERTY THE FIX ADDS, and it is the one to watch rather than the
+    // mint count: a caller may only discard the token it was itself refused
+    // with. `token_refresh_blind` is the pre-fix behaviour — clear the cache on
+    // trust — and it goes to zero the moment grants.ts names the bearer it
+    // sent. Reverting that threading turns this line red, not the count above.
+    expect(c['token_refresh_blind']).toBeUndefined();
+
+    // Every retrying subject asked, and the answers account for all of them:
+    // one discarded its own token and re-minted, one found a re-mint already in
+    // flight, and the rest took a token they had not tried. Those forty-eight
+    // are mints that did not happen.
     expect(c['token_refresh_requested']).toBe(SUBJECTS);
+    expect(
+      (c['token_refresh_discarded'] ?? 0) +
+        (c['token_refresh_superseded'] ?? 0) +
+        (c['token_refresh_empty'] ?? 0) +
+        (c['token_refresh_blind'] ?? 0),
+    ).toBe(SUBJECTS);
+    expect(c['token_refresh_superseded']).toBeGreaterThan(SUBJECTS / 2);
+
+    // One cold mint, and every forced mint bought by a discard of the caller's
+    // own token. Single flight is intact: all fifty arrived in one tick.
     expect(c['token_mint_cold']).toBe(1);
-    expect(c['token_mint']).toBe(1 + (c['token_mint_forced'] ?? 0));
-
-    // THE MECHANISM. A forced refresh either discards a live token and mints,
-    // or finds the cache already empty — a re-mint in flight — and coalesces.
-    // The two together account for every retrying subject, and the discards
-    // account for every forced mint. That equality is the storm's whole shape.
     expect(c['token_mint_forced']).toBe(c['token_refresh_discarded']);
-    // The cold wave coalesced 49 of the 50; everything above that belongs to
-    // the retry wave, and discards plus retry-coalesces account for all fifty
-    // retrying subjects with nothing left over.
-    const coldWaveCoalesced = SUBJECTS - 1;
-    const retryCoalesced = (c['token_coalesced'] ?? 0) - coldWaveCoalesced;
-    expect((c['token_refresh_discarded'] ?? 0) + retryCoalesced).toBe(SUBJECTS);
-
-    // All fifty arrived inside one tick, which is why the cold wave cost one
-    // mint and not fifty. The single-flight guarantee is intact; it just does
-    // not reach the retry wave, because those do not arrive together.
     expect(c['token_inflight_peak']).toBe(SUBJECTS);
   }, 60_000);
 
-  it('SEQUENTIAL: costs MORE than one mint per subject, because nothing coalesces', async () => {
-    // The worse shape, and the realistic one for a service answering ordinary
-    // traffic rather than a thundering herd. Fully deterministic — there is no
-    // concurrency for the interleaving to vary.
+  it('SEQUENTIAL: still one mint per subject — the KNOWN OPEN shape', async () => {
+    // NOT FIXED, and not fixable by naming the presented token. Each subject
+    // reads the previous subject's fresh token out of the cache (cache_hit 49),
+    // is refused with it, and so genuinely IS holding the cached one — the
+    // guard has nothing to catch. Fully deterministic: no concurrency for an
+    // interleaving to vary, so this is pinned exactly.
+    //
+    // THIS IS THE SHAPE ORDINARY TRAFFIC HAS, and it is the worse one. With
+    // ENTITLEMENT_GRANT_ERROR_TTL_MS at 5 s each active subject re-asks every
+    // five seconds, so a persistent 401 sustains roughly (active subjects) / 5
+    // successful password grants per second against an Authentik shared with
+    // the user plane. Closing it needs a damper the module declines by name:
+    // (b) a short negative memory after a re-mint that was also refused, or
+    // (c) a token-bucket bound on forced mints. Its own unit, its own round.
     await stormSequential();
     const c = openFgaTokenCounters();
 
     expect(idp.calls.length).toBe(SUBJECTS + 1);
     expect(c['token_mint_cold']).toBe(1);
     expect(c['token_mint_forced']).toBe(SUBJECTS);
-
-    // EVERY retry threw away a live token, and every FIRST attempt read the
-    // previous subject's token out of the cache. That is the storm stated
-    // plainly: fifty callers taking turns to discard each other's credential.
     expect(c['token_refresh_discarded']).toBe(SUBJECTS);
+    expect(c['token_refresh_superseded']).toBeUndefined();
     expect(c['token_cache_hit']).toBe(SUBJECTS - 1);
-    expect(c['token_coalesced']).toBeUndefined();
     expect(c['token_inflight_peak']).toBe(1);
   }, 60_000);
 
-  it('prints neither the token nor the service password, storm or no storm', async () => {
+  it('prints neither a token nor the service password, storm or no storm', async () => {
     // A hundred failures produce a hundred log lines, which is the condition
     // under which a leak is least likely to be noticed and most likely to be
     // shipped to an aggregator. The module's hygiene rule is asserted at the
-    // volume that tests it.
+    // volume that tests it — and this is the only assertion in the repository
+    // that catches grants.ts logging an axios error OBJECT, whose serialised
+    // request config carries the bearer.
     await stormConcurrent();
 
     expect(printed.length).toBeGreaterThan(0);

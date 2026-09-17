@@ -735,10 +735,52 @@ describe('the mint counters say WHY, not just how many', () => {
     expect(c['token_mint_expired']).toBe(1);
   });
 
-  it('calls a 401-driven re-mint forced, and records that it discarded a live token', async () => {
-    // THE STORM PATH. This is the mint the Check's 401 retry asks for, and the
-    // one the fleet number is made of — so it is the one that has to be
-    // separable from an honest expiry in a counter dump.
+  it('re-mints when the caller names the token that is actually cached', async () => {
+    // THE STORM PATH, and the legitimate half of it. The caller was refused
+    // holding token-1, token-1 is what the cache holds, so nobody else has
+    // replaced it yet and this really is the re-mint that has to happen.
+    const env = oidcEnv();
+    await openFgaAuthHeaders(env, T0);
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+
+    expect(
+      await openFgaAuthHeaders(env, T0, { forceRefresh: true, presentedToken: 'token-1' }),
+    ).toEqual({ authorization: 'Bearer token-2' });
+
+    const c = openFgaTokenCounters();
+    expect(c['token_mint']).toBe(2);
+    expect(c['token_mint_forced']).toBe(1);
+    expect(c['token_refresh_requested']).toBe(1);
+    expect(c['token_refresh_discarded']).toBe(1);
+  });
+
+  it('STANDS DOWN when the cache has already moved past the token that was refused', async () => {
+    // THE FIX. A caller refused holding token-1 arrives to find token-2 in the
+    // cache — someone else's re-mint landed first. There is nothing to re-mint:
+    // token-2 has not been tried. It takes token-2 and the identity provider is
+    // never called. Fifty subjects refused together used to cost 26 mints and
+    // now cost 2, entirely through this branch.
+    const env = oidcEnv();
+    await openFgaAuthHeaders(env, T0);
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+    await openFgaAuthHeaders(env, T0, { forceRefresh: true, presentedToken: 'token-1' });
+    const mintsBefore = idp.calls.length;
+
+    expect(
+      await openFgaAuthHeaders(env, T0, { forceRefresh: true, presentedToken: 'token-1' }),
+    ).toEqual({ authorization: 'Bearer token-2' });
+
+    expect(idp.calls).toHaveLength(mintsBefore);
+    const c = openFgaTokenCounters();
+    expect(c['token_refresh_superseded']).toBe(1);
+    expect(c['token_mint']).toBe(2);
+    expect(c['token_cache_hit']).toBe(1);
+  });
+
+  it('clears the cache on trust when the caller can name no token, and says so', async () => {
+    // THE PRE-FIX BEHAVIOUR, kept reachable for a caller with no token to name
+    // and counted separately so it cannot creep back in unnoticed. grants.ts
+    // always names one; mint-storm.test.ts pins this counter at zero.
     const env = oidcEnv();
     await openFgaAuthHeaders(env, T0);
     idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
@@ -748,10 +790,30 @@ describe('the mint counters say WHY, not just how many', () => {
     });
 
     const c = openFgaTokenCounters();
-    expect(c['token_mint']).toBe(2);
+    expect(c['token_refresh_blind']).toBe(1);
+    expect(c['token_refresh_discarded']).toBeUndefined();
     expect(c['token_mint_forced']).toBe(1);
-    expect(c['token_refresh_requested']).toBe(1);
-    expect(c['token_refresh_discarded']).toBe(1);
+  });
+
+  it('accounts for every refresh request across the four outcomes', async () => {
+    // An invariant over the split, for the same reason the mint reasons have
+    // one: a request landing in no bucket, or two, makes every ratio built on
+    // these numbers wrong without making any single count look wrong.
+    const env = oidcEnv();
+    await openFgaAuthHeaders(env, T0, { forceRefresh: true, presentedToken: 'nothing-cached-yet' });
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+    await openFgaAuthHeaders(env, T0, { forceRefresh: true, presentedToken: 'token-1' });
+    await openFgaAuthHeaders(env, T0, { forceRefresh: true, presentedToken: 'token-1' });
+    await openFgaAuthHeaders(env, T0, { forceRefresh: true });
+
+    const c = openFgaTokenCounters();
+    const byOutcome =
+      (c['token_refresh_discarded'] ?? 0) +
+      (c['token_refresh_superseded'] ?? 0) +
+      (c['token_refresh_empty'] ?? 0) +
+      (c['token_refresh_blind'] ?? 0);
+    expect(byOutcome).toBe(c['token_refresh_requested']);
+    expect(c['token_refresh_requested']).toBe(4);
   });
 
   it('separates a refresh that threw a token away from one that found nothing', async () => {
@@ -767,9 +829,10 @@ describe('the mint counters say WHY, not just how many', () => {
 
     const c = openFgaTokenCounters();
     expect(c['token_refresh_requested']).toBe(1);
+    expect(c['token_refresh_empty']).toBe(1);
     expect(c['token_refresh_discarded']).toBeUndefined();
     // Still attributed to the refresh, because that is what the caller asked
-    // for — the discard count, not the reason, is what says it was a no-op.
+    // for — the outcome split, not the reason, is what says it found nothing.
     expect(c['token_mint_forced']).toBe(1);
     expect(c['token_mint_cold']).toBeUndefined();
   });

@@ -31,6 +31,12 @@
  *   provider is a cross-cluster hop, and one request per concurrent read is
  *   how a busy page becomes an outage upstream.
  *
+ *   ONE RE-MINT PER REJECTED TOKEN, not one per rejected CALLER. Single flight
+ *   only collapses callers that overlap, and 401s arrive one at a time, so a
+ *   fleet retrying together used to mint once per subject. A refresh now names
+ *   the token it was refused with and stands down if the cache has already
+ *   moved on. Measured: 26 mints for 50 concurrent subjects, down to 2.
+ *
  *   FAIL CLOSED. A mint failure returns null and the caller DENIES. It must
  *   never fall through to an unauthenticated Check: OpenFGA would answer 401
  *   and the user-visible outcome would be identical, but the log would name
@@ -142,18 +148,31 @@ const recordInflightPeak = (): void => {
  *   token_cache_hit          calls served from the cache
  *   token_coalesced          calls that joined a mint already in flight
  *   token_inflight_peak      the deepest such pile-up (a gauge, not a total)
- *   token_refresh_requested  forced refreshes asked for
- *   token_refresh_discarded  ...of which: one actually threw a live token
- *                            away. The GAP between these two is a caller
- *                            whose token had already been replaced.
+ *   token_refresh_requested  forced refreshes asked for, which splits four ways
+ *   token_refresh_discarded  ...the caller held the cached token; it was
+ *                            dropped and re-minted. The legitimate one.
+ *   token_refresh_superseded ...the cache already held a token this caller had
+ *                            not tried, so it took that one instead. Every one
+ *                            of these is a mint that did not happen.
+ *   token_refresh_empty      ...a re-mint was already in flight; the caller
+ *                            joined it.
+ *   token_refresh_blind      ...the caller named no token, so the cache was
+ *                            dropped on trust. The pre-fix behaviour, kept
+ *                            reachable and counted so it cannot creep back.
  *
- * WHAT THESE ARE FOR. A review measured 26 mints for 50 subjects against a
- * permanent OpenFGA 401 — the per-subject reasoning predicts two — and the
- * first fix proposed for it measured identical, because nothing here could say
- * which reason the extra mints arrived under. `token_mint_forced` against
- * `reminted` from grants.ts is the mint-per-retrying-subject ratio, and
- * `token_refresh_requested` against `token_refresh_discarded` says how much of
- * it is callers re-minting over each other.
+ * WHAT THESE ARE FOR, and it is narrower than "operator visibility": nothing in
+ * this service reads them. There is no /metrics route — /healthz is the entire
+ * public allowlist — and `openFgaTokenCounters` is re-exported through
+ * ./index.ts without a consumer. They are a MEASUREMENT SEAM, for the tests in
+ * test/entitlements/mint-storm.test.ts and for whoever takes the sequential
+ * shape next. Operator visibility would go through the audit sink wired at
+ * src/connect/register.ts, and that is a separate piece of work.
+ *
+ * They earned their place already. A review measured 26 mints for 50 subjects
+ * against a permanent OpenFGA 401 where the per-subject reasoning predicts two,
+ * and the split above is what showed where the extra 25 came from: a forced
+ * refresh per subject, each discarding a token its neighbours were about to
+ * use. `token_refresh_superseded` is the counter that goes up when that stops.
  */
 export const openFgaTokenCounters = (): Readonly<Record<string, number>> => Object.fromEntries(counters);
 
@@ -171,16 +190,44 @@ export const resetOpenFgaTokenForTest = (): void => {
 };
 
 /**
- * Drop the cached token. The 401 path calls this to force exactly one re-mint.
+ * Throw away the token a caller was REFUSED WITH, so the 401 path re-mints once.
  *
- * ASKED FOR and ACTED ON are counted separately, and the gap between them is
- * the measurement this module was missing. A caller whose token has already
- * been replaced by a neighbour's re-mint finds nothing to discard; one that
- * discards a live token has just taken it away from everyone else holding it.
+ * `presented` is the token that came back 401. Naming it is the whole point,
+ * and skipping the discard when the cache holds something else is the fix for
+ * the mint storm:
+ *
+ *   Fifty subjects are refused holding the same token T1. The first to retry
+ *   finds T1 in the cache, discards it and mints T2. Every other retry was ALSO
+ *   refused holding T1 — but the cache now holds T2, which nothing has tried
+ *   yet, so there is nothing for them to re-mint. They take T2 and retry with
+ *   it. One re-mint serves all fifty instead of one re-mint per subject.
+ *
+ * WITHOUT the argument the cache is cleared on trust, which is how a caller
+ * ends up destroying a token twenty-five of its neighbours were about to use.
+ * That path stays reachable for a caller with no token to name, and it is
+ * counted separately as `token_refresh_blind` so it cannot creep back unseen.
+ *
+ * THIS DOES NOT HELP A SEQUENTIAL FLEET, and the measurement says so plainly:
+ * a subject arriving after the previous one finished reads the current token
+ * out of the cache, is refused with it, and so IS holding the cached one. See
+ * test/entitlements/mint-storm.test.ts.
  */
-export const invalidateOpenFgaToken = (): void => {
+export const invalidateOpenFgaToken = (presented?: string): void => {
   bump('token_refresh_requested');
-  if (cached !== null) bump('token_refresh_discarded');
+  if (cached === null) {
+    // Nothing held: a re-mint is already in flight and this caller joins it.
+    bump('token_refresh_empty');
+  } else if (presented === undefined) {
+    bump('token_refresh_blind');
+  } else if (cached.token !== presented) {
+    // SUPERSEDED. Someone else's re-mint already landed and this caller has
+    // not tried it. Leave the cache alone — including `invalidateRequested`,
+    // because no mint is being asked for here.
+    bump('token_refresh_superseded');
+    return;
+  } else {
+    bump('token_refresh_discarded');
+  }
   cached = null;
   // So the mint that follows is attributed to the refresh instead of looking
   // like a cold start — which is what an empty cache otherwise looks like.
@@ -483,6 +530,12 @@ export async function getOpenFgaToken(
   const config = oidcConfig(env);
   if (config === null) return null;
 
+  // CONSUMED HERE, on every path out of this function. A refresh that ends in a
+  // cache hit or a coalesce asked for no mint of its own, and leaving the flag
+  // set would hand its reason to an unrelated mint later on.
+  const refreshWasRequested = invalidateRequested;
+  invalidateRequested = false;
+
   if (cached !== null && nowMs < cached.refreshAtMs) {
     bump('token_cache_hit');
     return cached.token;
@@ -498,11 +551,9 @@ export async function getOpenFgaToken(
     return pending;
   }
 
-  // Read BEFORE the flag is cleared, and before the mint is started: a cache
-  // that still holds something reached its refresh point, an empty one either
-  // was emptied by a forced refresh or was never filled.
-  const reason: MintReason = cached !== null ? 'expired' : invalidateRequested ? 'forced' : 'cold';
-  invalidateRequested = false;
+  // A cache that still holds something reached its refresh point; an empty one
+  // either was emptied by a forced refresh or was never filled.
+  const reason: MintReason = cached !== null ? 'expired' : refreshWasRequested ? 'forced' : 'cold';
 
   const run = mint(config, nowMs, reason);
   inflight = run;
@@ -531,7 +582,7 @@ export async function getOpenFgaToken(
 export async function openFgaAuthHeaders(
   env: NodeJS.ProcessEnv,
   nowMs: number = Date.now(),
-  options: { forceRefresh?: boolean } = {},
+  options: { forceRefresh?: boolean; presentedToken?: string } = {},
 ): Promise<Record<string, string> | undefined> {
   const mode = openFgaAuthMode(env);
 
@@ -546,7 +597,9 @@ export async function openFgaAuthHeaders(
     );
   }
 
-  if (options.forceRefresh === true) invalidateOpenFgaToken();
+  // `presentedToken` is the bearer the caller was refused with — never logged,
+  // never stored, compared and dropped. See invalidateOpenFgaToken.
+  if (options.forceRefresh === true) invalidateOpenFgaToken(options.presentedToken);
 
   const token = await getOpenFgaToken(env, nowMs);
   if (token === null) return undefined;
