@@ -274,15 +274,24 @@ describe('acceptance — DPoP edge', () => {
   it('A NONCE FROM THE PREVIOUS BUCKET of the same epoch is accepted', async () => {
     // TWO CLOCK READS, KNOWINGLY. This mints against one `Date.now()` and the
     // edge verifies against another a request later, so a bucket boundary
-    // falling between them would turn "previous" into "two ago" and fail. The
-    // margin is the whole 300 s period against a gap of about two milliseconds
-    // — four orders of magnitude wider than the one-second margins that
-    // actually flaked in dpop.test.ts, and it has never been observed to fire.
+    // falling between them would turn "previous" into "two ago" and fail.
     //
-    // It is NOT closed the way those were, because this is an acceptance test
-    // over the assembled edge and registerAuth takes no clock: see the comment
-    // at its construction, which declines that seam on purpose. Closing this
-    // means reversing that decision, which is a bigger question than a flake.
+    // THE HONEST ODDS, because the first version of this comment gave the easy
+    // ones. Under a healthy clock the gap is about two milliseconds against a
+    // 300 s period, so roughly 1 in 10^5. But the condition this whole unit
+    // exists for is a BACKWARDS STEP, and commit fef12ca records a measured
+    // -933 ms on these hosts. Given such a step between the two reads, the
+    // exposure is the chance a bucket boundary falls inside that one-second
+    // window: about 1 in 300, not 1 in 10^5. Still small once multiplied by how
+    // often the step happens, and still never observed here.
+    //
+    // It is NOT closed the way dpop.test.ts was, because this is an acceptance
+    // test over the assembled edge and registerAuth takes no clock: see the
+    // comment at its construction, which declines that seam on purpose. Closing
+    // this means reversing that decision, which is a bigger question than a
+    // flake. Same shape, same reasoning: test/helpers/auth.ts defaults a proof's
+    // `iat` to its own Date.now(), and the calls in THIS file use it unshadowed.
+    // The margin there is the 30 s proof window.
     const previous = h.runtime.nonce.mint(Date.now() - NONCE_PERIOD_MS);
     expect((await call(h, { token, key, nonce: previous })).statusCode).toBe(200);
   });

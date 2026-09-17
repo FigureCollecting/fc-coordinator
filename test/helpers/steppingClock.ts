@@ -20,11 +20,16 @@
  *                         measured on this estate's WSL2 hosts (a `-933` is
  *                         recorded in test/entitlements/grants.test.ts).
  *
- * HOW TO USE IT, against one describe block at a time so the accumulated drift
- * stays small enough not to disturb anything with a genuinely wide margin:
+ * HOW TO USE IT. The file under test imports this one for effect, so there is
+ * nothing to wire up — vitest 4 has no `--setupFiles` flag and an earlier
+ * version of this comment claimed one. Set the variable and run, against one
+ * describe block at a time so the accumulated drift stays small enough not to
+ * disturb anything with a genuinely wide margin:
  *
- *   CLOCK_STEP_MS=1000 npx vitest run src/auth/dpop.test.ts \
- *     --setupFiles test/helpers/steppingClock.ts -t 'steps 3 and 4'
+ *   CLOCK_STEP_MS=1000 npx vitest run src/auth/dpop.test.ts -t 'steps 3 and 4'
+ *
+ * To add a file to the regime, import this one at its top and list it in
+ * test/clock-stability.test.ts, which asserts both.
  *
  * A test that passes under BOTH signs does not read the wall clock twice for
  * one assertion. That is the property this file exists to make checkable, and
