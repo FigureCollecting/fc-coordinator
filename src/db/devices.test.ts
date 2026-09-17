@@ -11,6 +11,12 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.
 const DB = 'fccoord';
 const MIGRATOR = 'fc_coordinator_migrator';
 const MIGRATOR_PW = 'migrator-pw';
+// The APPLICATION role. This fixture does not connect as it — every query below runs as the
+// migrator — but 0000_grants.sql GRANTs to it by name, and a GRANT to a role that does not exist
+// is an error, not a warning. So the role has to be here, and that is the correct behaviour to
+// depend on: a grants migration that silently skipped a missing grantee would leave production
+// with a schema the application cannot read and nothing anywhere saying so.
+const APP = 'coordinator';
 
 const JWK = { kty: 'EC', crv: 'P-256', x: 'abc', y: 'def' };
 
@@ -32,6 +38,10 @@ describe('device queries', () => {
     await container.exec([
       'psql', '-U', 'postgres', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1',
       '-c', `CREATE ROLE ${MIGRATOR} LOGIN PASSWORD '${MIGRATOR_PW}' NOSUPERUSER`,
+    ]);
+    await container.exec([
+      'psql', '-U', 'postgres', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1',
+      '-c', `CREATE ROLE ${APP} LOGIN PASSWORD 'app-pw' NOSUPERUSER`,
     ]);
     await container.exec([
       'psql', '-U', 'postgres', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1',
