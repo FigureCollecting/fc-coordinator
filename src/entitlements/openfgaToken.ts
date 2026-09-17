@@ -42,6 +42,9 @@
  *   NOTHING LEAKS. Not the password, not the client secret, not the token, and
  *   never an axios error object — which serialises the whole request config,
  *   the form body included. The message only, the same rule the Check follows.
+ *   The token endpoint is the one value that IS printed, so it goes through
+ *   `printableEndpoint` everywhere: a URL may carry `user:password@` and that
+ *   would otherwise be a credential arriving inside a value meant for the log.
  *
  * NO BACKOFF LAYER HERE, deliberately. A mint outage is already damped twice:
  * single-flight collapses concurrent attempts, and the grant cache remembers an
@@ -143,16 +146,22 @@ export function describeOpenFgaAuth(env: NodeJS.ProcessEnv): string {
   const mode = openFgaAuthMode(env);
   if (mode === 'oidc') {
     const missing = OIDC_KEYS.filter((key) => trimmed(env[key]) === '');
-    const endpoint = trimmed(env.OPENFGA_OIDC_TOKEN_ENDPOINT) || '(unset)';
+    const rawEndpoint = trimmed(env.OPENFGA_OIDC_TOKEN_ENDPOINT);
+    const endpoint = rawEndpoint || '(unset)';
     const clientId = trimmed(env.OPENFGA_OIDC_CLIENT_ID) || '(unset)';
     const rejected = missing.length === 0 ? rejectEndpoint(endpoint) : null;
+    // The RAW value is what gets validated; the PRINTABLE one is what gets
+    // shown. The branch is on emptiness rather than on the placeholder's text,
+    // so an endpoint literally configured as `(unset)` is still put through the
+    // redaction and comes back `(unparseable)`.
+    const shownEndpoint = rawEndpoint === '' ? '(unset)' : printableEndpoint(rawEndpoint);
     const state =
       missing.length > 0
         ? `INCOMPLETE, missing ${missing.join(', ')}`
         : rejected !== null
           ? `REFUSED — ${rejected}`
           : 'complete';
-    return `oidc client_credentials (${state}; token_endpoint=${endpoint}, client_id=${clientId})`;
+    return `oidc client_credentials (${state}; token_endpoint=${shownEndpoint}, client_id=${clientId})`;
   }
   if (mode === 'static') return 'static preshared token (OPENFGA_API_TOKEN)';
   return 'none — no credential configured, so every entitlement check denies';
@@ -185,6 +194,57 @@ export function initOpenFgaAuth(env: NodeJS.ProcessEnv = process.env): OpenFgaAu
 }
 
 /**
+ * Rendered in place of an endpoint that cannot be shown without risking the
+ * value inside it. Distinct from `(unset)` deliberately: "you configured
+ * nothing" and "you configured something I will not repeat" are different
+ * operator problems, and one boot line that says both says neither.
+ */
+const UNPRINTABLE_ENDPOINT = '(unparseable)';
+
+/**
+ * The configured token endpoint, in a form that is safe to put in a log line.
+ *
+ * WHY THIS EXISTS. This module's stated property is that nothing leaks, and
+ * every other credential it handles arrives in a variable of its own that is
+ * simply never printed. The endpoint is the exception in BOTH directions: it is
+ * the one value the boot line is SUPPOSED to print — an operator reads it to
+ * confirm the Secret points at the right issuer — and a URL is allowed to carry
+ * `user:password@` in its authority. So the one value meant to be echoed is
+ * also the one place a secret can arrive without announcing itself as one.
+ *
+ * ORIGIN PLUS PATH, and `origin` does the real work: it is the one part of a
+ * parsed URL guaranteed to exclude userinfo, so scheme, host and port survive
+ * and a credential cannot. Query and fragment go too — neither identifies the
+ * issuer, and both are as plausible a place to have parked a key as the
+ * authority is.
+ *
+ * THE CASE A NAIVE VERSION GETS WRONG is a value with no authority at all.
+ * `new URL('svcuser:pw@idp.example.com/token')` does not throw: it reports
+ * scheme `svcuser:`, origin `"null"` and pathname `pw@idp.example.com/token` —
+ * the whole credential, sitting in the field this function would otherwise
+ * print. Parsing successfully is not the same as being safe to print, so a null
+ * origin renders as the placeholder rather than as anything derived from the
+ * input.
+ */
+function printableEndpoint(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return UNPRINTABLE_ENDPOINT;
+  }
+  // `'null'` is the literal string the URL standard yields for a scheme that
+  // has no authority to have an origin for — the opaque-path case above.
+  if (url.origin === 'null') return UNPRINTABLE_ENDPOINT;
+  // A TRIPWIRE, not a case reachable today: with an authority present the
+  // parser cannot leave userinfo in the path. If an `@` ever appears here that
+  // assumption has stopped holding, so the value degrades to the origin — which
+  // still names the issuer — rather than being printed on the strength of it.
+  if (url.pathname.includes('@')) return url.origin;
+  return `${url.origin}${url.pathname}`;
+}
+
+/**
  * Is this an endpoint the service account's password may be sent to?
  *
  * WHY THE RULE IS HERE AT ALL. `resolveAuthConfig` already refuses a non-https
@@ -207,7 +267,11 @@ function rejectEndpoint(raw: string): string | null {
   try {
     url = new URL(raw);
   } catch {
-    return `OPENFGA_OIDC_TOKEN_ENDPOINT must be an absolute URL, got '${raw}'`;
+    // The configured value is NOT echoed raw here, unlike the same message in
+    // auth/config.ts. That one is about OIDC_JWKS_URI, which carries public
+    // keys; this one is about the endpoint the service account's password is
+    // posted to, and a URL may carry a second credential inside it.
+    return `OPENFGA_OIDC_TOKEN_ENDPOINT must be an absolute URL, got ${printableEndpoint(raw)}`;
   }
   if (url.protocol !== 'https:' && !LOOPBACK_HOSTS.has(url.hostname)) {
     return `OPENFGA_OIDC_TOKEN_ENDPOINT must use https (got '${url.protocol}') unless it is loopback — the service account's password is sent to it`;
@@ -327,7 +391,13 @@ async function mint(config: OidcConfig, nowMs: number): Promise<string | null> {
     // The MESSAGE only. An axios error carries the request config, and this
     // request's body is the service account's password.
     bump('token_mint_failed');
-    console.error('[ENTITLEMENT] minting the OpenFGA token failed — denying:', (err as Error).message);
+    // Naming the endpoint is the difference between "the provider is down" and
+    // "the Secret points at the wrong provider", and the printable form is one
+    // this line can afford to name. The MESSAGE only from the error itself.
+    console.error(
+      `[ENTITLEMENT] minting the OpenFGA token failed at ${printableEndpoint(config.endpoint)} — denying:`,
+      (err as Error).message,
+    );
     return null;
   }
 }

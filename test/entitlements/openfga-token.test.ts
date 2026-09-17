@@ -471,3 +471,228 @@ describe('the token endpoint scheme', () => {
     expect(JSON.stringify(errors)).toContain('REFUSED');
   });
 });
+
+// ===========================================================================
+// USERINFO EMBEDDED IN THE TOKEN ENDPOINT
+//
+// Every OTHER credential in this module arrives through its own variable and is
+// asserted never to be logged. The token endpoint is the exception in both
+// directions: it is the one value the boot line is SUPPOSED to print, and a URL
+// is allowed to carry a password inside it. So the one place a secret is meant
+// to be echoed is also the one place a secret can arrive unannounced.
+//
+// Nothing in the estate configures it this way. That is what makes it worth a
+// test rather than a fix alone — a latent leak has no operator to notice it.
+// ===========================================================================
+describe('userinfo embedded in the token endpoint', () => {
+  // Deliberately not the word "secret": the assertion must fail on THIS value
+  // and not on some unrelated line that happens to use the noun.
+  const EMBEDDED = 'hunter2-never-print-me';
+  const USER = 'svcuser';
+
+  const endpointEnv = (
+    endpoint: string,
+    over: Record<string, string | undefined> = {},
+  ): NodeJS.ProcessEnv =>
+    ({
+      OPENFGA_OIDC_TOKEN_ENDPOINT: endpoint,
+      OPENFGA_OIDC_CLIENT_ID: 'openfga',
+      OPENFGA_OIDC_USERNAME: USERNAME,
+      OPENFGA_OIDC_PASSWORD: PASSWORD,
+      ...over,
+    }) as NodeJS.ProcessEnv;
+
+  const HTTPS = `https://${USER}:${EMBEDDED}@auth.example.com/application/o/token/`;
+  /** The fixture endpoint, reachable, with userinfo bolted on. Loopback, so not REFUSED. */
+  const loopbackWithUserinfo = (): string => idp.url.replace('http://', `http://${USER}:${EMBEDDED}@`);
+
+  const printed = (): string => JSON.stringify([...logs, ...warns, ...errors]);
+
+  // -------------------------------------------------------------------------
+  // THE BOOT LINE
+  // -------------------------------------------------------------------------
+
+  // All four boot states, because the printed value is assembled once and
+  // reused by every one of them — and the three unusable states are reached by
+  // different branches, at three different console levels.
+  it.each([
+    ['complete', (): NodeJS.ProcessEnv => endpointEnv(HTTPS)],
+    ['INCOMPLETE', (): NodeJS.ProcessEnv => endpointEnv(HTTPS, { OPENFGA_OIDC_USERNAME: undefined })],
+    ['REFUSED, plaintext', (): NodeJS.ProcessEnv => endpointEnv(`http://${USER}:${EMBEDDED}@auth.example.com/token`)],
+    ['REFUSED, not an absolute URL', (): NodeJS.ProcessEnv => endpointEnv(`//${USER}:${EMBEDDED}@auth.example.com/token`)],
+    ['REFUSED, no scheme so the host lands in an opaque path', (): NodeJS.ProcessEnv => endpointEnv(`${USER}:${EMBEDDED}@auth.example.com/token`)],
+  ])('never prints it at boot in the %s state', (_label, build) => {
+    initOpenFgaAuth(build());
+
+    // EVERY level, not the one this state is expected to use: a fix that moved
+    // the leak from console.log to console.error would otherwise pass.
+    expect(printed()).not.toContain(EMBEDDED);
+  });
+
+  it('still identifies WHICH endpoint is configured, by origin and path', () => {
+    // Stripping must not turn the line into a shrug. An operator reads this to
+    // confirm the Secret points at the right issuer.
+    const described = describeOpenFgaAuth(endpointEnv(HTTPS));
+
+    expect(described).toContain('token_endpoint=https://auth.example.com/application/o/token/');
+    expect(described).not.toContain(EMBEDDED);
+    expect(described).not.toContain(USER);
+    expect(described).toContain('complete');
+  });
+
+  it('keeps every boot state exactly where it was, so stripping hid no misconfiguration', () => {
+    // The risk of a redaction is that it redacts the DIAGNOSIS too. The state
+    // word is the diagnosis, so it is pinned alongside the secret's absence.
+    expect(describeOpenFgaAuth(endpointEnv(HTTPS))).toContain('complete');
+    expect(describeOpenFgaAuth(endpointEnv(HTTPS, { OPENFGA_OIDC_PASSWORD: undefined }))).toContain('INCOMPLETE');
+    expect(describeOpenFgaAuth(endpointEnv(`http://${USER}:${EMBEDDED}@auth.example.com/token`))).toContain('REFUSED');
+    expect(describeOpenFgaAuth(endpointEnv(`//${USER}:${EMBEDDED}@auth.example.com/token`))).toContain('REFUSED');
+  });
+
+  // -------------------------------------------------------------------------
+  // THE TWO PLACEHOLDERS ARE DIFFERENT OPERATOR PROBLEMS
+  // -------------------------------------------------------------------------
+
+  it('still says (unset) rather than (unparseable) when the endpoint is simply absent', () => {
+    // An absent endpoint and an unrenderable one are different operator
+    // problems and the line must not collapse them.
+    const described = describeOpenFgaAuth(endpointEnv('', { OPENFGA_OIDC_TOKEN_ENDPOINT: undefined }));
+
+    expect(described).toContain('token_endpoint=(unset)');
+    expect(described).not.toContain('(unparseable)');
+    expect(described).toContain('INCOMPLETE');
+  });
+
+  it.each([
+    ['a protocol-relative URL, which has no scheme to parse', `//${USER}:${EMBEDDED}@auth.example.com/token`],
+    ['a bare host:port, where the userinfo lands in an OPAQUE PATH', `${USER}:${EMBEDDED}@auth.example.com/token`],
+    ['a data: URL, same shape, no authority at all', `data:text/plain,${USER}:${EMBEDDED}@auth.example.com`],
+  ])('renders %s as (unparseable), never as its own text', (_label, endpoint) => {
+    // The opaque-path case is the one a naive `origin + pathname` gets WRONG:
+    // `new URL` accepts it, reports origin "null", and puts the whole rest —
+    // userinfo included — in `pathname`. Parsing successfully is not the same
+    // as being safe to print.
+    const described = describeOpenFgaAuth(endpointEnv(endpoint));
+
+    expect(described).toContain('token_endpoint=(unparseable)');
+    expect(described).not.toContain(EMBEDDED);
+    expect(described).not.toContain('(unset)');
+  });
+
+  it('drops the query and the fragment, which are not part of identifying the issuer', () => {
+    // Not userinfo, but the same argument: neither is needed to recognise the
+    // endpoint, and a token endpoint carrying a query string is as plausible a
+    // place to have parked a secret as the authority is.
+    const described = describeOpenFgaAuth(
+      endpointEnv(`https://auth.example.com/token?api_key=${EMBEDDED}#${EMBEDDED}`),
+    );
+
+    expect(described).toContain('token_endpoint=https://auth.example.com/token,');
+    expect(described).not.toContain(EMBEDDED);
+  });
+
+  it('falls back to the origin alone if an @ ever survives into the path', () => {
+    // A tripwire rather than a reachable case. With an authority present the
+    // URL parser cannot leave userinfo in `pathname`, so this asserts what
+    // happens if that ever stops being true: the line degrades to the origin,
+    // which still names the issuer, instead of printing a path on the strength
+    // of an assumption. A path that genuinely contains an @ is the price, and
+    // it is one no token endpoint is known to charge.
+    const described = describeOpenFgaAuth(endpointEnv(`https://auth.example.com/a@${EMBEDDED}/token`));
+
+    expect(described).toContain('token_endpoint=https://auth.example.com,');
+    expect(described).not.toContain(EMBEDDED);
+    expect(described).toContain('complete');
+  });
+
+  // -------------------------------------------------------------------------
+  // EVERY OTHER CONSOLE SITE IN THE MODULE
+  //
+  // The boot line is where the leak was FOUND. It is not the only place the
+  // configured endpoint can be reached from, so the property is asserted over
+  // every branch in the file that writes to a console sink, driven with a
+  // userinfo-bearing endpoint in each.
+  // -------------------------------------------------------------------------
+  it.each([
+    [
+      'the REFUSED mint path, which reports its own reason at the first mint',
+      async (): Promise<void> => {
+        expect(await getOpenFgaToken(endpointEnv(`//${USER}:${EMBEDDED}@auth.example.com/token`), T0)).toBeNull();
+      },
+    ],
+    [
+      'the INCOMPLETE mint path',
+      async (): Promise<void> => {
+        expect(
+          await getOpenFgaToken(endpointEnv(HTTPS, { OPENFGA_OIDC_PASSWORD: undefined }), T0),
+        ).toBeNull();
+      },
+    ],
+    [
+      'the shadowed-static warning, the one console.warn the oidc path can reach',
+      async (): Promise<void> => {
+        await openFgaAuthHeaders(endpointEnv(loopbackWithUserinfo(), { OPENFGA_API_TOKEN: 'stale' }), T0);
+        expect(warns.length).toBeGreaterThan(0);
+      },
+    ],
+    [
+      'a mint that SUCCEEDS over an endpoint carrying userinfo',
+      async (): Promise<void> => {
+        expect(await getOpenFgaToken(endpointEnv(loopbackWithUserinfo()), T0)).toBe('token-1');
+      },
+    ],
+    [
+      'a mint whose response body is not an object',
+      async (): Promise<void> => {
+        idp.reply({ body: '[]' });
+        expect(await getOpenFgaToken(endpointEnv(loopbackWithUserinfo()), T0)).toBeNull();
+        expect(errors.length).toBeGreaterThan(0);
+      },
+    ],
+    [
+      'a mint whose response carries no access_token',
+      async (): Promise<void> => {
+        idp.reply({ body: { token_type: 'Bearer' } });
+        expect(await getOpenFgaToken(endpointEnv(loopbackWithUserinfo()), T0)).toBeNull();
+        expect(errors.length).toBeGreaterThan(0);
+      },
+    ],
+    [
+      'a mint the provider answers with a 500, so the axios error is the one being printed',
+      async (): Promise<void> => {
+        idp.reply({ status: 500, body: { error: 'boom' } });
+        expect(await getOpenFgaToken(endpointEnv(loopbackWithUserinfo()), T0)).toBeNull();
+        expect(errors.length).toBeGreaterThan(0);
+      },
+    ],
+    [
+      'a mint against a socket that refuses, the transport-error branch',
+      async (): Promise<void> => {
+        expect(
+          await getOpenFgaToken(endpointEnv(`https://${USER}:${EMBEDDED}@127.0.0.2:1/token`), T0),
+        ).toBeNull();
+        expect(errors.length).toBeGreaterThan(0);
+      },
+    ],
+  ])('leaks nothing through %s', async (_label, drive) => {
+    await drive();
+
+    expect(printed()).not.toContain(EMBEDDED);
+    // The other two credentials are asserted elsewhere; re-asserted here because
+    // this suite is the one that drives every console branch in one place.
+    expect(printed()).not.toContain(PASSWORD);
+  });
+
+  it('names the endpoint on the mint-failure line, so the failure says WHICH issuer', async () => {
+    // Redaction must not cost the diagnosis. Before this, a mint failure named
+    // no endpoint at all; it names one now, and the safe form is the one it can
+    // afford to name.
+    idp.reply({ status: 500, body: { error: 'boom' } });
+    expect(await getOpenFgaToken(endpointEnv(loopbackWithUserinfo()), T0)).toBeNull();
+
+    const text = JSON.stringify(errors);
+    expect(text).toContain('minting the OpenFGA token failed');
+    expect(text).toContain(new URL(idp.url).origin);
+    expect(text).not.toContain(EMBEDDED);
+  });
+});
