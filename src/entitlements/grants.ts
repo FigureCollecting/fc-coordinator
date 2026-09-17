@@ -424,11 +424,18 @@ export async function grantsForSubject(
   }
 
   const run = (async (): Promise<Decision> => {
-    // Wall clock, not the injected `nowMs`: this measures how long the hop took,
-    // and `nowMs` is a fixed instant the caller chose for cache arithmetic.
-    const startedAt = Date.now();
+    // Elapsed time, so performance.now() and NOT Date.now(): the latter is not
+    // monotonic, and on this estate's WSL2 hosts it steps backwards by about a
+    // second often enough that commit fef12ca on this very branch had to fix
+    // the identical pattern in a test, where it produced a measured -933.
+    // Applying that fix to the test and not to the production measurement would
+    // have left the audit record free to carry a negative latency.
+    //
+    // `nowMs` is untouched by this: it is a fixed instant the caller chose for
+    // cache arithmetic, not a stopwatch.
+    const startedAt = performance.now();
     const outcome = await check(subject, env, nowMs);
-    const latencyMs = Date.now() - startedAt;
+    const latencyMs = Math.round(performance.now() - startedAt);
 
     const grants = outcome.allowed ? INVENTORY_GRANT : NO_GRANTS;
     // The counters keep their long-standing behaviour: an unconfigured client
