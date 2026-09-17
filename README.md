@@ -103,13 +103,70 @@ The alternative was the buf registry's npm packages (`@buf/openfga_api.*`),
 which would put a second external registry in the install path of every CI run
 and every image build and pin the artifact to a protobuf-es version chosen by
 the registry rather than by this repo. Vendoring costs a drift risk instead, and
-`test/entitlements/openfga-wire.test.ts` is what pays it: it asserts the
-generated descriptor's field numbers against a table copied from upstream at a
-named commit, asserts the `.proto` text still agrees with the descriptor, and
-asserts the numbers the slice does not use are **reserved** rather than merely
-absent. That test is not theoretical — the proof-of-concept this work was built
-on numbered `authorization_model_id` 5, which upstream gives to `bool trace`,
-and it passed because both ends of it used the same wrong slice.
+`test/entitlements/openfga-wire.test.ts` is what pays it. The **actual upstream
+file** is vendored as `test/fixtures/upstream-openfga_service.proto`, byte for
+byte, with its sha256 asserted — the first version of that suite carried a
+hand-copied table of field numbers, which is the same class of artifact as the
+slice it was checking, and two hand-copies agreeing proves only that one hand
+made the same decision twice. The numbers are now **parsed** out of upstream and
+compared with the generated descriptor; the reserved set is **derived** as
+"upstream's fields minus the ones the slice carries" rather than listed. CI does
+not fetch anything, because a suite that goes red when GitHub is slow is a suite
+people learn to ignore; the hash is what makes the offline copy evidence.
+
+That test is not theoretical — the proof-of-concept this work was built on
+numbered `authorization_model_id` 5, which upstream gives to `bool trace`, and it
+passed because both ends of it used the same wrong slice.
+
+### OpenFGA's own status numbers
+
+**OpenFGA does not speak canonical gRPC statuses**, and this is the single
+sharpest edge on the hop. gRPC defines codes 0–16; OpenFGA writes its own
+numbers into the `grpc-status` trailer, from `errors_ignore.proto`:
+
+| | |
+|---|---|
+| `AuthErrorCode` | 1001 invalid_subject · 1002 invalid_audience · 1003 invalid_issuer · 1004 invalid_claims · 1005 invalid_bearer_token · 1010 bearer_token_missing · 1500 unauthenticated · 1600 forbidden |
+| `ErrorCode` | 2000 validation_error · 2001 authorization_model_not_found · … |
+
+Connect-ES refuses a status outside the canonical range and reports
+`Code.Internal` with the message `invalid grpc-status: 1010`, handing the raw
+trailer through as the error's metadata. So a client that keys its re-mint on
+`Code.Unauthenticated` **never re-mints against the real service** — the stale
+token that bought one re-mint and a successful Check under REST becomes a
+permanent error-deny. `grants.ts` therefore reads the number back off the
+metadata **before** mapping anything.
+
+**The rule is the range, not a list of observed codes**, and the measurement is
+what forced that. The same seven cases against the real binary, OIDC authn mode:
+
+| case | v1.5.9 | v1.20.0 |
+|---|---|---|
+| valid token, granted tuple | `0`, allowed | `0`, allowed |
+| no bearer | 1010 | 1010 |
+| expired token (the rotation shape) | **1005** | **1004** |
+| wrong audience | 1002 | 1004 |
+| wrong issuer | 1003 | 1004 |
+| malformed token | 1005 | 1004 |
+| unknown model id | 2001 | 2001 |
+
+The codes **moved between versions**. A fix enumerating the three anyone had
+seen would have been right on one version and silently wrong on the other, and
+on v1.5.9 the expired-token case — the whole reason the fix exists — emits 1005.
+So the boundary is OpenFGA's own, taken from its HTTP transcoding, which is the
+behaviour being carried across: every `AuthErrorCode` below `forbidden`
+transcodes to 401 and `forbidden` transcodes to 403; the old client retried 401
+and never retried 403. **1000–1599 buys one re-mint, 1600 buys none, and
+everything else fails closed with the number recorded.**
+
+**The failure text never reaches the log raw.** Connect puts `grpc-message`
+verbatim into the error's message for a canonical code, so a service, proxy or
+debug build that echoes the Authorization header back would land this process's
+credential in the application log. The bearer just presented is removed **by
+identity** (this module knows exactly what it sent, so there is no pattern to be
+wrong about), a generic `Bearer …` rule catches a credential that is not ours,
+and the whole thing is bounded at 200 characters — a 50 KB trailer is otherwise
+a 50 KB log line, once per read.
 
 ### The OpenFGA credential
 
@@ -162,6 +219,13 @@ names them (`ok`, `unauthenticated`, `permission_denied`, `unavailable`,
 **replaces** `http_status` outright rather than sitting beside it. `reason` is
 kept for the causes a status cannot express: `bad_body`, `token_mint_failed`,
 `rest_url_configured`.
+
+`openfga_code` carries OpenFGA's **own** error number when it sent one — see
+the next section. It sits beside `grpc_code` rather than replacing it because
+they answer different questions: `grpc_code` is what the transport concluded,
+and therefore what the mesh, the proxy and any hop telemetry recorded (always
+`internal` for these), while `openfga_code` is what the service actually said
+and is the only one that can be looked up.
 
 One distinction is genuinely lost and is better said than hidden: over HTTP a
 refused connection had no status and a served error had one, so `transport` and

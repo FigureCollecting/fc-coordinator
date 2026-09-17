@@ -211,6 +211,53 @@ describe('a gRPC response that does not decode', () => {
     expect(events[0]).toMatchObject({ decision: 'error', grpc_code: 'internal' });
   });
 
+  it('LIMIT: any message whose field 1 is a nonzero varint reads as a grant', async () => {
+    // NOT A BUG BEING FIXED — A PROPERTY BEING WRITTEN DOWN, because it is the
+    // kind that gets discovered during an incident instead.
+    //
+    // Protobuf is structurally typed on the wire: a payload carries field
+    // NUMBERS and wire types, never a type name. `CheckResponse.allowed` is
+    // field 1, a bool, so the two bytes below — field 1, varint, 1 — decode to
+    // `{allowed: true}` and this module issues the grant. They are equally a
+    // valid prefix of a great many other messages.
+    //
+    // AND IT CANNOT BE FIXED IN THIS CLIENT. protobuf-es's `$typeName` comes
+    // from the schema the bytes were decoded WITH, not from the bytes, so a
+    // type-name check would compare a constant to itself. There is no
+    // client-side assertion available here.
+    //
+    // WHAT ACTUALLY BOUNDS IT, which is why this is acceptable rather than
+    // merely unavoidable:
+    //   - the request names the STORE and the pinned MODEL, so an answer is an
+    //     answer to the question this process asked, not a free-floating yes;
+    //   - the stream is POST /openfga.v1.OpenFGAService/Check, so a peer must
+    //     be serving that method to be asked at all;
+    //   - the peer is authenticated by the mesh (mTLS) or by TLS, so "some
+    //     other server answered" means an identity that was already authorised
+    //     to answer this RPC — at which point it can simply reply `true`
+    //     honestly, and no amount of client-side decoding helps;
+    //   - everything that is NOT a decodable message still fails closed, which
+    //     is what the rest of this file measures.
+    //
+    // If a future change adds message-identity checking, this test goes red and
+    // the decision gets made deliberately rather than by accident.
+    const server = track(
+      await startRawH2cServer((stream) => {
+        stream.respond(
+          { ':status': 200, 'content-type': 'application/grpc' },
+          { waitForTrailers: true },
+        );
+        stream.once('wantTrailers', () => {
+          stream.sendTrailers({ 'grpc-status': '0' });
+        });
+        // 0x08 = field 1, wire type 0 (varint). 0x01 = true.
+        stream.end(grpcFrame(Buffer.from([0x08, 0x01])));
+      }),
+    );
+
+    expect(await grantsForSubject(SUB, T0, env(server.baseUrl))).toEqual(['inventory_levels']);
+  });
+
   it('denies when the framing promises a message and sends none', async () => {
     // An OK status with no message at all. There is no `allowed` to read, and
     // "no news is good news" is the exact shape of a fail-open.

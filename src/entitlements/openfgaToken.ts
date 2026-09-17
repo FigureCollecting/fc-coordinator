@@ -6,9 +6,21 @@
  * and that was right until OpenFGA moved to `authn.method: oidc`. The provider
  * it now trusts issues TEN-MINUTE tokens, so a static environment value is
  * correct for ten minutes and then denies forever — and denies SILENTLY,
- * because a 401 is caught, counted as an error and turned into a deny. Every
- * read would come back with its magnitudes withheld, and the only trace would
- * be a recurring "Check failed" in the log.
+ * because the refusal is caught, counted as an error and turned into a deny.
+ * Every read would come back with its magnitudes withheld, and the only trace
+ * would be a recurring "Check failed" in the log.
+ *
+ * WHAT "REFUSAL" MEANS ON THE WIRE, since this file's contract used to say 401
+ * and the Check is no longer HTTP. Over gRPC, OpenFGA answers an auth failure
+ * with its OWN status number rather than a canonical gRPC code — 1010
+ * `bearer_token_missing`, 1004 `invalid_claims`, 1005
+ * `auth_failed_invalid_bearer_token`, 1500 `unauthenticated` — and grants.ts
+ * reads that number back off the error's metadata. Everything below 1600
+ * `forbidden` is the class that used to be a 401 and is the class that buys the
+ * single re-mint this file serves. The numbers are not stable across OpenFGA
+ * versions (measured: an expired token is 1005 on v1.5.9 and 1004 on v1.20.0),
+ * which is why the caller keys on the RANGE and why this comment names the
+ * range rather than a list.
  *
  * THE GRANT IS client_credentials WITH A USERNAME AND PASSWORD, which looks
  * wrong and is not. The identity provider models this caller as a SERVICE
@@ -32,14 +44,15 @@
  *   how a busy page becomes an outage upstream.
  *
  *   ONE RE-MINT PER REJECTED TOKEN, not one per rejected CALLER. Single flight
- *   only collapses callers that overlap, and 401s arrive one at a time, so a
+ *   only collapses callers that overlap, and refusals arrive one at a time, so a
  *   fleet retrying together used to mint once per subject. A refresh now names
  *   the token it was refused with and stands down if the cache has already
  *   moved on. Measured: 26 mints for 50 concurrent subjects, down to 2.
  *
  *   FAIL CLOSED. A mint failure returns null and the caller DENIES. It must
- *   never fall through to an unauthenticated Check: OpenFGA would answer 401
- *   and the user-visible outcome would be identical, but the log would name
+ *   never fall through to an unauthenticated Check: OpenFGA would answer
+ *   `bearer_token_missing` (1010) and the user-visible outcome would be
+ *   identical, but the log would name
  *   the wrong cause and an operator would go looking for a revoked grant
  *   instead of a missing Secret key. That is also why a PARTIALLY configured
  *   provider stays in `oidc` mode and fails there, rather than degrading to
@@ -105,7 +118,7 @@ let inflight: Promise<string | null> | null = null;
  *
  * Without it a forced re-mint is indistinguishable from a cold start, because
  * both of them find an empty cache — and telling those two apart is the whole
- * question behind the 401 storm.
+ * question behind the re-mint storm.
  */
 let invalidateRequested = false;
 /** Callers currently waiting on one in-flight mint, for the high-water mark. */
@@ -142,7 +155,8 @@ const recordInflightPeak = (): void => {
  *   token_mint_expired       ...of which: a cached token had reached its
  *                            refresh point. The healthy, scheduled case.
  *   token_mint_forced        ...of which: a caller asked for a refresh, which
- *                            in this service means the Check's 401 retry.
+ *                            in this service means the Check's one retry after
+ *                            an OpenFGA auth refusal.
  *                            These three add up to token_mint exactly.
  *   token_mint_failed        mints that returned nothing
  *   token_cache_hit          calls served from the cache
@@ -169,7 +183,7 @@ const recordInflightPeak = (): void => {
  * src/connect/register.ts, and that is a separate piece of work.
  *
  * They earned their place already. A review measured 26 mints for 50 subjects
- * against a permanent OpenFGA 401 where the per-subject reasoning predicts two,
+ * against a permanently refusing OpenFGA where the per-subject reasoning predicts two,
  * and the split above is what showed where the extra 25 came from: a forced
  * refresh per subject, each discarding a token its neighbours were about to
  * use. `token_refresh_superseded` is the counter that goes up when that stops.
@@ -190,9 +204,9 @@ export const resetOpenFgaTokenForTest = (): void => {
 };
 
 /**
- * Throw away the token a caller was REFUSED WITH, so the 401 path re-mints once.
+ * Throw away the token a caller was REFUSED WITH, so the refusal path re-mints once.
  *
- * `presented` is the token that came back 401. Naming it is the whole point,
+ * `presented` is the token that was refused. Naming it is the whole point,
  * and skipping the discard when the cache holds something else is the fix for
  * the mint storm:
  *
@@ -228,7 +242,8 @@ export const invalidateOpenFgaToken = (presented?: string): void => {
     // reads one during an incident: a subject that denies after standing down
     // here and a subject that denies having minted a token of its own produce
     // the SAME entitlement.check line. Both retried once, both were refused
-    // twice, and `decision`, `reason` and `httpStatus` are identical — the
+    // twice, and `decision`, `reason`, `grpc_code` and `openfga_code` are
+    // identical — the
     // difference lives only in these process-wide counters, which are per
     // process and not per subject. So "how many of these denials cost a grant?"
     // is answerable in aggregate and not per record. Carrying it down to the
@@ -606,8 +621,8 @@ export async function getOpenFgaToken(
  *   `{}`                    no credential is configured; call anyway, which is
  *                           the documented unconfigured behaviour
  *   `undefined`             a credential WAS configured and could not be
- *                           obtained. Do not call at all — a 401 from OpenFGA
- *                           and a failed mint are the same outcome and
+ *                           obtained. Do not call at all — an auth refusal
+ *                           from OpenFGA and a failed mint are the same outcome and
  *                           different causes, and only the caller can say which.
  */
 export async function openFgaAuthHeaders(

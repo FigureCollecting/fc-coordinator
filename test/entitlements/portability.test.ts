@@ -88,15 +88,41 @@ const ALLOWED_BARE = [
  * neither caught by the forbidden-symbol pass if the module has a neutral
  * name. A partial guard is worse than none, because it is believed.
  */
+/**
+ * Returned for a dynamic specifier this extractor cannot read statically —
+ * a template with a substitution, a concatenation, a variable. It matches no
+ * allowlist entry and does not start with `.`, so it FAILS the guard by
+ * construction.
+ *
+ * FAILING IS THE POINT. The previous version simply did not match those forms,
+ * so `import(`${base}/logger.js`)` sailed through a guard whose entire purpose
+ * is to notice that import — a hole the shape of every other hole this file
+ * documents. A specifier that cannot be resolved cannot be cleared, and a guard
+ * that silently clears what it cannot read is worse than none, because it is
+ * believed.
+ */
+export const UNRESOLVABLE_SPECIFIER = '<unresolvable-dynamic-specifier>';
+
 export const specifiersIn = (source: string): string[] => [
   // import x from 'm' / import {a} from 'm' / import * as m from 'm' / export {a} from 'm'
+  // Quotes only: a static specifier MUST be a string literal, so a backtick
+  // here is a syntax error rather than an evasion.
   ...[...source.matchAll(/\bfrom\s+['"]([^'"]+)['"]/g)].map((m) => m[1] as string),
   // import 'm'  — side-effect only, no bindings, no `from`
   ...[...source.matchAll(/\bimport\s+['"]([^'"]+)['"]/g)].map((m) => m[1] as string),
-  // import('m') — dynamic, deferred, and just as much a dependency
-  ...[...source.matchAll(/\bimport\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1] as string),
-  // require('m')
-  ...[...source.matchAll(/\brequire\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1] as string),
+  // import(...) and require(...) — dynamic, deferred, and just as much a
+  // dependency. BOTH accept a template literal, which the quote-only version of
+  // this extractor could not see at all.
+  ...[...source.matchAll(/\b(?:import|require)\(\s*([^)]*?)\s*\)/g)].map((m) => {
+    const argument = (m[1] ?? '').trim();
+    const literal = /^(['"`])([^'"`]*)\1$/.exec(argument);
+    const body = literal?.[2];
+    // A SUBSTITUTION IS THE DANGEROUS CASE, and it is the one a naive reading
+    // clears: `./${name}.js` starts with a dot, so the relative-path branch
+    // would resolve it inside the module directory and pass it — while the
+    // value it actually loads at runtime is decided elsewhere.
+    return body === undefined || body.includes('${') ? UNRESOLVABLE_SPECIFIER : body;
+  }),
 ];
 
 /**
@@ -131,8 +157,29 @@ describe('the specifier extractor sees every import form', () => {
     ['dynamic', "const later = () => import('../platform/logger.js');", '../platform/logger.js'],
     ['dynamic, awaited', "const l = await import('../platform/logger.js');", '../platform/logger.js'],
     ['require', "const m = require('pg');", 'pg'],
+    // The forms a quote-only extractor missed entirely.
+    ['template-literal dynamic', 'const l = await import(`../platform/logger.js`);', '../platform/logger.js'],
+    ['template-literal require', 'const m = require(`pg`);', 'pg'],
   ])('catches a %s import', (_label, source, expected) => {
     expect(specifiersIn(source)).toContain(expected);
+  });
+
+  it.each([
+    ['a template with a substitution', 'const l = await import(`${base}/logger.js`);'],
+    // The one that would otherwise be CLEARED rather than merely unmatched:
+    // it starts with a dot, so the relative-path branch would resolve it
+    // inside the module directory and wave it through.
+    ['a relative template with a substitution', 'const l = await import(`./${name}.js`);'],
+    ['a concatenation', "const l = await import('../platform/' + name);"],
+    ['a bare variable', 'const l = await import(specifier);'],
+    ['a require of a variable', 'const m = require(name);'],
+  ])('refuses to clear %s', (_label, source) => {
+    // Not "ignores": REPORTS, as something no allowlist can match. The guard
+    // then fails on it, which is the only safe reading of an import whose
+    // target is decided at runtime.
+    expect(specifiersIn(source)).toContain(UNRESOLVABLE_SPECIFIER);
+    expect(ALLOWED_BARE.some((re) => re.test(UNRESOLVABLE_SPECIFIER))).toBe(false);
+    expect(UNRESOLVABLE_SPECIFIER.startsWith('.')).toBe(false);
   });
 });
 

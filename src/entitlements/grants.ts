@@ -155,6 +155,22 @@ export interface EntitlementAuditEvent {
    * dressed as a fact, so the record says `unavailable` and means it.
    */
   grpc_code?: string;
+  /**
+   * OpenFGA's OWN error number, present only when it sent one outside the
+   * canonical gRPC range — 1010 `bearer_token_missing`, 1004 `invalid_claims`,
+   * 1600 `forbidden`, 2001 `authorization_model_not_found`, and the rest of
+   * errors_ignore.proto.
+   *
+   * IT SITS BESIDE `grpc_code` RATHER THAN REPLACING IT because they answer
+   * different questions and a reader needs both: `grpc_code` is what the
+   * transport concluded and therefore what the mesh, the proxy and any hop
+   * telemetry will have recorded (always `internal` for these), while
+   * `openfga_code` is what the service actually said and is the only one that
+   * can be looked up. Collapsing them would make an OpenFGA auth refusal
+   * indistinguishable from a genuine transport fault in exactly the records
+   * used to tell them apart.
+   */
+  openfga_code?: number;
   /** Why, when the code does not say: `bad_body`, `token_mint_failed`, `rest_url_configured`. */
   reason?: string;
 }
@@ -191,6 +207,7 @@ interface Decision {
   grants: readonly EntitlementName[];
   decision: EntitlementDecision;
   grpcCode?: string;
+  openfgaCode?: number;
   reason?: string;
 }
 
@@ -262,6 +279,98 @@ const grpcCodeName = (code: Code): string => {
     : name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
 };
 
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * OPENFGA DOES NOT SPEAK CANONICAL gRPC STATUSES.
+ *
+ * gRPC defines codes 0–16. OpenFGA writes its OWN numbers into the
+ * `grpc-status` trailer — `bearer_token_missing` is 1010, `invalid_claims` is
+ * 1004, `authorization_model_not_found` is 2001 (openfga/api
+ * errors_ignore.proto). Connect refuses a status outside the canonical range
+ * and reports `Code.Internal` with the message "invalid grpc-status: 1010",
+ * handing the RAW TRAILER through as the error's metadata. So a client that
+ * keys its re-mint on `Code.Unauthenticated` never re-mints against the real
+ * service: measured on v1.5.9 and v1.20.0, the stale-token rotation that used
+ * to buy one re-mint under REST produced a permanent error-deny instead.
+ *
+ * THE RULE IS THE RANGE, NOT A LIST OF OBSERVED CODES, and that is not
+ * fastidiousness — it is what the measurement forced. The same seven cases on
+ * two versions:
+ *
+ *            no bearer   expired   wrong aud   wrong iss   malformed   bad model
+ *   v1.5.9      1010      1005       1002        1003        1005        2001
+ *   v1.20.0     1010      1004       1004        1004        1004        2001
+ *
+ * The codes MOVED. A fix that enumerated the three anyone had seen would have
+ * been correct on one version and silently wrong on the other — and on v1.5.9
+ * the expired-token case, which is the whole reason this exists, emits 1005 and
+ * would have been missed by every list that did not already know to include it.
+ *
+ * So the boundary is OpenFGA's own, taken from its HTTP transcoding, which is
+ * the behaviour being carried across: every AuthErrorCode below `forbidden`
+ * transcodes to 401, and `forbidden` transcodes to 403. The old client retried
+ * 401 and never retried 403. Therefore 1000–1599 buys one re-mint, 1600 buys
+ * none, and everything else — the 2xxx ErrorCode family, and any number from a
+ * future version or a middlebox — fails closed with the number recorded.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+const OPENFGA_AUTH_MIN = 1000;
+/** `forbidden`, which transcodes to 403 and which a fresh token cannot fix. */
+const OPENFGA_FORBIDDEN = 1600;
+
+/** Canonical gRPC space: 0 is OK, 1–16 are the codes Connect knows. */
+const isCanonicalStatus = (value: number): boolean => value === 0 || value in Code;
+
+/**
+ * The number OpenFGA actually sent, or undefined when the status was a
+ * canonical gRPC one.
+ *
+ * TWO PLACES IT CAN BE, because Connect parses trailers two ways. Normally the
+ * raw `grpc-status` survives on the error's metadata and `code` is
+ * `Code.Internal`. If the server sends `grpc-status-details-bin` instead,
+ * Connect reads the protobuf Status and puts its number straight into `code`,
+ * so a non-canonical value arrives THERE. Neither is hypothetical enough to
+ * leave to chance, and reading both costs one comparison.
+ */
+function openFgaStatusOf(err: ConnectError): number | undefined {
+  const trailer = err.metadata.get('grpc-status');
+  if (trailer !== null) {
+    const parsed = Number(trailer);
+    if (Number.isInteger(parsed) && !isCanonicalStatus(parsed)) return parsed;
+  }
+  const code: number = err.code;
+  return isCanonicalStatus(code) ? undefined : code;
+}
+
+/** Longest failure text this module will print. A trailer is not a log budget. */
+const MAX_ERROR_TEXT = 200;
+
+/**
+ * THE MESSAGE IS TEXT THE FAR SIDE CHOSE, and it goes through here before it
+ * goes anywhere near a log.
+ *
+ * Connect puts `grpc-message` VERBATIM into the error's message for a canonical
+ * code. A service, a proxy or a debug build that echoes the Authorization
+ * header back — "unauthenticated: Bearer eyJ…" is an entirely plausible thing
+ * for one to say — therefore lands this process's credential in the application
+ * log, which is shipped to an aggregator. It need not be malicious to happen.
+ *
+ * THE PRESENTED TOKEN IS REMOVED BY IDENTITY, NOT BY PATTERN. This module knows
+ * exactly which bearer it just sent, so it can delete that string rather than
+ * guess at what a credential looks like — no regex to be wrong about. The
+ * `Bearer …` rule is the second line, for a credential that is not ours (a
+ * neighbour's token quoted back by a shared gateway). And the whole thing is
+ * bounded, because a 50 KB trailer is otherwise a 50 KB log line, once per read.
+ */
+function safeFailureText(text: string, presentedToken: string | undefined): string {
+  let out = text;
+  if (presentedToken !== undefined && presentedToken !== '') {
+    out = out.split(presentedToken).join('[redacted]');
+  }
+  out = out.replace(/\bBearer\s+\S+/gi, '[redacted-credential]');
+  return out.length > MAX_ERROR_TEXT ? `${out.slice(0, MAX_ERROR_TEXT)}… (${String(out.length)} chars)` : out;
+}
+
 const bump = (name: string): void => {
   counters.set(name, (counters.get(name) ?? 0) + 1);
 };
@@ -311,6 +420,8 @@ interface CheckOutcome {
   errored: boolean;
   /** Present when the call was attempted, so `unavailable` is distinguishable from `unauthenticated`. */
   grpcCode?: string;
+  /** OpenFGA's own number, when it sent one outside the canonical gRPC range. */
+  openfgaCode?: number;
   /** Why, when the reason is not simply the code. */
   reason?: string;
 }
@@ -435,6 +546,17 @@ async function check(subject: string, env: NodeJS.ProcessEnv, nowMs: number): Pr
         // this file used to carry an option for.
         headers: auth,
       });
+      // WHAT A DECODED MESSAGE DOES AND DOES NOT PROVE. Protobuf is
+      // structurally typed on the wire — a payload carries field numbers, never
+      // a type name — so ANY message whose field 1 is a nonzero varint decodes
+      // here as `{allowed: true}`. `$typeName` cannot help: protobuf-es derives
+      // it from the schema the bytes were decoded WITH, so checking it compares
+      // a constant to itself. What bounds this is not the decode: the request
+      // names the store and the pinned model, the stream is
+      // POST /openfga.v1.OpenFGAService/Check, and the peer is authenticated by
+      // the mesh — an identity able to answer this RPC at all could simply
+      // reply `true` honestly. Pinned, with the reasoning, in
+      // test/entitlements/wire-surprise.test.ts.
       const allowed: unknown = (response as { allowed?: unknown } | null | undefined)?.allowed;
       if (typeof allowed !== 'boolean') {
         // UNREACHABLE THROUGH THE REAL CLIENT, AND KEPT ANYWAY. The generated
@@ -457,18 +579,36 @@ async function check(subject: string, env: NodeJS.ProcessEnv, nowMs: number): Pr
     } catch (err) {
       // `from` normalises: a ConnectError keeps its code, and anything else the
       // transport throws becomes `unknown` rather than escaping the rule.
-      const code = ConnectError.from(err).code;
-      if (code === Code.Unauthenticated && canRemint && !reminted) {
+      const connectError = ConnectError.from(err);
+      const code = connectError.code;
+      // READ OPENFGA'S OWN NUMBER BEFORE MAPPING ANYTHING. See the block above
+      // openFgaStatusOf: every OpenFGA auth refusal arrives as Code.Internal,
+      // so a decision made on `code` alone is a decision made on the transport's
+      // opinion of a status it did not understand.
+      const openfgaCode = openFgaStatusOf(connectError);
+      const staleCredential =
+        openfgaCode === undefined
+          ? code === Code.Unauthenticated
+          : openfgaCode >= OPENFGA_AUTH_MIN && openfgaCode < OPENFGA_FORBIDDEN;
+      if (staleCredential && canRemint && !reminted) {
         reminted = true;
         bump('reminted');
         continue;
       }
-      // The message ONLY, unchanged in spirit from the axios rule it replaces.
-      // A ConnectError carries response `metadata` and a `cause` holding the
-      // underlying socket error, so anything broader than the message risks
-      // printing whatever the far side or the runtime put there.
-      console.error('[ENTITLEMENT] OpenFGA Check failed — denying:', (err as Error).message);
-      return { allowed: false, errored: true, grpcCode: grpcCodeName(code) };
+      // NEVER THE ERROR OBJECT, and never the message raw either — see
+      // safeFailureText. A ConnectError carries response `metadata`, a `cause`
+      // holding the underlying socket error, and a message the far side wrote.
+      console.error(
+        '[ENTITLEMENT] OpenFGA Check failed — denying:',
+        `grpc=${grpcCodeName(code)}${openfgaCode === undefined ? '' : ` openfga=${String(openfgaCode)}`}`,
+        safeFailureText(connectError.rawMessage, presentedToken),
+      );
+      return {
+        allowed: false,
+        errored: true,
+        grpcCode: grpcCodeName(code),
+        ...(openfgaCode === undefined ? {} : { openfgaCode }),
+      };
     }
   }
 }
@@ -581,6 +721,7 @@ export async function grantsForSubject(
       latency_ms: latencyMs,
       ...(modelId ? { model_id: modelId } : {}),
       ...(decision.grpcCode === undefined ? {} : { grpc_code: decision.grpcCode }),
+      ...(decision.openfgaCode === undefined ? {} : { openfga_code: decision.openfgaCode }),
       ...(decision.reason === undefined ? {} : { reason: decision.reason }),
     });
   };
@@ -647,6 +788,7 @@ export async function grantsForSubject(
       grants,
       decision: name,
       ...(outcome.grpcCode === undefined ? {} : { grpcCode: outcome.grpcCode }),
+      ...(outcome.openfgaCode === undefined ? {} : { openfgaCode: outcome.openfgaCode }),
       ...(outcome.reason === undefined || outcome.reason === 'unconfigured'
         ? {}
         : { reason: outcome.reason }),
