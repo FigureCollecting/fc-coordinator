@@ -217,6 +217,28 @@ async function mint(config: OidcConfig, nowMs: number): Promise<string | null> {
   try {
     const response = await axios.post(config.endpoint, form.toString(), {
       timeout: config.timeoutMs,
+      // NEVER FOLLOW A REDIRECT FROM HERE, and this is the single most
+      // dangerous line in the file to remove.
+      //
+      // axios defaults to following up to 21 redirects, and follow-redirects
+      // preserves BOTH the method and the body across a 307 or a 308 —
+      // including to a different host. The body of THIS request is the service
+      // account's password and, when configured, the client secret. Measured
+      // against a real socket before this option existed: a token endpoint
+      // answering 307 handed the full form body, password intact and correctly
+      // percent-decoded at the far end, to the host it named, and the token
+      // that host returned was cached and presented to OpenFGA as this
+      // service's credential. The url-encoding above exists so the password
+      // survives the wire; without this line it survives it all the way to
+      // whoever asks.
+      //
+      // Zero, not one, and not same-host-only. A token endpoint that is not
+      // where it says it is, is a misconfiguration; an allowance shaped like
+      // "same host is fine" is one Host header away from not being. With
+      // maxRedirects at 0 axios returns the 3xx as an ordinary response, which
+      // the default validateStatus then rejects, so a redirect lands in the
+      // catch below and fails the mint closed like any other bad answer.
+      maxRedirects: 0,
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
     });
     const data: unknown = response.data;

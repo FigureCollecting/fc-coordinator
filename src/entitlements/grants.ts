@@ -278,6 +278,19 @@ async function check(subject: string, env: NodeJS.ProcessEnv, nowMs: number): Pr
     try {
       const response = await axios.post(url, body, {
         timeout,
+        // A 3xx IS THE ONE NON-2xx THE RULE ABOVE DOES NOT COVER, because it
+        // never reaches it: axios follows the redirect and the answer arrives
+        // as a 200 from somewhere else entirely. So the fail-closed rule held
+        // for every status class that had been asked about and failed OPEN for
+        // the one that had not. A redirect target answering `{"allowed": true}`
+        // could issue the grant, unauthenticated — the bearer is dropped on a
+        // cross-host hop, so what leaks is not a credential but the DECISION.
+        //
+        // With this at 0 the 3xx comes back as an ordinary response and the
+        // default validateStatus rejects it, so it denies like any other
+        // non-2xx. Pinned in test/entitlements/redirect.test.ts across 301,
+        // 302, 303, 307 and 308, each with a body claiming a grant.
+        maxRedirects: 0,
         headers: { 'content-type': 'application/json', ...auth },
       });
       const data: unknown = response.data;
