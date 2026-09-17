@@ -89,8 +89,21 @@ interface CachedToken {
   refreshAtMs: number;
 }
 
+/** Why the mint about to happen is happening. See `openFgaTokenCounters`. */
+type MintReason = 'cold' | 'expired' | 'forced';
+
 let cached: CachedToken | null = null;
 let inflight: Promise<string | null> | null = null;
+/**
+ * Set by `invalidateOpenFgaToken`, read by the mint that follows it.
+ *
+ * Without it a forced re-mint is indistinguishable from a cold start, because
+ * both of them find an empty cache — and telling those two apart is the whole
+ * question behind the 401 storm.
+ */
+let invalidateRequested = false;
+/** Callers currently waiting on one in-flight mint, for the high-water mark. */
+let inflightWaiters = 0;
 let warnedShadowedStatic = false;
 let warnedIncomplete = false;
 let warnedEndpoint = false;
@@ -101,13 +114,55 @@ const bump = (name: string): void => {
   counters.set(name, (counters.get(name) ?? 0) + 1);
 };
 
-/** Snapshot: `token_mint`, `token_cache_hit`, `token_coalesced`, `token_mint_failed`. */
+/**
+ * A high-water mark, not a running total: the deepest single-flight pile-up
+ * seen so far. `token_coalesced` counts every caller that ever joined one;
+ * fifty arriving together and two arriving twenty-five times give the same
+ * total and are different incidents.
+ */
+const recordInflightPeak = (): void => {
+  if (inflightWaiters > (counters.get('token_inflight_peak') ?? 0)) {
+    counters.set('token_inflight_peak', inflightWaiters);
+  }
+};
+
+/**
+ * Snapshot of everything this module counts.
+ *
+ *   token_mint               tokens successfully minted
+ *   token_mint_cold          ...of which: nothing was cached and no refresh
+ *                            had been asked for — a process start, or the
+ *                            first call after a failed mint
+ *   token_mint_expired       ...of which: a cached token had reached its
+ *                            refresh point. The healthy, scheduled case.
+ *   token_mint_forced        ...of which: a caller asked for a refresh, which
+ *                            in this service means the Check's 401 retry.
+ *                            These three add up to token_mint exactly.
+ *   token_mint_failed        mints that returned nothing
+ *   token_cache_hit          calls served from the cache
+ *   token_coalesced          calls that joined a mint already in flight
+ *   token_inflight_peak      the deepest such pile-up (a gauge, not a total)
+ *   token_refresh_requested  forced refreshes asked for
+ *   token_refresh_discarded  ...of which: one actually threw a live token
+ *                            away. The GAP between these two is a caller
+ *                            whose token had already been replaced.
+ *
+ * WHAT THESE ARE FOR. A review measured 26 mints for 50 subjects against a
+ * permanent OpenFGA 401 — the per-subject reasoning predicts two — and the
+ * first fix proposed for it measured identical, because nothing here could say
+ * which reason the extra mints arrived under. `token_mint_forced` against
+ * `reminted` from grants.ts is the mint-per-retrying-subject ratio, and
+ * `token_refresh_requested` against `token_refresh_discarded` says how much of
+ * it is callers re-minting over each other.
+ */
 export const openFgaTokenCounters = (): Readonly<Record<string, number>> => Object.fromEntries(counters);
 
 /** Test seam: drop the cached token, the in-flight mint, the counters and the one-shot warnings. */
 export const resetOpenFgaTokenForTest = (): void => {
   cached = null;
   inflight = null;
+  invalidateRequested = false;
+  inflightWaiters = 0;
   counters.clear();
   warnedShadowedStatic = false;
   warnedIncomplete = false;
@@ -115,9 +170,21 @@ export const resetOpenFgaTokenForTest = (): void => {
   loggedBootLine = false;
 };
 
-/** Drop the cached token. The 401 path calls this to force exactly one re-mint. */
+/**
+ * Drop the cached token. The 401 path calls this to force exactly one re-mint.
+ *
+ * ASKED FOR and ACTED ON are counted separately, and the gap between them is
+ * the measurement this module was missing. A caller whose token has already
+ * been replaced by a neighbour's re-mint finds nothing to discard; one that
+ * discards a live token has just taken it away from everyone else holding it.
+ */
 export const invalidateOpenFgaToken = (): void => {
+  bump('token_refresh_requested');
+  if (cached !== null) bump('token_refresh_discarded');
   cached = null;
+  // So the mint that follows is attributed to the refresh instead of looking
+  // like a cold start — which is what an empty cache otherwise looks like.
+  invalidateRequested = true;
 };
 
 const trimmed = (raw: string | undefined): string => raw?.trim() ?? '';
@@ -332,7 +399,7 @@ function refreshAtMs(expiresInSeconds: number, skewSeconds: number, nowMs: numbe
   return nowMs + ahead * 1000;
 }
 
-async function mint(config: OidcConfig, nowMs: number): Promise<string | null> {
+async function mint(config: OidcConfig, nowMs: number, reason: MintReason): Promise<string | null> {
   // URLSearchParams percent-encodes every value, which is the whole point: a
   // password with `&` or `=` in it would otherwise split into extra fields.
   const form = new URLSearchParams({
@@ -386,6 +453,9 @@ async function mint(config: OidcConfig, nowMs: number): Promise<string | null> {
     const expiresIn = typeof body.expires_in === 'number' && Number.isFinite(body.expires_in) ? body.expires_in : 0;
     cached = { token: body.access_token, refreshAtMs: refreshAtMs(expiresIn, config.skewSeconds, nowMs) };
     bump('token_mint');
+    // Beside the total, never instead of it: the three reasons must add up to
+    // it, and they only do if both are bumped on the same successful path.
+    bump(`token_mint_${reason}`);
     return cached.token;
   } catch (err) {
     // The MESSAGE only. An axios error carries the request config, and this
@@ -423,15 +493,26 @@ export async function getOpenFgaToken(
   const pending = inflight;
   if (pending !== null) {
     bump('token_coalesced');
+    inflightWaiters += 1;
+    recordInflightPeak();
     return pending;
   }
 
-  const run = mint(config, nowMs);
+  // Read BEFORE the flag is cleared, and before the mint is started: a cache
+  // that still holds something reached its refresh point, an empty one either
+  // was emptied by a forced refresh or was never filled.
+  const reason: MintReason = cached !== null ? 'expired' : invalidateRequested ? 'forced' : 'cold';
+  invalidateRequested = false;
+
+  const run = mint(config, nowMs, reason);
   inflight = run;
+  inflightWaiters = 1;
+  recordInflightPeak();
   try {
     return await run;
   } finally {
     inflight = null;
+    inflightWaiters = 0;
   }
 }
 

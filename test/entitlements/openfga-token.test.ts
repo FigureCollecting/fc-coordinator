@@ -696,3 +696,127 @@ describe('userinfo embedded in the token endpoint', () => {
     expect(text).not.toContain(EMBEDDED);
   });
 });
+
+// ===========================================================================
+// WHY A MINT HAPPENED
+//
+// The module could already say HOW MANY tokens it minted. It could not say
+// what for, and that turned out to matter: a review measured 26 mints for 50
+// subjects against a permanent 401 where the per-subject reasoning predicted
+// two, and the first fix attempted for it measured identical — because nobody
+// could see which of the three reasons the extra mints were arriving under.
+//
+// So every mint now names its cause, a forced refresh says whether it actually
+// threw anything away, and the single-flight pile-up records how deep it got.
+// These are the numbers test/entitlements/mint-storm.test.ts reads.
+// ===========================================================================
+describe('the mint counters say WHY, not just how many', () => {
+  it('calls the first mint of a process cold', async () => {
+    expect(await getOpenFgaToken(oidcEnv(), T0)).toBe('token-1');
+
+    const c = openFgaTokenCounters();
+    expect(c['token_mint']).toBe(1);
+    expect(c['token_mint_cold']).toBe(1);
+    expect(c['token_mint_expired']).toBeUndefined();
+    expect(c['token_mint_forced']).toBeUndefined();
+  });
+
+  it('calls a mint past the refresh point expired', async () => {
+    const env = oidcEnv();
+    await getOpenFgaToken(env, T0);
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+
+    // 600 s lifetime, 120 s skew -> the refresh point is 480 s in.
+    expect(await getOpenFgaToken(env, T0 + 480_000)).toBe('token-2');
+
+    const c = openFgaTokenCounters();
+    expect(c['token_mint']).toBe(2);
+    expect(c['token_mint_cold']).toBe(1);
+    expect(c['token_mint_expired']).toBe(1);
+  });
+
+  it('calls a 401-driven re-mint forced, and records that it discarded a live token', async () => {
+    // THE STORM PATH. This is the mint the Check's 401 retry asks for, and the
+    // one the fleet number is made of — so it is the one that has to be
+    // separable from an honest expiry in a counter dump.
+    const env = oidcEnv();
+    await openFgaAuthHeaders(env, T0);
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+
+    expect(await openFgaAuthHeaders(env, T0, { forceRefresh: true })).toEqual({
+      authorization: 'Bearer token-2',
+    });
+
+    const c = openFgaTokenCounters();
+    expect(c['token_mint']).toBe(2);
+    expect(c['token_mint_forced']).toBe(1);
+    expect(c['token_refresh_requested']).toBe(1);
+    expect(c['token_refresh_discarded']).toBe(1);
+  });
+
+  it('separates a refresh that threw a token away from one that found nothing', async () => {
+    // Asked for and acted on are different numbers, and the gap between them is
+    // the interesting one: a refresh that discards nothing is a caller whose
+    // token was ALREADY replaced by someone else's re-mint, which is exactly
+    // the coordination the storm lacks.
+    const env = oidcEnv();
+
+    expect(await openFgaAuthHeaders(env, T0, { forceRefresh: true })).toEqual({
+      authorization: 'Bearer token-1',
+    });
+
+    const c = openFgaTokenCounters();
+    expect(c['token_refresh_requested']).toBe(1);
+    expect(c['token_refresh_discarded']).toBeUndefined();
+    // Still attributed to the refresh, because that is what the caller asked
+    // for — the discard count, not the reason, is what says it was a no-op.
+    expect(c['token_mint_forced']).toBe(1);
+    expect(c['token_mint_cold']).toBeUndefined();
+  });
+
+  it('accounts for every mint exactly once across the three reasons', async () => {
+    // An invariant, not a scenario: a reason that stops being assigned, or one
+    // assigned twice, makes every ratio built on these numbers wrong without
+    // making any single count look wrong.
+    const env = oidcEnv();
+    await getOpenFgaToken(env, T0);
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+    await getOpenFgaToken(env, T0 + 480_000);
+    await openFgaAuthHeaders(env, T0 + 480_000, { forceRefresh: true });
+
+    const c = openFgaTokenCounters();
+    const byReason =
+      (c['token_mint_cold'] ?? 0) + (c['token_mint_expired'] ?? 0) + (c['token_mint_forced'] ?? 0);
+    expect(byReason).toBe(c['token_mint']);
+    expect(c['token_mint']).toBe(3);
+  });
+
+  it('records how deep the single-flight pile-up got, not just that there was one', async () => {
+    // `token_coalesced` is a running total over the process; the peak is what
+    // says whether fifty callers arrived together or two did, twenty-five
+    // times. Those are the same total and different incidents.
+    const env = oidcEnv();
+    await Promise.all(Array.from({ length: 50 }, () => getOpenFgaToken(env, T0)));
+
+    const c = openFgaTokenCounters();
+    expect(c['token_mint']).toBe(1);
+    expect(c['token_coalesced']).toBe(49);
+    expect(c['token_inflight_peak']).toBe(50);
+  });
+
+  it('reports the peak as a high-water mark, not a sum of separate pile-ups', async () => {
+    const env = oidcEnv();
+    await Promise.all(Array.from({ length: 4 }, () => getOpenFgaToken(env, T0)));
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+    await Promise.all(Array.from({ length: 3 }, () => getOpenFgaToken(env, T0 + 480_000)));
+
+    const c = openFgaTokenCounters();
+    expect(c['token_coalesced']).toBe(5);
+    expect(c['token_inflight_peak']).toBe(4);
+  });
+
+  it('clears the reasons with the rest of the state, so one test cannot read another', () => {
+    resetOpenFgaTokenForTest();
+    expect(openFgaTokenCounters()).toEqual({});
+  });
+});
