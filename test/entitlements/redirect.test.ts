@@ -20,10 +20,20 @@
  *   the full form body with the password intact, and `getOpenFgaToken` returned
  *   the attacker's token.
  *
- *   THE CHECK. The bearer IS dropped on a cross-host hop, so no credential
- *   leaks. What leaks is the DECISION: the redirect target answers
- *   `{"allowed": true}` and an unauthenticated third party has granted
- *   `inventory_levels`.
+ *   THE CHECK — NOW SOMEWHERE ELSE. The same finding applied to the Check: the
+ *   bearer is dropped on a cross-host hop, so no credential leaked, but the
+ *   DECISION did — the redirect target answered `{"allowed": true}` and an
+ *   unauthenticated third party had granted `inventory_levels`. That half moved
+ *   to test/entitlements/wire-surprise.test.ts when the Check became gRPC,
+ *   because gRPC has no redirects and the question had to be re-asked rather
+ *   than retired: what CAN arrive on that hop that is neither a CheckResponse
+ *   nor a gRPC status. This file keeps the half that is still HTTP.
+ *
+ * WHY THE MINT IS STILL HTTP, since a reader will ask. The estate's transport
+ * rule is about hops between Ross's own components; the token endpoint is
+ * Authentik's OIDC endpoint, which has no gRPC form, and OIDC is on the
+ * exemption list for exactly that reason. The credential-bearing POST is
+ * therefore still an axios call and still needs both guards below.
  *
  * The fix is one option in each place. A redirecting token endpoint or
  * authorization service is a misconfiguration, and following it is never the
@@ -214,7 +224,7 @@ describe('a token endpoint that redirects', () => {
         SUB,
         T0,
         oidcEnv(`${redirector.baseUrl}/token`, {
-          OPENFGA_API_URL: fga.baseUrl,
+          OPENFGA_GRPC_URL: fga.baseUrl,
           OPENFGA_STORE_ID: STORE,
         }),
       );
@@ -234,66 +244,27 @@ describe('a token endpoint that redirects', () => {
 });
 
 // ===========================================================================
-// THE CHECK — a third party must not be able to issue the grant
-// ===========================================================================
-describe('an OpenFGA endpoint that redirects', () => {
-  it('does not accept a grant issued by the redirect TARGET', async () => {
-    // The bearer is dropped on a cross-host hop, so nothing leaks here. What
-    // would leak is the answer: an unauthenticated third party granting
-    // inventory_levels.
-    const target = track(await startRedirectTarget({ allowed: true }));
-    const redirector = track(await startRedirector(307, `${target.baseUrl}/check`));
-
-    const grants = await grantsForSubject(SUB, T0, {
-      OPENFGA_API_URL: redirector.baseUrl,
-      OPENFGA_STORE_ID: STORE,
-    } as NodeJS.ProcessEnv);
-
-    expect(grants).toEqual([]);
-    expect(target.seen).toHaveLength(0);
-    expect(events[0]).toMatchObject({ decision: 'error', http_status: 307 });
-  });
-
-  it.each(REDIRECT_STATUSES)('denies on a %i whose body CLAIMS a grant', async (status) => {
-    // The redirect response itself carries the grant, so a reader that treated
-    // a 3xx as a success would find `allowed: true` waiting for it.
-    const target = track(await startRedirectTarget({ allowed: true }));
-    const { port, close } = await listen((_req, res) => {
-      res.writeHead(status, {
-        location: `${target.baseUrl}/check`,
-        'content-type': 'application/json',
-      });
-      res.end(JSON.stringify({ allowed: true }));
-    });
-    open.push({ baseUrl: `http://127.0.0.1:${port}`, seen: [], close });
-
-    const grants = await grantsForSubject(SUB, T0, {
-      OPENFGA_API_URL: `http://127.0.0.1:${port}`,
-      OPENFGA_STORE_ID: STORE,
-    } as NodeJS.ProcessEnv);
-
-    expect(grants).toEqual([]);
-    expect(events[0]).toMatchObject({ decision: 'error', http_status: status });
-  });
-});
-
-// ===========================================================================
 // THE SOURCE
 // ===========================================================================
-describe('both call sites', () => {
-  it.each([
-    ['the mint', 'openfgaToken.ts'],
-    ['the Check', 'grants.ts'],
-  ])('configure maxRedirects: 0 on %s', (_label, file) => {
+describe('the mint call site', () => {
+  const codeOf = (file: string): string =>
+    fs
+      .readFileSync(path.resolve(import.meta.dirname, `../../src/entitlements/${file}`), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/(^|[^:])\/\/.*$/gm, '$1');
+
+  it('configures maxRedirects: 0 on openfgaToken.ts', () => {
     // Behaviour alone cannot pin this: a change that removed the option AND
     // adjusted these fixtures would pass. The option is the claim, so the option
     // is what is asserted — the same belt-and-braces the validateStatus pin uses.
-    const source = fs.readFileSync(
-      path.resolve(import.meta.dirname, `../../src/entitlements/${file}`),
-      'utf8',
-    );
-    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+    expect(codeOf('openfgaToken.ts')).toMatch(/maxRedirects:\s*0/);
+  });
 
-    expect(code).toMatch(/maxRedirects:\s*0/);
+  it('is the ONLY call site left that needs the option', () => {
+    // The Check used to need it too and no longer can: it is gRPC, and gRPC has
+    // no redirects to follow. An option that reappeared in grants.ts would mean
+    // an HTTP client had reappeared with it — which is the regression the whole
+    // unit exists to prevent, caught here from the opposite direction.
+    expect(codeOf('grants.ts')).not.toMatch(/maxRedirects/);
   });
 });

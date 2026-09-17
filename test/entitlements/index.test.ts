@@ -7,9 +7,12 @@
  * may move. Pinning the set here means widening it is a deliberate edit rather
  * than a side effect of exporting something for one test's convenience.
  *
- * Ported from fc-backend tests/services/entitlements/index.test.ts. The set is
- * UNCHANGED by the port, which is the claim worth pinning: fc-coordinator
- * consumes exactly the surface fc-backend did.
+ * Ported from fc-backend tests/services/entitlements/index.test.ts. The port
+ * itself changed nothing. The move of the OpenFGA Check to gRPC added exactly
+ * one name, `initOpenFgaTransport`, and the fact that it is ONE is the claim
+ * worth pinning: a transport change that had leaked a client, a transport
+ * object or a code enum into this surface would have coupled every future host
+ * to Connect's API rather than to this module's.
  */
 import { describe, expect, it } from 'vitest';
 import * as entitlements from '../../src/entitlements/index.js';
@@ -20,9 +23,12 @@ const EXPECTED_FUNCTIONS = [
   // its two halves, exported for callers that want them separately
   'grantsForSubject',
   'mintEntitlementAssertion',
-  // boot
+  // boot: the signing key, then the credential, then the WIRE. The third is
+  // new with the move to gRPC and it is the one that can refuse to start —
+  // a manifest still setting OPENFGA_API_URL must not produce a running pod.
   'initEntitlementSigning',
   'initOpenFgaAuth',
+  'initOpenFgaTransport',
   // the identity rule, exported so a host can check its own source against it
   'isEntitlementSubject',
   // observability

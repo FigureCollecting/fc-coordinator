@@ -37,7 +37,7 @@ const GTIN = '04573102591234';
 const STORE = '01KXA5NRJYR0GYKX4NWQ2ANDZS';
 
 const stubDb = { query: async () => ({ rows: [{ ok: 1 }] }) } as never;
-const ENV_KEYS = ['OPENFGA_API_URL', 'OPENFGA_STORE_ID', 'OPENFGA_MODEL_ID',
+const ENV_KEYS = ['OPENFGA_GRPC_URL', 'OPENFGA_STORE_ID', 'OPENFGA_MODEL_ID',
   'ENTITLEMENT_SIGNING_KEY_PEM', 'ENTITLEMENT_SIGNING_KID'] as const;
 
 let telemetry: Telemetry;
@@ -95,7 +95,7 @@ async function start(allow: boolean): Promise<Client<typeof CompareService>> {
   process.env['ENTITLEMENT_SIGNING_KID'] = KID;
 
   fga = await startFakeOpenFga(() => allow);
-  process.env['OPENFGA_API_URL'] = fga.baseUrl;
+  process.env['OPENFGA_GRPC_URL'] = fga.baseUrl;
   process.env['OPENFGA_STORE_ID'] = STORE;
 
   spine = await startFakeSpineRead({ keys: kp.keys });

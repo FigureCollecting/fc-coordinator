@@ -13,12 +13,21 @@
  * error path that reaches the user, because a gate that fails loudly is a gate
  * that can be knocked over.
  *
- * Driven against a REAL in-process OpenFGA stub rather than a mocked axios, so
- * the request SHAPE (path, body, bearer) is pinned too — that shape is the part
- * that silently returns `allowed:false` forever if it is wrong.
+ * Driven against a REAL in-process OpenFGA — now one that serves
+ * openfga.v1.OpenFGAService/Check over gRPC on cleartext h2c, the shape the
+ * real service presents on :8081 — rather than against a mocked client, so the
+ * request SHAPE (method, message fields, bearer metadata) is pinned too. That
+ * shape is the part that silently returns `allowed:false` forever if it is
+ * wrong, and moving transports gave it three new ways to be wrong: a method
+ * path built from a descriptor, protobuf field numbers instead of JSON keys,
+ * and a credential carried as metadata.
+ *
+ * WHAT MOVED OUT OF THIS FILE. The JSON-body cases — no `allowed` key, a truthy
+ * string, a non-object body, unparseable JSON — cannot happen on a typed wire
+ * and are not simply deleted: their successor cases, which ask the same
+ * question of gRPC, are in test/entitlements/wire-surprise.test.ts.
  */
-import * as http from 'node:http';
-import type { AddressInfo, Socket } from 'node:net';
+import { Code } from '@connectrpc/connect';
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import { INVENTORY_LEVELS } from '@figurecollecting/ingest-contract/entitlement';
 import {
@@ -29,76 +38,15 @@ import {
 } from '../../src/entitlements/grants.js';
 import { resetEntitlementSigningForTest } from '../../src/entitlements/assertion.js';
 import { generateTestSigningKey, verifyEntitlementHeader } from '../helpers/entitlementVerifier.js';
+import { startFakeOpenFga, type FakeOpenFga } from '../helpers/fakeOpenFga.js';
 
 const SUB = '7f3a1c62-9d44-4e51-8b0a-2c6d5e1f9a33';
 const OTHER_SUB = '11111111-2222-3333-4444-555555555555';
 const STORE_ID = '01KXA5NRJYR0GYKX4NWQ2ANDZS';
 const TOKEN = 'test-preshared-key-never-logged';
 
-interface Captured {
-  path: string;
-  method: string;
-  authorization?: string | undefined;
-  body: any;
-}
-
-interface Stub {
-  baseUrl: string;
-  captured: Captured[];
-  close: () => Promise<void>;
-}
-
-type Handler = (captured: Captured, res: http.ServerResponse) => void;
-
-async function startFga(handler: Handler): Promise<Stub> {
-  const captured: Captured[] = [];
-  const server = http.createServer((req, res) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (c) => chunks.push(c as Buffer));
-    req.on('end', () => {
-      const raw = Buffer.concat(chunks).toString('utf8');
-      let body: any = undefined;
-      try {
-        body = raw ? JSON.parse(raw) : undefined;
-      } catch {
-        body = raw;
-      }
-      const entry: Captured = {
-        path: req.url ?? '',
-        method: req.method ?? '',
-        authorization: req.headers.authorization,
-        body,
-      };
-      captured.push(entry);
-      handler(entry, res);
-    });
-  });
-  const sockets = new Set<Socket>();
-  server.on('connection', (s) => {
-    sockets.add(s);
-    s.once('close', () => sockets.delete(s));
-  });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
-  const port = (server.address() as AddressInfo).port;
-  return {
-    baseUrl: `http://127.0.0.1:${port}`,
-    captured,
-    close: async () => {
-      for (const s of sockets) s.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
-  };
-}
-
-const allowed =
-  (value: boolean): Handler =>
-  (_c, res) => {
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ allowed: value, resolution: '' }));
-  };
-
 const ENV_KEYS = [
-  'OPENFGA_API_URL',
+  'OPENFGA_GRPC_URL',
   'OPENFGA_STORE_ID',
   'OPENFGA_API_TOKEN',
   'OPENFGA_MODEL_ID',
@@ -112,7 +60,7 @@ const ENV_KEYS = [
 ] as const;
 
 let saved: Record<string, string | undefined> = {};
-let stub: Stub | null = null;
+let stub: FakeOpenFga | null = null;
 let warnSpy: MockInstance<typeof console.warn>;
 let errorSpy: MockInstance<typeof console.error>;
 let logSpy: MockInstance<typeof console.log>;
@@ -149,7 +97,7 @@ afterEach(async () => {
 });
 
 const configure = (baseUrl: string, extra: Record<string, string> = {}): void => {
-  process.env['OPENFGA_API_URL'] = baseUrl;
+  process.env['OPENFGA_GRPC_URL'] = baseUrl;
   process.env['OPENFGA_STORE_ID'] = STORE_ID;
   process.env['OPENFGA_API_TOKEN'] = TOKEN;
   for (const [k, v] of Object.entries(extra)) process.env[k] = v;
@@ -157,74 +105,84 @@ const configure = (baseUrl: string, extra: Record<string, string> = {}): void =>
 
 describe('grantsForSubject — the Check', () => {
   it('returns the inventory_levels grant when OpenFGA allows', async () => {
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl);
 
     await expect(grantsForSubject(SUB)).resolves.toEqual([INVENTORY_LEVELS]);
     expect(entitlementGrantCounters()['allow']).toBe(1);
   });
 
-  it('sends the Check OpenFGA expects: POST /stores/<id>/check with the app-level tuple and a bearer', async () => {
-    stub = await startFga(allowed(true));
+  it('sends the Check OpenFGA expects: the Check RPC, the app-level tuple, and a bearer', async () => {
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl);
 
     await grantsForSubject(SUB);
 
-    expect(stub.captured).toHaveLength(1);
-    const call = stub.captured[0] as Captured;
-    expect(call.method).toBe('POST');
-    expect(call.path).toBe(`/stores/${STORE_ID}/check`);
-    expect(call.authorization).toBe(`Bearer ${TOKEN}`);
+    expect(stub.calls).toHaveLength(1);
+    const call = stub.calls[0];
+    // The server DISPATCHED this, which it can only do from a correctly framed
+    // POST /openfga.v1.OpenFGAService/Check on an HTTP/2 stream.
+    expect(call?.method).toBe('Check');
+    expect(call?.authorization).toBe(`Bearer ${TOKEN}`);
+    expect(call?.storeId).toBe(STORE_ID);
     // The subject is `user:<authentik uuid>`; the relation and object are the
     // app-level pair from the B1 model — never a per-object feature join.
-    expect(call.body.tuple_key).toEqual({
+    expect({ user: call?.user, relation: call?.relation, object: call?.object }).toEqual({
       user: `user:${SUB}`,
       relation: INVENTORY_LEVELS,
       object: 'app:figurecollecting',
     });
-    expect(call.body.authorization_model_id).toBeUndefined();
+    // proto3 gives a scalar string no presence, so "not pinned" is the empty
+    // string on the wire rather than an absent key. OpenFGA reads both as
+    // "evaluate against the latest model", which is the same decision the JSON
+    // body made by omitting it.
+    expect(call?.modelId).toBe('');
   });
 
   it('pins the authorization model when one is configured', async () => {
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl, { OPENFGA_MODEL_ID: '01KXA5NRMNY7C8MZETNYXQT1CJ' });
 
     await grantsForSubject(SUB);
-    expect((stub.captured[0] as Captured).body.authorization_model_id).toBe(
+    expect(stub.calls[0]?.modelId).toBe(
       '01KXA5NRMNY7C8MZETNYXQT1CJ',
     );
   });
 
   it('honours an overridden app object', async () => {
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl, { OPENFGA_APP_OBJECT: 'app:staging' });
 
     await grantsForSubject(SUB);
-    expect((stub.captured[0] as Captured).body.tuple_key.object).toBe('app:staging');
+    expect(stub.calls[0]?.object).toBe('app:staging');
   });
 
   it('sends no Authorization header when no preshared key is configured', async () => {
     // A supported deployment: OpenFGA running without auth. Sending an empty
     // bearer instead of none would be rejected by a server that DOES require
     // one, turning a config gap into a puzzling 401 rather than a plain one.
-    stub = await startFga(allowed(true));
-    process.env['OPENFGA_API_URL'] = stub.baseUrl;
+    stub = await startFakeOpenFga(() => true);
+    process.env['OPENFGA_GRPC_URL'] = stub.baseUrl;
     process.env['OPENFGA_STORE_ID'] = STORE_ID;
 
     await expect(grantsForSubject(SUB)).resolves.toEqual([INVENTORY_LEVELS]);
-    expect((stub.captured[0] as Captured).authorization).toBeUndefined();
+    expect(stub.calls[0]?.authorization).toBeUndefined();
   });
 
-  it('tolerates a trailing slash on the API url', async () => {
-    stub = await startFga(allowed(true));
+  it('tolerates a trailing slash on the endpoint url', async () => {
+    // The old client built its path by hand and had to strip this; the gRPC
+    // transport builds it from the descriptor. The case stays because the
+    // MISTAKE stays available to an operator writing the manifest, and a
+    // doubled slash would be a 404 at the far end dressed up as Unimplemented.
+    stub = await startFakeOpenFga(() => true);
     configure(`${stub.baseUrl}/`);
 
-    await grantsForSubject(SUB);
-    expect((stub.captured[0] as Captured).path).toBe(`/stores/${STORE_ID}/check`);
+    await expect(grantsForSubject(SUB)).resolves.toEqual([INVENTORY_LEVELS]);
+    expect(stub.calls).toHaveLength(1);
   });
 
   it('returns no grants when OpenFGA denies', async () => {
-    stub = await startFga(allowed(false));
+    stub = await startFakeOpenFga(() => false);
     configure(stub.baseUrl);
 
     await expect(grantsForSubject(SUB)).resolves.toEqual([]);
@@ -233,22 +191,18 @@ describe('grantsForSubject — the Check', () => {
 });
 
 describe('grantsForSubject — every failure is a DENY (the B1 fail-open lesson)', () => {
-  it('denies on a 500 from OpenFGA', async () => {
-    stub = await startFga((_c, res) => {
-      res.writeHead(500, { 'content-type': 'application/json' });
-      res.end('{"code":"internal_error"}');
-    });
+  it('denies on an internal error from OpenFGA', async () => {
+    stub = await startFakeOpenFga(() => true);
+    stub.reply({ code: Code.Internal });
     configure(stub.baseUrl);
 
     await expect(grantsForSubject(SUB)).resolves.toEqual([]);
     expect(entitlementGrantCounters()['error']).toBe(1);
   });
 
-  it('denies on a 401 — a bad preshared key must not open the gate', async () => {
-    stub = await startFga((_c, res) => {
-      res.writeHead(401);
-      res.end('{"code":"unauthenticated"}');
-    });
+  it('denies on an unauthenticated — a bad preshared key must not open the gate', async () => {
+    stub = await startFakeOpenFga(() => true);
+    stub.reply({ code: Code.Unauthenticated });
     configure(stub.baseUrl);
 
     await expect(grantsForSubject(SUB)).resolves.toEqual([]);
@@ -257,7 +211,7 @@ describe('grantsForSubject — every failure is a DENY (the B1 fail-open lesson)
 
   it('denies when the connection is refused', async () => {
     // A port nothing listens on: start a stub, take its URL, then close it.
-    const dead = await startFga(allowed(true));
+    const dead = await startFakeOpenFga(() => true);
     const deadUrl = dead.baseUrl;
     await dead.close();
     configure(deadUrl);
@@ -267,39 +221,45 @@ describe('grantsForSubject — every failure is a DENY (the B1 fail-open lesson)
   });
 
   it('denies when the Check outruns its timeout', async () => {
-    stub = await startFga(() => {
-      /* never responds */
-    });
+    stub = await startFakeOpenFga(() => true);
+    stub.reply({ delayMs: 60_000 }); // accepts the stream, answers never
     configure(stub.baseUrl, { OPENFGA_TIMEOUT_MS: '120' });
 
     await expect(grantsForSubject(SUB)).resolves.toEqual([]);
     expect(entitlementGrantCounters()['error']).toBe(1);
   });
 
-  it.each([
-    ['a body with no allowed field', '{"resolution":""}'],
-    ['a truthy string instead of a boolean', '{"allowed":"true"}'],
-    ['a non-object body', '"allowed"'],
-    ['unparseable JSON', '{not json'],
-  ])('denies on %s', async (_label, payload) => {
-    stub = await startFga((_c, res) => {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(payload);
-    });
+  it('denies — as a DENY, not an error — when `allowed` is absent from the response', async () => {
+    // A SEMANTIC THE TRANSPORT CHANGED, recorded rather than glossed over. Over
+    // JSON, `{"resolution":""}` had no `allowed` key and was an ERROR: a body
+    // that is not a Check response is a fault. proto3 has no presence on a
+    // scalar bool, so an absent `allowed` and an explicit `false` are THE SAME
+    // BYTES, and the answer below is indistinguishable from a deny by
+    // construction — there is no reading of the wire that could separate them.
+    //
+    // The distinction is therefore lost, and it is lost in the safe direction:
+    // what was an error-deny is now a plain deny. Both withhold the grant. The
+    // cost is operational rather than security — a malformed OpenFGA response
+    // of this one shape no longer stands out as a fault — and the shapes that
+    // CAN still be told apart are covered in wire-surprise.test.ts.
+    stub = await startFakeOpenFga(() => true);
+    stub.reply({ allowed: false });
     configure(stub.baseUrl);
 
     await expect(grantsForSubject(SUB)).resolves.toEqual([]);
+    expect(entitlementGrantCounters()['deny']).toBe(1);
+    expect(entitlementGrantCounters()['error']).toBeUndefined();
   });
 
   it.each([
     ['empty', ''],
     ['blank', '  '],
   ])('denies a %s subject without calling OpenFGA', async (_l, sub) => {
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl);
 
     await expect(grantsForSubject(sub)).resolves.toEqual([]);
-    expect(stub.captured).toHaveLength(0);
+    expect(stub.calls).toHaveLength(0);
   });
 });
 
@@ -316,31 +276,31 @@ describe('grantsForSubject — the subject must be an Authentik uuid', () => {
     ['a uuid missing a group', '7f3a1c62-9d44-4e51-8b0a'],
     ['a numeric pk', '42'],
   ])('refuses %s without calling OpenFGA', async (_label, subject) => {
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl);
 
     await expect(grantsForSubject(subject)).resolves.toEqual([]);
-    expect(stub.captured).toHaveLength(0);
+    expect(stub.calls).toHaveLength(0);
     expect(entitlementGrantCounters()['bad_subject']).toBeGreaterThanOrEqual(1);
   });
 
   it('refuses a non-string subject rather than throwing', async () => {
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl);
 
     await expect(grantsForSubject(undefined as unknown as string)).resolves.toEqual([]);
     await expect(grantsForSubject(null as unknown as string)).resolves.toEqual([]);
     await expect(grantsForSubject(12345 as unknown as string)).resolves.toEqual([]);
-    expect(stub.captured).toHaveLength(0);
+    expect(stub.calls).toHaveLength(0);
   });
 
   it('accepts an uppercase uuid — OpenFGA is case-sensitive, so it is passed through verbatim', async () => {
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl);
     const upper = SUB.toUpperCase();
 
     await expect(grantsForSubject(upper)).resolves.toEqual([INVENTORY_LEVELS]);
-    expect((stub.captured[0] as Captured).body.tuple_key.user).toBe(`user:${upper}`);
+    expect(stub.calls[0]?.user).toBe(`user:${upper}`);
   });
 });
 
@@ -358,72 +318,62 @@ describe('grantsForSubject — unconfigured', () => {
   });
 
   it('denies when the store id is missing even though the URL is set', async () => {
-    stub = await startFga(allowed(true));
-    process.env['OPENFGA_API_URL'] = stub.baseUrl;
+    stub = await startFakeOpenFga(() => true);
+    process.env['OPENFGA_GRPC_URL'] = stub.baseUrl;
 
     await expect(grantsForSubject(SUB)).resolves.toEqual([]);
-    expect(stub.captured).toHaveLength(0);
+    expect(stub.calls).toHaveLength(0);
   });
 });
 
 describe('grantsForSubject — caching keeps the hot read path off OpenFGA', () => {
   it('serves a repeat check for the same subject from cache', async () => {
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl, { ENTITLEMENT_GRANT_CACHE_TTL_MS: '30000' });
 
     await grantsForSubject(SUB, 1_000);
     await grantsForSubject(SUB, 5_000);
     await grantsForSubject(SUB, 30_000);
 
-    expect(stub.captured).toHaveLength(1);
+    expect(stub.calls).toHaveLength(1);
     expect(entitlementGrantCounters()['cache_hit']).toBe(2);
   });
 
   it('re-checks once the TTL has passed', async () => {
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl, { ENTITLEMENT_GRANT_CACHE_TTL_MS: '30000' });
 
     await grantsForSubject(SUB, 1_000);
     await grantsForSubject(SUB, 31_001);
 
-    expect(stub.captured).toHaveLength(2);
+    expect(stub.calls).toHaveLength(2);
   });
 
   it('caches denies too — a revoked user does not cost a Check per request', async () => {
-    stub = await startFga(allowed(false));
+    stub = await startFakeOpenFga(() => false);
     configure(stub.baseUrl, { ENTITLEMENT_GRANT_CACHE_TTL_MS: '30000' });
 
     await grantsForSubject(SUB, 1_000);
     await grantsForSubject(SUB, 2_000);
 
-    expect(stub.captured).toHaveLength(1);
+    expect(stub.calls).toHaveLength(1);
   });
 
   it('keys the cache per subject', async () => {
-    stub = await startFga((c, res) => {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ allowed: c.body.tuple_key.user === `user:${SUB}` }));
-    });
+    stub = await startFakeOpenFga((c) => c.user === `user:${SUB}`);
     configure(stub.baseUrl);
 
     await expect(grantsForSubject(SUB, 1_000)).resolves.toEqual([INVENTORY_LEVELS]);
     await expect(grantsForSubject(OTHER_SUB, 1_000)).resolves.toEqual([]);
     await expect(grantsForSubject(SUB, 2_000)).resolves.toEqual([INVENTORY_LEVELS]);
 
-    expect(stub.captured).toHaveLength(2);
+    expect(stub.calls).toHaveLength(2);
   });
 
   it('caches an ERROR deny only briefly, so an OpenFGA blip does not pin a user out for the full TTL', async () => {
-    let fail = true;
-    stub = await startFga((_c, res) => {
-      if (fail) {
-        res.writeHead(500);
-        res.end('{}');
-        return;
-      }
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end('{"allowed":true}');
-    });
+    stub = await startFakeOpenFga(() => true);
+    // Once, then healthy. A sticky override plus a timer would be a race.
+    stub.replyOnce({ code: Code.Internal });
     configure(stub.baseUrl, {
       ENTITLEMENT_GRANT_CACHE_TTL_MS: '30000',
       ENTITLEMENT_GRANT_ERROR_TTL_MS: '5000',
@@ -432,38 +382,31 @@ describe('grantsForSubject — caching keeps the hot read path off OpenFGA', () 
     await expect(grantsForSubject(SUB, 1_000)).resolves.toEqual([]);
     // Inside the short error window: still denied, still no second call.
     await expect(grantsForSubject(SUB, 3_000)).resolves.toEqual([]);
-    expect(stub.captured).toHaveLength(1);
+    expect(stub.calls).toHaveLength(1);
 
-    fail = false;
     // Past it, long before the success TTL would have expired.
     await expect(grantsForSubject(SUB, 7_000)).resolves.toEqual([INVENTORY_LEVELS]);
-    expect(stub.captured).toHaveLength(2);
+    expect(stub.calls).toHaveLength(2);
   });
 
   it('collapses concurrent checks for one subject into a single upstream call', async () => {
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    stub = await startFga((_c, res) => {
-      void gate.then(() => {
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end('{"allowed":true}');
-      });
-    });
+    // NO GATE, and it is not needed: the in-flight map is written
+    // SYNCHRONOUSLY, before the first await inside the Check, so the second
+    // through fourth callers find it in the same tick whatever the server does.
+    // The gate this case used to hold the response open with was insurance
+    // against a race that the module's own ordering rules out.
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl);
 
-    const all = Promise.all([
+    const results = await Promise.all([
       grantsForSubject(SUB, 1_000),
       grantsForSubject(SUB, 1_000),
       grantsForSubject(SUB, 1_000),
       grantsForSubject(SUB, 1_000),
     ]);
-    (release as () => void)();
-    const results = await all;
 
     expect(results.every((r) => r.length === 1)).toBe(true);
-    expect(stub.captured).toHaveLength(1);
+    expect(stub.calls).toHaveLength(1);
   });
 });
 
@@ -471,7 +414,7 @@ describe('grantsForSubject — the cache is bounded (it used to grow forever)', 
   const uuid = (n: number): string => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 
   it('evicts the least recently written subject once the cap is reached', async () => {
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl, {
       ENTITLEMENT_GRANT_CACHE_MAX: '2',
       ENTITLEMENT_GRANT_CACHE_TTL_MS: '30000',
@@ -480,20 +423,20 @@ describe('grantsForSubject — the cache is bounded (it used to grow forever)', 
     await grantsForSubject(uuid(1), 1_000); // upstream 1
     await grantsForSubject(uuid(2), 1_000); // upstream 2
     await grantsForSubject(uuid(3), 1_000); // upstream 3, and uuid(1) is evicted
-    expect(stub.captured).toHaveLength(3);
+    expect(stub.calls).toHaveLength(3);
 
     // Still inside its 30 s lifetime, so a cache that never evicted would
     // answer this without a call. It does not: the entry is gone.
     await grantsForSubject(uuid(1), 2_000);
-    expect(stub.captured).toHaveLength(4);
+    expect(stub.calls).toHaveLength(4);
 
     // The two most recent are still cached.
     await grantsForSubject(uuid(3), 2_000);
-    expect(stub.captured).toHaveLength(4);
+    expect(stub.calls).toHaveLength(4);
   });
 
   it('drops EXPIRED entries before it touches a live one', async () => {
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl, {
       ENTITLEMENT_GRANT_CACHE_MAX: '2',
       ENTITLEMENT_GRANT_CACHE_TTL_MS: '10000',
@@ -501,32 +444,32 @@ describe('grantsForSubject — the cache is bounded (it used to grow forever)', 
 
     await grantsForSubject(uuid(1), 1_000); // expires at 11 000
     await grantsForSubject(uuid(2), 8_000); // expires at 18 000
-    expect(stub.captured).toHaveLength(2);
+    expect(stub.calls).toHaveLength(2);
 
     // At 12 000 uuid(1) is dead weight. Admitting uuid(3) should reclaim it and
     // leave the live uuid(2) alone — evicting by age alone would take uuid(2)
     // as well, since it is written after uuid(1).
     await grantsForSubject(uuid(3), 12_000);
-    expect(stub.captured).toHaveLength(3);
+    expect(stub.calls).toHaveLength(3);
 
     await grantsForSubject(uuid(2), 13_000);
-    expect(stub.captured).toHaveLength(3);
+    expect(stub.calls).toHaveLength(3);
     expect(entitlementGrantCounters()['evicted']).toBeGreaterThanOrEqual(1);
   });
 
   it('holds many distinct subjects without exceeding the cap', async () => {
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl, { ENTITLEMENT_GRANT_CACHE_MAX: '8' });
 
     for (let i = 0; i < 50; i++) await grantsForSubject(uuid(i), 1_000);
 
     // 50 distinct subjects, 50 Checks, and the map never held more than 8.
     // Observable as: the first subject is long gone, the last is still there.
-    expect(stub.captured).toHaveLength(50);
+    expect(stub.calls).toHaveLength(50);
     await grantsForSubject(uuid(49), 1_000);
-    expect(stub.captured).toHaveLength(50);
+    expect(stub.calls).toHaveLength(50);
     await grantsForSubject(uuid(0), 1_000);
-    expect(stub.captured).toHaveLength(51);
+    expect(stub.calls).toHaveLength(51);
   });
 });
 
@@ -538,12 +481,15 @@ describe('grantsForSubject — a bound of zero is not a bound', () => {
   ])(
     'falls back to the default timeout when the configured one is %s',
     async (_label, value) => {
-      // axios reads `timeout: 0` as "wait forever". On a user-facing read path a
-      // single typo would turn the Check into an unbounded hang, so a value that
-      // is not a positive number is refused in favour of the documented default.
-      stub = await startFga(() => {
-        /* never responds */
-      });
+      // A bound of zero is not a smaller bound, it is the absence of one, and
+      // the two transports break in OPPOSITE directions on it: axios read
+      // `timeout: 0` as "wait forever" and hung the read, while a gRPC deadline
+      // of zero has already expired when the call starts and would deny every
+      // read instantly. A value that is not a positive number is therefore
+      // refused in favour of the documented default, and the assertions below
+      // catch either failure — one never settles, the other settles at once.
+      stub = await startFakeOpenFga(() => true);
+      stub.reply({ delayMs: 60_000 }); // accepts the stream, answers never
       configure(stub.baseUrl, { OPENFGA_TIMEOUT_MS: value });
 
       // performance.now(), NOT Date.now(): this is an ELAPSED-TIME measurement
@@ -564,13 +510,14 @@ describe('grantsForSubject — a bound of zero is not a bound', () => {
       // runner's own timeout below.
       //
       // The window is deliberately WIDE, and the bound below is NOT the
-      // configured 2 000 ms. axios implements its timeout with the socket's
-      // inactivity timer, which it arms around connect rather than at the call,
-      // so under event-loop contention the rejection can arrive early —
-      // measured at 1 283 ms against this very stub with the loop busy, while
-      // an idle run lands at 2 07x ms every time. A bound near 2 000 would
-      // therefore go red on a loaded CI runner and prove nothing about the
-      // code. 500 ms is still far above any instant-resolve path.
+      // configured 2 000 ms. The original reason was axios's socket inactivity
+      // timer firing early under event-loop contention (measured at 1 283 ms
+      // against this stub with the loop busy, 2 07x ms idle). The gRPC deadline
+      // is a timer on the call rather than the socket and lands closer to
+      // 2 000, but the wide window is kept: a bound near the configured value
+      // goes red on a loaded runner and proves nothing about the code. 500 ms
+      // is still far above any instant-resolve path, which is the failure this
+      // case exists to catch.
       expect(elapsed).toBeGreaterThan(500);
       expect(elapsed).toBeLessThan(6_000);
     },
@@ -581,7 +528,7 @@ describe('grantsForSubject — a bound of zero is not a bound', () => {
     // The same rule as above on a different bound, asserted through BEHAVIOUR
     // rather than elapsed time — a max of 0 honoured literally would evict on
     // every write, so nothing would ever be served from cache.
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl, {
       ENTITLEMENT_GRANT_CACHE_MAX: '0',
       ENTITLEMENT_GRANT_CACHE_TTL_MS: '30000',
@@ -590,17 +537,15 @@ describe('grantsForSubject — a bound of zero is not a bound', () => {
     await grantsForSubject(SUB, 1_000);
     await grantsForSubject(SUB, 2_000);
 
-    expect(stub.captured).toHaveLength(1);
+    expect(stub.calls).toHaveLength(1);
     expect(entitlementGrantCounters()['cache_hit']).toBe(1);
   });
 });
 
 describe('secret hygiene', () => {
   it('never logs the preshared key, even when the Check fails', async () => {
-    stub = await startFga((_c, res) => {
-      res.writeHead(500);
-      res.end('{"code":"internal_error"}');
-    });
+    stub = await startFakeOpenFga(() => true);
+    stub.reply({ code: Code.Internal });
     configure(stub.baseUrl);
 
     await grantsForSubject(SUB);
@@ -620,7 +565,7 @@ describe('entitlementHeaderFor — the module in one call', () => {
 
   it('checks, then signs: the header verifies and names the subject it was checked for', async () => {
     const kp = withKey();
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl);
 
     const header = await entitlementHeaderFor(SUB);
@@ -630,12 +575,12 @@ describe('entitlementHeaderFor — the module in one call', () => {
     expect(verified.sub).toBe(SUB);
     expect([...verified.grants]).toEqual([INVENTORY_LEVELS]);
     // The subject signed is the subject checked — not one resolved twice.
-    expect((stub.captured[0] as Captured).body.tuple_key.user).toBe(`user:${SUB}`);
+    expect(stub.calls[0]?.user).toBe(`user:${SUB}`);
   });
 
   it('returns null when the Check denies', async () => {
     withKey();
-    stub = await startFga(allowed(false));
+    stub = await startFakeOpenFga(() => false);
     configure(stub.baseUrl);
 
     await expect(entitlementHeaderFor(SUB)).resolves.toBeNull();
@@ -643,17 +588,15 @@ describe('entitlementHeaderFor — the module in one call', () => {
 
   it('returns null when the Check errors', async () => {
     withKey();
-    stub = await startFga((_c, res) => {
-      res.writeHead(500);
-      res.end('{}');
-    });
+    stub = await startFakeOpenFga(() => true);
+    stub.reply({ code: Code.Internal });
     configure(stub.baseUrl);
 
     await expect(entitlementHeaderFor(SUB)).resolves.toBeNull();
   });
 
   it('returns null when there is no signing key, even on an allow', async () => {
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl);
 
     await expect(entitlementHeaderFor(SUB)).resolves.toBeNull();
@@ -664,11 +607,11 @@ describe('entitlementHeaderFor — the module in one call', () => {
     ['blank', '   '],
   ])('returns null for a %s subject, without calling OpenFGA', async (_l, sub) => {
     withKey();
-    stub = await startFga(allowed(true));
+    stub = await startFakeOpenFga(() => true);
     configure(stub.baseUrl);
 
     await expect(entitlementHeaderFor(sub)).resolves.toBeNull();
-    expect(stub.captured).toHaveLength(0);
+    expect(stub.calls).toHaveLength(0);
   });
 });
 
@@ -704,7 +647,7 @@ describe('FAIL CLOSED — the state this service ships in until D4 lands', () =>
 
   it('mints NO header when OpenFGA is configured but unreachable', async () => {
     withKey();
-    const dead = await startFga(allowed(true));
+    const dead = await startFakeOpenFga(() => true);
     const deadUrl = dead.baseUrl;
     await dead.close();
     configure(deadUrl);

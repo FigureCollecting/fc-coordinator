@@ -65,7 +65,7 @@ afterEach(async () => {
     fga = null;
   }
   for (const k of [
-    'OPENFGA_API_URL',
+    'OPENFGA_GRPC_URL',
     'OPENFGA_STORE_ID',
     'ENTITLEMENT_SIGNING_KEY_PEM',
     'ENTITLEMENT_SIGNING_KID',
@@ -94,7 +94,7 @@ async function startWithDefaultResolver(options: {
   process.env['ENTITLEMENT_SIGNING_KID'] = KID;
 
   fga = await startFakeOpenFga(() => true);
-  process.env['OPENFGA_API_URL'] = fga.baseUrl;
+  process.env['OPENFGA_GRPC_URL'] = fga.baseUrl;
   process.env['OPENFGA_STORE_ID'] = '01KXA5NRJYR0GYKX4NWQ2ANDZS';
 
   spine = await startFakeSpineRead({ keys: kp.keys });
@@ -128,7 +128,7 @@ describe('the default identity resolver, as production wires it', () => {
     expect(res.coverage?.redacted).toEqual([]);
     expect(JSON.parse(res.resultJson).heads[0].perStore[0].offers[0].stockOnHand).toBe('7');
     // And the uuid that reached OpenFGA is the one the decorator carried.
-    expect(JSON.stringify(fga?.calls[0]?.body)).toContain(`user:${SUB}`);
+    expect(fga?.calls[0]?.user).toBe(`user:${SUB}`);
   });
 
   it('treats an undecorated request as unauthenticated: redacted, never rejected', async () => {
@@ -199,5 +199,34 @@ describe('the health route is unaffected by the Connect surface', () => {
     // else. It is asserted WHOLE here, so mounting Connect cannot quietly widen
     // the one body the estate serves without credentials.
     expect(res.json()).toEqual({ status: 'ok', db: 'ok', otel: 'missing' });
+  });
+});
+
+describe('the boot wiring names the transport, and refuses the retired one', () => {
+  it('prints which wire the Check runs on', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await startWithDefaultResolver({ decorate: { sub: SUB } });
+
+    // The pod log has to answer "is this hop gRPC yet" without anyone reading
+    // the manifest. `initOpenFgaTransport` is unit-tested in
+    // test/entitlements/boot-transport.test.ts; what is asserted HERE is the
+    // only thing that file cannot assert — that production wiring calls it.
+    expect(logSpy.mock.calls.map((a) => a.map(String).join(' ')).join('\n')).toContain(
+      'openfga: grpc h2c',
+    );
+  });
+
+  it('refuses to build the app when OPENFGA_API_URL survives in the manifest', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    process.env['OPENFGA_API_URL'] = 'http://openfga-mc-fc-ha.authz.svc.cluster.local:8080';
+    try {
+      // An un-updated manifest must not produce a running pod. The alternative
+      // is a service that starts, reports healthy, and redacts every read.
+      await expect(startWithDefaultResolver({ decorate: { sub: SUB } })).rejects.toThrow(
+        /OPENFGA_GRPC_URL/,
+      );
+    } finally {
+      delete process.env['OPENFGA_API_URL'];
+    }
   });
 });

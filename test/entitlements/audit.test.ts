@@ -20,6 +20,7 @@
  * was an error, which is the difference between "these users were revoked" and
  * "the authorization service was sick and we are still replaying that".
  */
+import { Code } from '@connectrpc/connect';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   entitlementHeaderFor,
@@ -46,7 +47,7 @@ let events: EntitlementAuditEvent[];
 
 const env = (over: Record<string, string | undefined> = {}): NodeJS.ProcessEnv =>
   ({
-    OPENFGA_API_URL: fga.baseUrl,
+    OPENFGA_GRPC_URL: fga.baseUrl,
     OPENFGA_STORE_ID: STORE,
     OPENFGA_MODEL_ID: MODEL,
     ...over,
@@ -101,7 +102,11 @@ describe('an allowed Check', () => {
       decision: 'allow',
       source: 'openfga',
       model_id: MODEL,
-      http_status: 200,
+      // `ok` where the HTTP version recorded 200. Present on the SUCCESS path
+      // too, deliberately: the field means "the call was attempted and this is
+      // how it ended", so a reader can tell a granted Check apart from one that
+      // never left the process.
+      grpc_code: 'ok',
     });
     expect(typeof events[0]?.latency_ms).toBe('number');
   });
@@ -128,18 +133,26 @@ describe('a denied Check', () => {
 });
 
 describe('a Check that could not be made', () => {
-  it('records decision error WITH the status, so a 504 is not a 401', async () => {
-    fga.reply({ status: 504, body: { allowed: true } });
+  it('records decision error WITH the code, so unavailable is not unauthenticated', async () => {
+    fga.reply({ code: Code.Unavailable });
 
     await grantsForSubject(SUB, T0, env());
-    expect(events[0]).toMatchObject({ decision: 'error', http_status: 504, reason: 'http_error' });
+    expect(events[0]).toMatchObject({ decision: 'error', grpc_code: 'unavailable' });
+    // No `reason`: the code IS the reason. `reason` is kept for the causes a
+    // gRPC status cannot express — a failed mint, a refused REST variable, an
+    // answer that was not a CheckResponse.
+    expect(events[0]?.reason).toBeUndefined();
   });
 
-  it('records a transport failure with no status at all', async () => {
-    await grantsForSubject(SUB, T0, env({ OPENFGA_API_URL: 'http://127.0.0.1:1' }));
+  it('records a connection that was refused as unavailable, in the only vocabulary gRPC has', async () => {
+    // WHAT CHANGED WITH THE TRANSPORT, said plainly. Over HTTP a refused socket
+    // produced no status and the record said `reason: transport`; a served
+    // error produced one and said `http_error`. gRPC gives both the same code,
+    // and no part of the protocol separates them, so the record reports
+    // `unavailable` and does not guess.
+    await grantsForSubject(SUB, T0, env({ OPENFGA_GRPC_URL: 'http://127.0.0.1:1' }));
 
-    expect(events[0]).toMatchObject({ decision: 'error', reason: 'transport' });
-    expect(events[0]?.http_status).toBeUndefined();
+    expect(events[0]).toMatchObject({ decision: 'error', grpc_code: 'unavailable' });
   });
 
   it('records a failed token mint as its OWN reason, not as a 401', async () => {
@@ -159,7 +172,8 @@ describe('a Check that could not be made', () => {
       source: 'none',
       latency_ms: 0,
     });
-    expect(events[0]?.http_status).toBeUndefined();
+    // NOTHING WAS DIALLED, so there is no gRPC status to report either.
+    expect(events[0]?.grpc_code).toBeUndefined();
     expect(fga.calls).toHaveLength(0);
   });
 
@@ -224,11 +238,11 @@ describe('the cache', () => {
   it('replays the ORIGINAL decision, so a cached error still reads as an error', async () => {
     // Without this the second read looks like an ordinary denial, and an
     // operator watching the log sees a revocation that never happened.
-    fga.reply({ status: 503, body: {} });
+    fga.reply({ code: Code.Unavailable });
     await grantsForSubject(SUB, T0, env());
     await grantsForSubject(SUB, T0 + 1_000, env());
 
-    expect(events[1]).toMatchObject({ decision: 'error', source: 'cache', http_status: 503 });
+    expect(events[1]).toMatchObject({ decision: 'error', source: 'cache', grpc_code: 'unavailable' });
   });
 
   it('marks a coalesced caller as coalesced, not as a fresh Check', async () => {
@@ -274,7 +288,7 @@ describe('the event body', () => {
       [
         'decision',
         'event',
-        'http_status',
+        'grpc_code',
         'latency_ms',
         'model_id',
         'object',

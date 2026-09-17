@@ -9,13 +9,13 @@
 //
 // SLICE 1b CHANGED WHAT "axios" MEANS HERE, and the guard had to get more
 // precise rather than more permissive. The ported entitlement module
-// (src/entitlements, from fc-backend U6) calls OpenFGA over axios; that is a
-// DECLARED part of its portability contract, enforced by
-// test/entitlements/portability.test.ts, and it is a direct dependency of this
-// repo. So axios in the app graph is no longer evidence of anything by itself.
-// What is still forbidden — and is the thing the original test was really
-// about — is axios arriving as a TRANSITIVE of the fc-shared barrel. The
-// distinction the graph can make is WHO ASKED, so that is what is asserted:
+// (src/entitlements, the D6 U6 copy) declares axios as part of its portability
+// contract, enforced by test/entitlements/portability.test.ts, and it is a
+// direct dependency of this repo. So axios in the app graph is no longer
+// evidence of anything by itself. What is still forbidden — and is the thing
+// the original test was really about — is axios arriving as a TRANSITIVE of the
+// fc-shared barrel. The distinction the graph can make is WHO ASKED, so that is
+// what is asserted:
 //
 //   the fc-shared seam    resolves none of axios, zustand, react
 //   the whole application resolves neither zustand nor react, and resolves
@@ -23,6 +23,14 @@
 //
 // Loosening this to "axios is allowed anywhere" would have thrown away the
 // original guard; the parent check keeps it and sharpens it.
+//
+// WHAT AXIOS IS STILL DOING IN THERE, after the OpenFGA Check became gRPC: the
+// OIDC token mint (openfgaToken.ts). That hop goes to Authentik's token
+// endpoint, which has no gRPC form and is on the estate's exemption list, so it
+// stays HTTP and the assertion below stays anti-vacuous for a REASON rather
+// than by luck. If that mint ever moves, the importer count drops to zero and
+// this test goes red — which is the correct outcome, because at that point the
+// dependency should leave package.json too.
 // ============================================================================
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -116,6 +124,36 @@ describe('the coordinator import graph never reaches the browser half of fc-shar
         inEntitlements: true,
       });
     }
+  });
+
+  it('ships the gRPC client inside the entitlement module, not beside it', () => {
+    // THE OTHER HALF OF THE SAME QUESTION. The Check is gRPC now, and a build
+    // that emitted the module without its transport — tree-shaken, mis-pathed,
+    // or left behind by a bad `clean` — would fail at the first read in
+    // production and pass every unit test, which run the TypeScript rather than
+    // dist/. So the real emitted graph is asked whether the client is in it,
+    // and whether it is where the portability contract says it is.
+    const graph = probe(BUILT_APP);
+    const importers = importersOf(graph, '@connectrpc/connect-node');
+
+    expect(importers.length).toBeGreaterThan(0);
+    expect(importers.some((importer) => importer.startsWith(ENTITLEMENTS_DIR))).toBe(true);
+  });
+
+  it('carries the generated openfga wire types with the module', () => {
+    // The descriptor is committed INSIDE src/entitlements (see buf.gen.yaml)
+    // precisely so the directory travels whole. This proves the built output
+    // agrees.
+    const graph = probe(BUILT_APP);
+    // A RELATIVE specifier, so it is matched on the resolution rather than on
+    // the require cache: the emitted output is ESM and never goes through
+    // require at all, which is why `required` is empty for it.
+    const generated = graph.resolved.filter(
+      (r) =>
+        r.specifier.endsWith('gen/openfga/v1/openfga_service_pb.js') &&
+        (r.parentURL ?? '').includes('/dist/entitlements/'),
+    );
+    expect(generated.length).toBeGreaterThan(0);
   });
 
   it('still reaches the fc-shared values the coordinator depends on', () => {
