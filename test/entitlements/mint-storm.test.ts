@@ -120,6 +120,24 @@ afterEach(async () => {
 });
 
 describe('50 subjects against a permanently unauthenticated OpenFGA', () => {
+  it('is measured against an IdP that mints a DISTINCT token per grant', async () => {
+    // THE PREMISE OF EVERY OTHER CASE IN THIS FILE, asserted rather than
+    // assumed. It was assumed once, wrongly: the fake handed out one constant
+    // token, so "is the cached token the one I was refused with?" answered yes
+    // for every caller by string identity, and a fix turning on exactly that
+    // question looked like a no-op. Authentik issues a separate JWT per grant.
+    // If this file is ever re-pointed at a pinned reply, this is what says so.
+    await stormConcurrent();
+
+    expect(idp.issued.length).toBe(idp.calls.length);
+    expect(new Set(idp.issued).size).toBe(idp.issued.length);
+
+    // And the module's own counter agrees with the socket's request log, so a
+    // mis-attributed or double-bumped counter cannot hide behind it. The
+    // headline number in this file is the SOCKET's, never the module's.
+    expect(openFgaTokenCounters()['token_mint']).toBe(idp.calls.length);
+  }, 60_000);
+
   it('honours the per-subject retry bound exactly — the storm is in mints, not checks', async () => {
     // FIRST, because it is the part that is NOT broken and the part a reader
     // will otherwise assume is. Two checks per subject, no loop, every subject
@@ -207,7 +225,9 @@ describe('50 subjects against a permanently unauthenticated OpenFGA', () => {
     expect(printed.length).toBeGreaterThan(0);
     const text = JSON.stringify(printed);
     expect(text).not.toContain(PASSWORD);
-    expect(text).not.toContain('token-1');
+    // Any of them, not just the first: the IdP mints a distinct token per grant
+    // and a leak of the twenty-sixth is a leak.
+    expect(text).not.toMatch(/token-\d+/);
     expect(text).not.toContain('Bearer');
   }, 60_000);
 });

@@ -6,6 +6,18 @@
  * into it, and a mock asserts the call we MEANT to make. This records the bytes
  * that actually went over the wire, so a missing `--data-urlencode` equivalent
  * shows up as a password that does not round-trip.
+ *
+ * A DISTINCT TOKEN PER REQUEST, by default, and that default is load-bearing.
+ * It used to hand out the constant `token-1` however many times it was asked,
+ * which is not what an identity provider does — Authentik issues a separate JWT
+ * per grant. The difference is invisible to most tests and decisive for one: a
+ * caller asking "is the token in the cache the one I was refused with?" gets
+ * `true` from a constant fake no matter what happened in between, so a fix that
+ * turns on exactly that question measured as a no-op and was written off. It is
+ * not a no-op; it takes 26 mints to 2. See test/entitlements/mint-storm.test.ts.
+ *
+ * Pass `initial`, or call `reply`, to pin a fixed answer where a test needs to
+ * name the token it expects; `reply(null)` goes back to minting distinct ones.
  */
 import * as http from 'node:http';
 import type { AddressInfo, Socket } from 'node:net';
@@ -29,16 +41,25 @@ export interface TokenReply {
 export interface FakeTokenEndpoint {
   url: string;
   calls: TokenCall[];
-  /** Swap the answer mid-test: the next call gets this. */
-  reply: (next: TokenReply) => void;
+  /**
+   * Every `access_token` this endpoint actually handed out, in order.
+   *
+   * Exposed so a test that DEPENDS on the tokens being distinct can prove they
+   * were, rather than inheriting it from a default someone may later change
+   * back. That is the assumption whose silent failure hid a working fix.
+   */
+  issued: string[];
+  /** Swap the answer mid-test: the next call gets this. `null` restores the default. */
+  reply: (next: TokenReply | null) => void;
   close: () => Promise<void>;
 }
 
-export async function startFakeTokenEndpoint(
-  initial: TokenReply = { body: { access_token: 'token-1', token_type: 'Bearer', expires_in: 600 } },
-): Promise<FakeTokenEndpoint> {
+export async function startFakeTokenEndpoint(initial?: TokenReply): Promise<FakeTokenEndpoint> {
   const calls: TokenCall[] = [];
-  let next: TokenReply = initial;
+  const issued: string[] = [];
+  /** null means "mint a fresh one", which is the default and what a real IdP does. */
+  let next: TokenReply | null = initial ?? null;
+  let minted = 0;
 
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -54,9 +75,15 @@ export async function startFakeTokenEndpoint(
         form,
         raw,
       });
-      const status = next.status ?? 200;
+      const answer: TokenReply =
+        next ?? { body: { access_token: `token-${++minted}`, token_type: 'Bearer', expires_in: 600 } };
+      const status = answer.status ?? 200;
+      // Recorded from the answer actually sent, pinned or minted, so `issued`
+      // never disagrees with what went down the socket.
+      const token = (answer.body as { access_token?: unknown } | undefined)?.access_token;
+      if (typeof token === 'string') issued.push(token);
       res.writeHead(status, { 'content-type': 'application/json' });
-      res.end(typeof next.body === 'string' ? next.body : JSON.stringify(next.body ?? {}));
+      res.end(typeof answer.body === 'string' ? answer.body : JSON.stringify(answer.body ?? {}));
     });
   });
 
@@ -71,6 +98,7 @@ export async function startFakeTokenEndpoint(
   return {
     url: `http://127.0.0.1:${port}/application/o/token/`,
     calls,
+    issued,
     reply: (r) => {
       next = r;
     },
