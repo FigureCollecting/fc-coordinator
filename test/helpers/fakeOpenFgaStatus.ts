@@ -46,6 +46,20 @@ export type RawReply =
        * which is why there is a test that echoes the bearer back through it.
        */
       message?: string;
+      /**
+       * How the status is carried.
+       *
+       *   'trailer'     the plain `grpc-status` field — what OpenFGA sends
+       *   'details-bin' a base64 `google.rpc.Status` in
+       *                 `grpc-status-details-bin`, which Connect PREFERS over
+       *                 the plain field and reads the code straight out of
+       *
+       * The second path matters because Connect puts that number directly into
+       * `ConnectError.code` instead of mapping it to `Code.Internal`, so the
+       * client sees a non-canonical value in a different place. A reader of the
+       * audit line should not be able to tell which path was used.
+       */
+      via?: 'trailer' | 'details-bin';
     }
   | { allowed: boolean };
 
@@ -60,6 +74,27 @@ export interface FakeOpenFgaStatus {
   /** Answers are taken from the front of this queue; the last one repeats. */
   script: (replies: RawReply[]) => void;
   close: () => Promise<void>;
+}
+
+/**
+ * A base64 `google.rpc.Status` for the `-bin` trailer, hand-encoded because
+ * three bytes of protobuf are clearer than a dependency: field 1 is `int32
+ * code` (tag 0x08, varint), field 2 is `string message` (tag 0x12, length
+ * prefixed).
+ */
+function encodeStatusDetails(code: number, message?: string): string {
+  const bytes: number[] = [0x08];
+  let value = code;
+  while (value > 0x7f) {
+    bytes.push((value & 0x7f) | 0x80);
+    value >>>= 7;
+  }
+  bytes.push(value);
+  if (message !== undefined) {
+    const text = Buffer.from(message, 'utf8');
+    bytes.push(0x12, text.length, ...text);
+  }
+  return Buffer.from(bytes).toString('base64');
 }
 
 /** gRPC length-prefixed framing: one uncompressed message. */
@@ -98,12 +133,32 @@ export async function startFakeOpenFgaStatus(
         // TRAILERS-ONLY. `:status` is 200 — the HTTP request succeeded; it is
         // the gRPC status that refuses, which is exactly the trap: nothing at
         // the HTTP layer says anything went wrong.
+        if (reply.via === 'details-bin') {
+          // A REAL TRAILER, not a trailers-only HEADERS frame. Connect reads
+          // `grpc-status-details-bin` off the TRAILER; a trailers-only response
+          // carrying it is rejected as "protocol error: missing status", which
+          // is a different failure and would have made this fixture prove the
+          // wrong thing. Measured, not assumed.
+          stream.respond(
+            { ':status': 200, 'content-type': 'application/grpc' },
+            { waitForTrailers: true },
+          );
+          stream.once('wantTrailers', () => {
+            stream.sendTrailers({
+              'grpc-status-details-bin': encodeStatusDetails(reply.status, reply.message),
+            });
+          });
+          stream.end();
+          return;
+        }
         stream.respond(
           {
             ':status': 200,
             'content-type': 'application/grpc',
             'grpc-status': String(reply.status),
-            ...(reply.message === undefined ? {} : { 'grpc-message': encodeURIComponent(reply.message) }),
+            ...(reply.message === undefined
+              ? {}
+              : { 'grpc-message': encodeURIComponent(reply.message) }),
           },
           { endStream: true },
         );

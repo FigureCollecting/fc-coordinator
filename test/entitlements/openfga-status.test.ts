@@ -155,6 +155,47 @@ describe('an OpenFGA auth status below `forbidden`', () => {
     });
   });
 
+  it.each([
+    ['1004 invalid_claims', 1004],
+    ['1010 bearer_token_missing', 1010],
+  ])('reads %s out of grpc-status-details-bin too, in ONE vocabulary', async (_label, status) => {
+    // THE OTHER WAY A STATUS CAN ARRIVE. Connect PREFERS
+    // `grpc-status-details-bin` over the plain field, and reads the number
+    // straight into `ConnectError.code` rather than mapping it to
+    // `Code.Internal`. So the same refusal reaches this module as a different
+    // shape depending on how the server chose to encode it.
+    //
+    // THE AUDIT FIELD MUST NOT SHOW THAT. `grpc_code` is the TRANSPORT's
+    // vocabulary — the thing a mesh, a proxy or hop telemetry also recorded —
+    // and a line reading `code_1004` puts an OpenFGA number into a field where
+    // every other record holds a gRPC name. One encoding choice by the server
+    // would then split one condition across two values in the field used to
+    // group them. The number belongs in `openfga_code` and only there.
+    fga.script([{ status, via: 'details-bin' }, { allowed: true }]);
+    idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
+
+    const grants = await grantsForSubject(SUB, T0, env());
+
+    // Still the auth class, so it still buys exactly one re-mint.
+    expect(grants).toEqual(['inventory_levels']);
+    expect(entitlementGrantCounters()['reminted']).toBe(1);
+  });
+
+  it('reports the same two fields whichever way the status was encoded', async () => {
+    fga.script([{ status: 1004, via: 'details-bin' }]);
+
+    await grantsForSubject(SUB, T0, env());
+
+    expect(events[0]).toMatchObject({
+      decision: 'error',
+      grpc_code: 'internal',
+      openfga_code: 1004,
+    });
+    // Said explicitly, because this is the regression the note is about: no
+    // `code_1004` leaking into the transport field.
+    expect(events[0]?.grpc_code).not.toMatch(/^code_/);
+  });
+
   it('does not re-mint on the static path — there is nothing to re-mint', async () => {
     fga.script([{ status: 1010 }]);
 

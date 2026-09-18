@@ -112,8 +112,17 @@ export const specifiersIn = (source: string): string[] => [
   ...[...source.matchAll(/\bimport\s+['"]([^'"]+)['"]/g)].map((m) => m[1] as string),
   // import(...) and require(...) — dynamic, deferred, and just as much a
   // dependency. BOTH accept a template literal, which the quote-only version of
-  // this extractor could not see at all.
-  ...[...source.matchAll(/\b(?:import|require)\(\s*([^)]*?)\s*\)/g)].map((m) => {
+  // this extractor could not see at all; and BOTH allow whitespace before the
+  // parenthesis, so `import ('pg')` is legal and was read as nothing.
+  //
+  // THE COST OF THAT `\s*` IS A FALSE POSITIVE IN PROSE, and it is the right
+  // trade. A comment in this directory reading "we import (lazily) at boot" now
+  // produces an unresolvable specifier and fails the build. That is the same
+  // bargain the `from '…'` rule already makes — see the note in grants.ts — and
+  // it is the correct direction for a guard: refusing a sentence costs a
+  // reworded comment, while missing an import costs the property this file
+  // exists to hold.
+  ...[...source.matchAll(/\b(?:import|require)\s*\(\s*([^)]*?)\s*\)/g)].map((m) => {
     const argument = (m[1] ?? '').trim();
     const literal = /^(['"`])([^'"`]*)\1$/.exec(argument);
     const body = literal?.[2];
@@ -160,6 +169,11 @@ describe('the specifier extractor sees every import form', () => {
     // The forms a quote-only extractor missed entirely.
     ['template-literal dynamic', 'const l = await import(`../platform/logger.js`);', '../platform/logger.js'],
     ['template-literal require', 'const m = require(`pg`);', 'pg'],
+    // Whitespace before the parenthesis is legal in both forms and was not
+    // read at all, so `import ('pg')` cleared a guard that exists to see it.
+    ['dynamic with a space before the paren', "const l = await import ('pg');", 'pg'],
+    ['require with a space before the paren', "const m = require ('pg');", 'pg'],
+    ['dynamic with a newline before the paren', "const l = await import\n  ('pg');", 'pg'],
   ])('catches a %s import', (_label, source, expected) => {
     expect(specifiersIn(source)).toContain(expected);
   });

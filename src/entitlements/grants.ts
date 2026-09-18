@@ -598,15 +598,26 @@ async function check(subject: string, env: NodeJS.ProcessEnv, nowMs: number): Pr
       // NEVER THE ERROR OBJECT, and never the message raw either — see
       // safeFailureText. A ConnectError carries response `metadata`, a `cause`
       // holding the underlying socket error, and a message the far side wrote.
+      // ONE VOCABULARY PER FIELD. `grpc_code` is the TRANSPORT's, and Connect
+      // hands the same OpenFGA refusal over in two shapes depending on how the
+      // server encoded it: from the plain `grpc-status` trailer the code is
+      // `Code.Internal`, but from `grpc-status-details-bin` Connect reads the
+      // number straight into `code`, which would put `code_1004` into a field
+      // where every other record holds a gRPC name. One encoding choice by the
+      // server would then split one condition across two values in the field
+      // used to group them. So a non-canonical number is always reported as
+      // the code Connect assigns when it cannot interpret a status —
+      // `internal` — and the number lives in `openfga_code` and nowhere else.
+      const grpcCode = grpcCodeName(openfgaCode === undefined ? code : Code.Internal);
       console.error(
         '[ENTITLEMENT] OpenFGA Check failed — denying:',
-        `grpc=${grpcCodeName(code)}${openfgaCode === undefined ? '' : ` openfga=${String(openfgaCode)}`}`,
+        `grpc=${grpcCode}${openfgaCode === undefined ? '' : ` openfga=${String(openfgaCode)}`}`,
         safeFailureText(connectError.rawMessage, presentedToken),
       );
       return {
         allowed: false,
         errored: true,
-        grpcCode: grpcCodeName(code),
+        grpcCode,
         ...(openfgaCode === undefined ? {} : { openfgaCode }),
       };
     }
@@ -809,11 +820,17 @@ export async function grantsForSubject(
     // counting OpenFGA traffic by it would over-count by exactly the outage
     // they are diagnosing. `bad_subject` already gets this right above.
     //
-    // NOTE TO A FUTURE EDITOR: do not write the word `from` immediately before
-    // a quoted string anywhere in this directory, comments included. The
-    // portability guard's specifier extractor does not strip comments — on
-    // purpose, since a partial guard is worse than none — so it reads that
-    // shape as an import and fails the build. This comment cost one.
+    // NOTE TO A FUTURE EDITOR: anywhere in this directory, comments included,
+    // do not write the word `from` immediately before a quoted string, and do
+    // not write either of the two dynamic-import keywords immediately followed
+    // by an opening parenthesis. The portability guard's specifier extractor
+    // does not strip comments — on purpose, since a partial guard is worse than
+    // none — so it reads those shapes as imports and fails the build.
+    //
+    // Both rules were paid for. The first cost this comment a rewrite; the
+    // second cost it another, on the same day the guard learned that a space
+    // before the parenthesis is legal and that it had been ignoring every such
+    // import since it was written.
     const asked =
       name !== 'unconfigured' &&
       outcome.reason !== 'token_mint_failed' &&

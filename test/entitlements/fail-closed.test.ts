@@ -231,11 +231,25 @@ describe('the Check call site', () => {
     expect(source()).toMatch(/redirect/i);
   });
 
-  it('names no gRPC code in the deny path — the rule is total, not a list', () => {
-    // One code is named in grants.ts, `Unauthenticated`, and it is named in the
-    // RETRY branch rather than the deny branch. Any second name would mean the
-    // catch had started to discriminate, which is where a fail-open lives.
-    const named = [...code().matchAll(/Code\.(\w+)/g)].map((m) => m[1]);
-    expect(named).toEqual(['Unauthenticated']);
+  it('COMPARES against no gRPC code but one — the rule is total, not a list', () => {
+    // THE PROPERTY IS "DOES NOT DISCRIMINATE", so what is counted is
+    // COMPARISONS, not mentions. The first version of this pin counted every
+    // `Code.X` in the file and went red the day one was used as a VALUE rather
+    // than as a branch — reporting a non-canonical OpenFGA status as
+    // `Code.Internal`, which decides nothing. Loosening it to a longer list
+    // would have thrown the property away; narrowing it to comparisons keeps
+    // it exactly.
+    //
+    // One comparison remains, `Unauthenticated`, and it is in the RETRY branch
+    // rather than the deny branch. A second would mean the catch had started to
+    // discriminate, which is where a fail-open lives.
+    const compared = [...code().matchAll(/(?:[=!]==\s*Code\.(\w+))|(?:Code\.(\w+)\s*[=!]==)/g)].map(
+      (m) => m[1] ?? m[2],
+    );
+    expect(compared).toEqual(['Unauthenticated']);
+
+    // And the deny path still returns without consulting any of them: the only
+    // other thing that branches is OpenFGA's own number, against a RANGE.
+    expect(code()).toMatch(/openfgaCode >= OPENFGA_AUTH_MIN && openfgaCode < OPENFGA_FORBIDDEN/);
   });
 });
