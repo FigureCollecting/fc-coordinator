@@ -44,6 +44,8 @@
 // instead of a note in a runbook. See test/connect/prefix.test.ts.
 // ============================================================================
 
+import { resolveIdpPath, type IdpPath } from '../entitlements/index.js';
+
 export type Env = Record<string, string | undefined>;
 
 /** Asymmetric signature algorithms only. No HS*, no `none`, ever. */
@@ -54,12 +56,16 @@ const SUPPORTED_ALGORITHMS = new Set([
   'EdDSA', 'Ed25519',
 ]);
 
-const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
-
 export interface AuthConfig {
   issuer: string;
   audience: string;
   jwksUri: URL;
+  /**
+   * HOW that URI is reached: public https, the in-cluster mirror, or loopback
+   * — and the headers the fetch must carry, which are not empty on the mirror.
+   * `jwksUri` stays the dial target; this is everything else about the hop.
+   */
+  jwksPath: IdpPath;
   /** Scheme + host + port, exactly. The left-hand side of every `htu` check. */
   origin: string;
   oidcAlgorithms: string[];
@@ -173,10 +179,15 @@ export function resolveAuthConfig(env: Env = process.env): AuthConfig {
     throw new Error(`OIDC_JWKS_URI must be an absolute URL, got '${jwksRaw}'`);
   }
   // HTTPS, except to loopback — which is how a local test issuer is reached and
-  // is not a network hop anyone can sit on.
-  if (jwksUri.protocol !== 'https:' && !LOOPBACK.has(jwksUri.hostname)) {
-    throw new Error(`OIDC_JWKS_URI must use https (got '${jwksUri.protocol}') unless it is loopback`);
-  }
+  // is not a network hop anyone can sit on — and except to the in-cluster
+  // Authentik mirror, where the hop inside the pod is cleartext BY DESIGN and
+  // the Linkerd proxy is what puts mTLS on the wire. That third case is the
+  // only relaxation, it makes IDP_PUBLIC_HOST mandatory, and the https refusal
+  // for every other host is unchanged to the byte. The whole argument, and the
+  // same rule applied to the token endpoint, is in entitlements/idpEndpoint.ts.
+  const resolved = resolveIdpPath(jwksUri, { key: 'OIDC_JWKS_URI', env: env as NodeJS.ProcessEnv });
+  if (!resolved.ok) throw new Error(resolved.reason);
+  const jwksPath = resolved.path;
 
   const originRaw = required(env, 'COORDINATOR_PUBLIC_ORIGIN');
   let origin: URL;
@@ -198,6 +209,7 @@ export function resolveAuthConfig(env: Env = process.env): AuthConfig {
     issuer,
     audience,
     jwksUri,
+    jwksPath,
     origin: origin.origin,
     oidcAlgorithms: algorithms(env, 'OIDC_ALGORITHMS', 'RS256,ES256,PS256'),
     dpopAlgorithms: algorithms(env, 'DPOP_ALGORITHMS', 'ES256,ES384,PS256,RS256'),

@@ -74,6 +74,7 @@
  * still copies whole. See ./index.ts.
  */
 import axios from 'axios';
+import { resolveIdpPath, type IdpPathResult } from './idpEndpoint.js';
 
 /** Which credential this process will present. */
 export type OpenFgaAuthMode = 'oidc' | 'static' | 'none';
@@ -87,13 +88,6 @@ const MIN_REFRESH_FRACTION = 0.5;
 /** A blocking hop inside a user-facing read, like the Check itself. */
 const DEFAULT_MINT_TIMEOUT_MS = 5_000;
 const DEFAULT_SCOPE = 'openid';
-
-/**
- * Loopback is the one place plaintext is acceptable, because it is not a hop
- * anyone can sit on. Exactly the exemption src/auth/config.ts makes for
- * OIDC_JWKS_URI, and exactly the set it uses.
- */
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
 
 const OIDC_KEYS = [
   'OPENFGA_OIDC_TOKEN_ENDPOINT',
@@ -289,7 +283,7 @@ export function describeOpenFgaAuth(env: NodeJS.ProcessEnv): string {
     const rawEndpoint = trimmed(env.OPENFGA_OIDC_TOKEN_ENDPOINT);
     const endpoint = rawEndpoint || '(unset)';
     const clientId = trimmed(env.OPENFGA_OIDC_CLIENT_ID) || '(unset)';
-    const rejected = missing.length === 0 ? rejectEndpoint(endpoint) : null;
+    const resolved = missing.length === 0 ? idpPathFor(endpoint, env) : null;
     // The RAW value is what gets validated; the PRINTABLE one is what gets
     // shown. The branch is on emptiness rather than on the placeholder's text,
     // so an endpoint literally configured as `(unset)` is still put through the
@@ -298,8 +292,8 @@ export function describeOpenFgaAuth(env: NodeJS.ProcessEnv): string {
     const state =
       missing.length > 0
         ? `INCOMPLETE, missing ${missing.join(', ')}`
-        : rejected !== null
-          ? `REFUSED — ${rejected}`
+        : resolved !== null && !resolved.ok
+          ? `REFUSED — ${resolved.reason}`
           : 'complete';
     return `oidc client_credentials (${state}; token_endpoint=${shownEndpoint}, client_id=${clientId})`;
   }
@@ -329,6 +323,28 @@ export function initOpenFgaAuth(env: NodeJS.ProcessEnv = process.env): OpenFgaAu
     if (described.includes('REFUSED') || described.includes('INCOMPLETE')) console.error(line);
     else if (mode === 'none') console.warn(line);
     else console.log(line);
+
+    // A SECOND LINE, FOR THE PATH RATHER THAN THE CREDENTIAL, on the same
+    // principle that separates this boot line from initOpenFgaTransport's: one
+    // says WHICH credential, one says WHICH wire carries it, and an operator
+    // diagnosing a redacted read needs both. After R7 there are two wires the
+    // mint can travel and they fail differently — the public one fails as a
+    // timeout, the mirror fails as tokens OpenFGA refuses — so "which one am I
+    // on, and what authority am I presenting" has to be readable without
+    // decoding a token.
+    //
+    // ONLY WHEN THE PROVIDER IS USABLE. A half-configured provider mints
+    // nothing, so a line describing the path it would have taken is a healthy
+    // line about a broken state — and the rule that an unusable provider never
+    // logs at `log` level is already asserted in openfga-token.test.ts.
+    if (mode === 'oidc' && !described.includes('REFUSED') && !described.includes('INCOMPLETE')) {
+      const path = idpPathFor(trimmed(env.OPENFGA_OIDC_TOKEN_ENDPOINT), env);
+      // The false arm is unreachable and is the one uncovered branch in this
+      // file: `described` is built from the SAME call, so a path that fails
+      // here would already have made the line above say REFUSED. It is a type
+      // narrowing on a union, not a second opinion.
+      if (path.ok) console.log(`[ENTITLEMENT] idp: ${path.path.description}`);
+    }
   }
   return mode;
 }
@@ -405,7 +421,8 @@ function printableEndpoint(raw: string): string {
 }
 
 /**
- * Is this an endpoint the service account's password may be sent to?
+ * Is this an endpoint the service account's password may be sent to, and HOW
+ * must it be reached?
  *
  * WHY THE RULE IS HERE AT ALL. `resolveAuthConfig` already refuses a non-https
  * `OIDC_JWKS_URI` and explains why every variable there has no safe default.
@@ -415,14 +432,21 @@ function printableEndpoint(raw: string): string {
  * the wire, and it was previously accepted in silence: no warning, no boot
  * line, nothing.
  *
- * NO OPT-OUT VARIABLE, deliberately. The loopback exemption is enough for a
- * local issuer and for every fixture in the suite, and a flag whose whole
- * purpose is to disable a transport requirement is a flag that eventually gets
- * set in production by someone in a hurry.
+ * THE RULE ITSELF NOW LIVES IN ./idpEndpoint.ts, because it governs two
+ * settings and used to be written twice. R7 relaxes it for exactly one host
+ * shape — the in-cluster Authentik mirror, where the hop is cleartext inside
+ * the pod and the mesh proxy carries the mTLS — and a relaxation applied to a
+ * duplicated rule is a relaxation applied to whichever copy someone remembered.
+ * The https refusal for every other host is unchanged to the byte, including
+ * this file's suffix explaining why the rule is stricter here.
  *
- * Returns null when the endpoint is acceptable, or the reason it is not.
+ * NO OPT-OUT VARIABLE, still, and that is why the mesh suffix is a constant
+ * rather than a setting: a flag whose whole purpose is to disable a transport
+ * requirement is a flag that eventually gets set in production by someone in a
+ * hurry, and a configurable "which domain counts as in-cluster" is that flag
+ * wearing a DNS name.
  */
-function rejectEndpoint(raw: string): string | null {
+function idpPathFor(raw: string, env: NodeJS.ProcessEnv): IdpPathResult {
   let url: URL;
   try {
     url = new URL(raw);
@@ -431,16 +455,26 @@ function rejectEndpoint(raw: string): string | null {
     // auth/config.ts. That one is about OIDC_JWKS_URI, which carries public
     // keys; this one is about the endpoint the service account's password is
     // posted to, and a URL may carry a second credential inside it.
-    return `OPENFGA_OIDC_TOKEN_ENDPOINT must be an absolute URL, got ${printableEndpoint(raw)}`;
+    return {
+      ok: false,
+      reason: `OPENFGA_OIDC_TOKEN_ENDPOINT must be an absolute URL, got ${printableEndpoint(raw)}`,
+    };
   }
-  if (url.protocol !== 'https:' && !LOOPBACK_HOSTS.has(url.hostname)) {
-    return `OPENFGA_OIDC_TOKEN_ENDPOINT must use https (got '${url.protocol}') unless it is loopback — the service account's password is sent to it`;
-  }
-  return null;
+  return resolveIdpPath(url, {
+    key: 'OPENFGA_OIDC_TOKEN_ENDPOINT',
+    env,
+    refusalSuffix: " — the service account's password is sent to it",
+  });
 }
 
 interface OidcConfig {
   endpoint: string;
+  /**
+   * Sent with the mint. Empty on the public path; on the mirror it carries
+   * `Host` and `X-Forwarded-Proto`, which is what makes Authentik mint a token
+   * whose `iss` is the PUBLIC issuer rather than the mirror's own name.
+   */
+  headers: Readonly<Record<string, string>>;
   clientId: string;
   username: string;
   password: string;
@@ -463,17 +497,18 @@ function oidcConfig(env: NodeJS.ProcessEnv): OidcConfig | null {
     return null;
   }
   const endpoint = trimmed(env.OPENFGA_OIDC_TOKEN_ENDPOINT);
-  const rejected = rejectEndpoint(endpoint);
-  if (rejected !== null) {
+  const path = idpPathFor(endpoint, env);
+  if (!path.ok) {
     if (!warnedEndpoint) {
       warnedEndpoint = true;
-      console.error(`[ENTITLEMENT] REFUSED to mint an OpenFGA token: ${rejected}. Every entitlement check denies and spine reads come back redacted until this is corrected.`);
+      console.error(`[ENTITLEMENT] REFUSED to mint an OpenFGA token: ${path.reason}. Every entitlement check denies and spine reads come back redacted until this is corrected.`);
     }
     return null;
   }
 
   return {
     endpoint,
+    headers: path.path.headers,
     clientId: trimmed(env.OPENFGA_OIDC_CLIENT_ID),
     username: trimmed(env.OPENFGA_OIDC_USERNAME),
     // NOT trimmed: a password's surrounding whitespace is part of it.
@@ -529,7 +564,11 @@ async function mint(config: OidcConfig, nowMs: number, reason: MintReason): Prom
       // the default validateStatus then rejects, so a redirect lands in the
       // catch below and fails the mint closed like any other bad answer.
       maxRedirects: 0,
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      // The path's headers, never assembled here. On the public hop there are
+      // none and this is the same request it always was; on the mirror they are
+      // `Host` and `X-Forwarded-Proto`, and without them Authentik mints an
+      // issuer naming the in-cluster Service that OpenFGA refuses silently.
+      headers: { 'content-type': 'application/x-www-form-urlencoded', ...config.headers },
     });
     const data: unknown = response.data;
     if (typeof data !== 'object' || data === null || Array.isArray(data)) {

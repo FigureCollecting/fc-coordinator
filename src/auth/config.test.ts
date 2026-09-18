@@ -135,3 +135,60 @@ describe('resolveAuthConfig', () => {
     );
   });
 });
+
+// ===========================================================================
+// THE IdP MESH PATH (R7). The JWKS fetch may move onto the in-cluster Authentik
+// mirror, where the hop inside the pod is cleartext and the Linkerd proxy
+// supplies mTLS on the wire. The https rule above is relaxed for THAT host
+// shape and nothing else, and relaxing it makes a second setting mandatory —
+// see src/entitlements/idpEndpoint.ts and test/entitlements/idp-path.test.ts
+// for the rule and its whole argument.
+// ===========================================================================
+describe('resolveAuthConfig and the in-cluster IdP mirror', () => {
+  const MIRROR = 'http://authentik-mc-fc-ha.authz.svc.cluster.local:9000/application/o/fc-coordinator/jwks/';
+  const PUBLIC_HOST = 'auth.mindsignals1.com';
+
+  it('accepts cleartext to the mesh mirror when the public host is named', () => {
+    const config = resolveAuthConfig({
+      ...COMPLETE,
+      OIDC_JWKS_URI: MIRROR,
+      IDP_PUBLIC_HOST: PUBLIC_HOST,
+    });
+    expect(config.jwksUri.href).toBe(MIRROR);
+    expect(config.jwksPath.kind).toBe('mesh');
+    expect(config.jwksPath.headers).toEqual({ host: PUBLIC_HOST, 'x-forwarded-proto': 'https' });
+  });
+
+  it('REFUSES the mirror when IDP_PUBLIC_HOST is unset', () => {
+    expect(() => resolveAuthConfig({ ...COMPLETE, OIDC_JWKS_URI: MIRROR })).toThrow(
+      /IDP_PUBLIC_HOST/,
+    );
+  });
+
+  it('REFUSES the mirror when IDP_PUBLIC_HOST is not a bare authority', () => {
+    for (const bad of ['https://auth.mindsignals1.com', 'auth.mindsignals1.com/o', ' ']) {
+      expect(() =>
+        resolveAuthConfig({ ...COMPLETE, OIDC_JWKS_URI: MIRROR, IDP_PUBLIC_HOST: bad }),
+      ).toThrow(/IDP_PUBLIC_HOST/);
+    }
+  });
+
+  it('still refuses plain http to a PUBLIC host, with the message it always had', () => {
+    // The rule that is NOT being relaxed, pinned against its own message so a
+    // future edit that widens it has to change this line to do so.
+    expect(() =>
+      resolveAuthConfig({
+        ...COMPLETE,
+        OIDC_JWKS_URI: 'http://auth.example.com/jwks',
+        IDP_PUBLIC_HOST: PUBLIC_HOST,
+      }),
+    ).toThrow("OIDC_JWKS_URI must use https (got 'http:') unless it is loopback");
+  });
+
+  it('leaves the public https path with no headers and says so in one line', () => {
+    const config = resolveAuthConfig(COMPLETE);
+    expect(config.jwksPath.kind).toBe('public');
+    expect(config.jwksPath.headers).toEqual({});
+    expect(config.jwksPath.description).toBe('public https auth.figurecollecting.com');
+  });
+});

@@ -19,7 +19,16 @@
 // Authentik does issue it, binding.ts prefers it with no flag day and no
 // re-enrolment.
 // ============================================================================
-import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from 'jose';
+import * as http from 'node:http';
+import * as https from 'node:https';
+import {
+  createRemoteJWKSet,
+  customFetch,
+  jwtVerify,
+  type FetchImplementation,
+  type JWTVerifyGetKey,
+  type RemoteJWKSet,
+} from 'jose';
 
 /** RFC 4122 shape, version-agnostic: a v7 uuid from a future Authentik must pass. */
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -59,18 +68,108 @@ export interface RemoteJwksOptions {
   /** Minimum gap between refetches triggered by an unknown kid. */
   cooldownMs?: number;
   timeoutMs?: number;
+  /**
+   * Sent with every JWKS fetch. Normally empty; on the in-cluster Authentik
+   * mirror it carries the PUBLIC authority, because the identity provider
+   * derives the issuer it advertises from the request. Produced by
+   * `resolveIdpPath` — never assembled here.
+   */
+  headers?: Readonly<Record<string, string>>;
+}
+
+/**
+ * NODE'S FETCH SILENTLY DROPS A `Host` HEADER, which is the whole reason this
+ * function exists. `host` is a forbidden header name in the Fetch standard, so
+ * undici — which is what jose fetches through, including via jose's own
+ * `headers` option — removes it without erroring. Measured against a real
+ * socket on this Node before anything was written:
+ *
+ *   global fetch   host: 127.0.0.1:45207   x-forwarded-proto: https
+ *   jose headers   host: 127.0.0.1:45207   x-forwarded-proto: https
+ *   node:http      host: auth.example.com  x-forwarded-proto: https
+ *
+ * `X-Forwarded-Proto` gets through and `Host` does not, so the option alone
+ * would produce a fetch that looks configured and mints the wrong issuer.
+ *
+ * WHAT THIS REPLACES, AND WHAT IT DOES NOT. Only the TRANSPORT. jose's
+ * `[customFetch]` seam is called at exactly the points jose decides to fetch,
+ * so the cache age, the unknown-kid cooldown, the rotation refetch, the
+ * single-flight and the timeout all stay inside jose and are unchanged — the
+ * alternative the brief offered, fetching the set ourselves and handing it to
+ * `createLocalJWKSet`, would have moved every one of those into this file.
+ * Pinned by the four cases in oidc.test.ts that exercise them THROUGH this
+ * substitution.
+ *
+ * `redirect: 'manual'` is honoured by not following one: node:http does not
+ * follow redirects, and a 3xx therefore arrives as a non-200 that jose
+ * rejects. That matters more here than anywhere else in the service — the JWKS
+ * is the set of keys every access token is verified against, so a followed
+ * redirect is a key-substitution primitive.
+ */
+function meshFetch(headers: Readonly<Record<string, string>>): FetchImplementation {
+  return async (url, options) => {
+    const target = new URL(url);
+    const client = target.protocol === 'https:' ? https : http;
+    // jose's own headers first (accept, user-agent), then ours — so the
+    // authority this hop must present cannot be overwritten by a default.
+    const merged: Record<string, string> = {};
+    for (const [name, value] of options.headers) merged[name] = value;
+    for (const [name, value] of Object.entries(headers)) merged[name] = value;
+
+    return await new Promise<Response>((resolve, reject) => {
+      const request = client.request(
+        target,
+        { method: options.method, headers: merged, signal: options.signal },
+        (response) => {
+          const chunks: Buffer[] = [];
+          response.on('data', (chunk: Buffer) => chunks.push(chunk));
+          response.on('error', reject);
+          response.on('end', () => {
+            // A Response carries `status` and `json()`, which is all jose uses,
+            // and rebuilding it here keeps the contract jose declares rather
+            // than a duck-typed stand-in that drifts from it.
+            resolve(
+              new Response(Buffer.concat(chunks), {
+                // `?? 502` is the ONE branch in this function no test reaches,
+                // and it is disclosed rather than chased: node always sets a
+                // status on a response it delivered, but the type allows
+                // `undefined` because IncomingMessage is shared with the
+                // request side. Deleting the fallback to make a number go up
+                // would trade a compile-time guarantee for a coverage line.
+                status: response.statusCode ?? 502,
+                headers: { 'content-type': response.headers['content-type'] ?? 'application/json' },
+              }),
+            );
+          });
+        },
+      );
+      request.on('error', reject);
+      request.end();
+    });
+  };
 }
 
 /**
  * The production key resolver. jose refetches on an unknown `kid` (rate-limited
  * by the cooldown), so ROTATION needs no restart and no configuration: publish
  * the new key in Authentik, and the first token signed with it pulls the set.
+ *
+ * Returns jose's `RemoteJWKSet`, which is a `JWTVerifyGetKey` and also carries
+ * `reload`, `fresh` and `coolingDown` — the state a test has to read to prove
+ * the cache still behaves through the transport substitution below.
  */
-export function createRemoteJwks(url: URL, options: RemoteJwksOptions = {}): JWTVerifyGetKey {
+export function createRemoteJwks(url: URL, options: RemoteJwksOptions = {}): RemoteJWKSet {
+  const headers = options.headers ?? {};
+  // The substitution is installed ONLY when a `host` is asked for. Every other
+  // deployment keeps jose's own fetch, byte for byte, so the public path is not
+  // quietly moved onto a transport this repo maintains.
+  const transport = headers['host'] === undefined ? {} : { [customFetch]: meshFetch(headers) };
   return createRemoteJWKSet(url, {
     cacheMaxAge: options.cacheMaxAgeMs ?? 600_000,
     cooldownDuration: options.cooldownMs ?? 30_000,
     timeoutDuration: options.timeoutMs ?? 5_000,
+    headers,
+    ...transport,
   });
 }
 

@@ -364,12 +364,18 @@ describe('the boot line', () => {
       OPENFGA_OIDC_PASSWORD: PASSWORD,
     }) as NodeJS.ProcessEnv;
 
-  it('names the active path ONCE, not once per call', () => {
+  it('names the active credential AND its network path, ONCE, not once per call', () => {
+    // TWO LINES SINCE R7, AND THE CLAIM HERE IS STILL IDEMPOTENCE. The second
+    // says WHICH WIRE the mint travels, on the same principle that keeps
+    // initOpenFgaTransport's line separate from this one: a redacted read can
+    // be a wrong credential or a wrong path, they fail differently, and an
+    // operator needs to read both without decoding a token.
     expect(initOpenFgaAuth(oidcEnv())).toBe('oidc');
     initOpenFgaAuth(oidcEnv());
 
-    expect(logs).toHaveLength(1);
+    expect(logs).toHaveLength(2);
     expect(String(logs[0]?.[0])).toContain('oidc');
+    expect(String(logs[1]?.[0])).toContain('idp: loopback');
   });
 
   it('WARNS rather than logs when there is no credential, because that state denies everything', () => {
@@ -916,5 +922,60 @@ describe('the mint counters say WHY, not just how many', () => {
   it('clears the reasons with the rest of the state, so one test cannot read another', () => {
     resetOpenFgaTokenForTest();
     expect(openFgaTokenCounters()).toEqual({});
+  });
+});
+
+// ===========================================================================
+// THE BOOT LINE NAMES THE NETWORK PATH (R7)
+//
+// Two wires can now carry the mint and they fail differently: the public one
+// fails as a timeout or a TLS error, the mirror fails as tokens OpenFGA
+// refuses for their issuer. "Which one am I on, and what authority am I
+// presenting" therefore has to be readable off the log, because the failure it
+// distinguishes is otherwise indistinguishable from a revoked grant.
+// ===========================================================================
+describe('the boot line names the IdP path', () => {
+  const pathEnv = (endpoint: string, publicHost?: string): NodeJS.ProcessEnv =>
+    ({
+      OPENFGA_OIDC_TOKEN_ENDPOINT: endpoint,
+      OPENFGA_OIDC_CLIENT_ID: 'openfga',
+      OPENFGA_OIDC_USERNAME: USERNAME,
+      OPENFGA_OIDC_PASSWORD: PASSWORD,
+      ...(publicHost === undefined ? {} : { IDP_PUBLIC_HOST: publicHost }),
+    }) as NodeJS.ProcessEnv;
+
+  it('names the mesh mirror AND the authority it presents', () => {
+    initOpenFgaAuth(
+      pathEnv(
+        'http://authentik-mc-fc-ha.authz.svc.cluster.local:9000/application/o/token/',
+        'auth.mindsignals1.com',
+      ),
+    );
+    expect(String(logs[1]?.[0])).toBe(
+      '[ENTITLEMENT] idp: mesh mirror authentik-mc-fc-ha.authz.svc.cluster.local:9000 presenting Host auth.mindsignals1.com',
+    );
+  });
+
+  it('names the public path when that is what is configured', () => {
+    initOpenFgaAuth(pathEnv('https://auth.mindsignals1.com/application/o/token/'));
+    expect(String(logs[1]?.[0])).toBe('[ENTITLEMENT] idp: public https auth.mindsignals1.com');
+  });
+
+  it('says nothing about a path the provider cannot use', () => {
+    // A REFUSED endpoint already gets an error line naming the reason. A second
+    // line describing the wire it would have taken would read as progress.
+    initOpenFgaAuth(pathEnv('http://auth.example.com/application/o/token/'));
+    expect(logs).toHaveLength(0);
+    expect(String(errors[0]?.[0])).toContain('REFUSED');
+  });
+
+  it('REFUSES the mirror with no public host, at error level, before a token is asked for', () => {
+    expect(
+      initOpenFgaAuth(
+        pathEnv('http://authentik-mc-fc-ha.authz.svc.cluster.local:9000/application/o/token/'),
+      ),
+    ).toBe('oidc');
+    expect(logs).toHaveLength(0);
+    expect(String(errors[0]?.[0])).toContain('IDP_PUBLIC_HOST');
   });
 });
