@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { SignJWT, exportJWK, generateKeyPair, type JSONWebKeySet } from 'jose';
-import { createAccessTokenVerifier, createRemoteJwks } from './oidc.js';
+import * as http from 'node:http';
+import { createAccessTokenVerifier, createJwksFor, createRemoteJwks } from './oidc.js';
+import { resolveIdpPath } from '../entitlements/index.js';
 import { TEST_AUDIENCE, TEST_ISSUER, makeIssuer, serveJwks } from '../../test/helpers/auth.js';
+import { startFakeAuthentik } from '../../test/helpers/fakeAuthentik.js';
+import Fastify from 'fastify';
 
 const SUBJECT = '0d1b1a3e-9f2c-4f63-8a11-2f9a5d6c7e80';
 
@@ -219,5 +223,225 @@ describe('createRemoteJwks', () => {
       algorithms: ['RS256'],
     });
     expect((await verify(await issuer.mint({ sub: SUBJECT }))).ok).toBe(false);
+  });
+});
+
+// ===========================================================================
+// THE JWKS FETCH THROUGH THE IN-CLUSTER MIRROR (R7).
+//
+// MEASURED, NOT ASSUMED: Node's global fetch — which is what jose uses, and
+// what jose's own `headers` option feeds — SILENTLY DROPS a `Host` header,
+// because `host` is a forbidden header name in the Fetch standard. A probe
+// against a real socket on this Node:
+//
+//   global fetch   host: 127.0.0.1:45207   x-forwarded-proto: https
+//   jose headers   host: 127.0.0.1:45207   x-forwarded-proto: https
+//   node:http      host: auth.example.com  x-forwarded-proto: https
+//
+// So `headers` alone gets X-Forwarded-Proto through and loses the one header
+// that decides the issuer. createRemoteJwks therefore installs jose's
+// `[customFetch]` over node:http when a host header is asked for — which
+// replaces the TRANSPORT only: the cache age, the unknown-kid cooldown, the
+// refetch and the timeout all stay inside jose, and the cases below prove they
+// still work through the substitution.
+// ===========================================================================
+describe('createRemoteJwks presenting a public authority', () => {
+  it('sends the Host header the mesh path requires', async () => {
+    const idp = await startFakeAuthentik();
+    closers.push(idp.close);
+
+    const jwks = createRemoteJwks(new URL(idp.jwksUri), {
+      headers: { host: 'auth.mindsignals1.com', 'x-forwarded-proto': 'https' },
+    });
+    await jwks({ alg: 'RS256', kid: 'authentik-kid-1' }).catch(() => undefined);
+
+    expect(idp.jwksCalls).toHaveLength(1);
+    expect(idp.jwksCalls[0]?.host).toBe('auth.mindsignals1.com');
+    expect(idp.jwksCalls[0]?.forwardedProto).toBe('https');
+  });
+
+  it('sends the dial address as Host when no public authority is configured', async () => {
+    // The unchanged path, asserted so "we always rewrite Host" cannot creep in.
+    const idp = await startFakeAuthentik();
+    closers.push(idp.close);
+
+    const jwks = createRemoteJwks(new URL(idp.jwksUri));
+    await jwks({ alg: 'RS256', kid: 'authentik-kid-1' }).catch(() => undefined);
+
+    expect(idp.jwksCalls[0]?.host).toBe(new URL(idp.jwksUri).host);
+    expect(idp.jwksCalls[0]?.forwardedProto).toBeUndefined();
+  });
+
+  it("keeps jose's cache: two verifications, one fetch", async () => {
+    const idp = await startFakeAuthentik();
+    closers.push(idp.close);
+
+    const jwks = createRemoteJwks(new URL(idp.jwksUri), {
+      headers: { host: 'auth.mindsignals1.com', 'x-forwarded-proto': 'https' },
+    });
+    await jwks({ alg: 'RS256', kid: 'authentik-kid-1' }).catch(() => undefined);
+    await jwks({ alg: 'RS256', kid: 'authentik-kid-1' }).catch(() => undefined);
+
+    expect(idp.jwksCalls).toHaveLength(1);
+  });
+
+  it("keeps jose's rotation refetch: an unknown kid pulls the set again", async () => {
+    const idp = await startFakeAuthentik();
+    closers.push(idp.close);
+
+    const jwks = createRemoteJwks(new URL(idp.jwksUri), {
+      headers: { host: 'auth.mindsignals1.com' },
+      cooldownMs: 0,
+      cacheMaxAgeMs: 60_000,
+    });
+    await jwks({ alg: 'RS256', kid: 'authentik-kid-1' }).catch(() => undefined);
+    await jwks({ alg: 'RS256', kid: 'never-issued' }).catch(() => undefined);
+
+    expect(idp.jwksCalls.length).toBeGreaterThan(1);
+  });
+
+  it('still fails closed when the endpoint is unreachable, timeout intact', async () => {
+    const jwks = createRemoteJwks(new URL('http://127.0.0.1:1/jwks'), {
+      headers: { host: 'auth.mindsignals1.com' },
+      timeoutMs: 500,
+    });
+    await expect(jwks({ alg: 'RS256', kid: 'kid-1' })).rejects.toBeInstanceOf(Error);
+  });
+
+  it('still fails closed on a non-200 answer', async () => {
+    const app = Fastify({ logger: false });
+    app.get('/jwks', async (_req, reply) => reply.code(503).send('nope'));
+    await app.listen({ port: 0, host: '127.0.0.1' });
+    closers.push(() => app.close());
+    const port = (app.addresses()[0] as { port: number }).port;
+
+    const jwks = createRemoteJwks(new URL(`http://127.0.0.1:${port}/jwks`), {
+      headers: { host: 'auth.mindsignals1.com' },
+      timeoutMs: 2_000,
+    });
+    await expect(jwks({ alg: 'RS256', kid: 'kid-1' })).rejects.toBeInstanceOf(Error);
+  });
+
+  it('speaks TLS when the URL says https, proving the client is chosen by scheme', async () => {
+    // A CLEARTEXT server on the other end, dialled with an `https:` URL. An
+    // http client would read a 200 and this case would pass vacuously; a TLS
+    // client cannot complete a handshake against a plain HTTP server and
+    // fails. So a rejection here is evidence that the https arm selected
+    // node:https, which pointing at a closed port could never be.
+    const idp = await startFakeAuthentik();
+    closers.push(idp.close);
+    const port = new URL(idp.jwksUri).port;
+
+    const jwks = createRemoteJwks(
+      new URL(`https://127.0.0.1:${port}/application/o/fc-coordinator/jwks/`),
+      { headers: { host: 'auth.mindsignals1.com' }, timeoutMs: 2_000 },
+    );
+    await expect(jwks({ alg: 'RS256', kid: 'authentik-kid-1' })).rejects.toBeInstanceOf(Error);
+    // And the cleartext server never saw a readable request.
+    expect(idp.jwksCalls).toHaveLength(0);
+  });
+
+  it('never follows a redirect, so a 302 cannot move the trusted key set', async () => {
+    // The JWKS is the set of keys every access token is verified against. A
+    // redirect here is a key-substitution primitive, and jose asks for
+    // `redirect: 'manual'` precisely so it cannot be followed — a replacement
+    // transport that quietly follows one would give that away without changing
+    // a line of jose's own code.
+    const app = Fastify({ logger: false });
+    app.get('/jwks', async (_req, reply) => reply.code(302).header('location', 'https://evil.example/jwks').send());
+    await app.listen({ port: 0, host: '127.0.0.1' });
+    closers.push(() => app.close());
+    const port = (app.addresses()[0] as { port: number }).port;
+
+    const jwks = createRemoteJwks(new URL(`http://127.0.0.1:${port}/jwks`), {
+      headers: { host: 'auth.mindsignals1.com' },
+      timeoutMs: 2_000,
+    });
+    await expect(jwks({ alg: 'RS256', kid: 'kid-1' })).rejects.toBeInstanceOf(Error);
+  });
+});
+
+// ===========================================================================
+// HARDENING FROM THE ADVERSARIAL REVIEW OF PR #10
+// ===========================================================================
+describe('the JWKS transport after review', () => {
+  it('honours a capital-H Host, rather than silently reverting to undici', async () => {
+    // `resolveIdpPath` always lower-cases, so production was safe — but this
+    // function is exported with an unconstrained `headers` option, and a
+    // caller who spells the header the way HTTP prints it got the exact
+    // failure this unit exists to prevent: configured-looking, silent, wrong
+    // authority. Measured on a raw socket before the fix.
+    const idp = await startFakeAuthentik();
+    closers.push(idp.close);
+
+    const jwks = createRemoteJwks(new URL(idp.jwksUri), {
+      headers: { Host: 'auth.mindsignals1.com', 'X-Forwarded-Proto': 'https' },
+    });
+    await jwks({ alg: 'RS256', kid: 'authentik-kid-1' }).catch(() => undefined);
+
+    expect(idp.jwksCalls[0]?.host).toBe('auth.mindsignals1.com');
+    expect(idp.jwksCalls[0]?.forwardedProto).toBe('https');
+  });
+
+  it('surfaces a timeout as jose’s own JWKSTimeout, not a bare AbortError', async () => {
+    // jose maps a timeout BY NAME (`err.name === 'TimeoutError'`), and node's
+    // abort surfaces as `AbortError` with the TimeoutError demoted to `cause`.
+    // Nothing observable changes today, because `classify` flattens everything
+    // that is not an expiry or a claim mismatch — it would matter the moment
+    // anyone improves that classifier, and a replacement transport should not
+    // quietly change the error taxonomy of the thing it replaces.
+    const server = http.createServer(() => {
+      /* accept the connection and never answer */
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    closers.push(() => new Promise<void>((resolve) => { server.close(() => resolve()); }));
+    const port = (server.address() as { port: number }).port;
+
+    const jwks = createRemoteJwks(new URL(`http://127.0.0.1:${port}/jwks`), {
+      headers: { host: 'auth.mindsignals1.com' },
+      timeoutMs: 300,
+    });
+    await expect(jwks({ alg: 'RS256', kid: 'kid-1' })).rejects.toMatchObject({
+      code: 'ERR_JWKS_TIMEOUT',
+    });
+  });
+});
+
+describe('createJwksFor is the wiring, so the wiring is tested', () => {
+  it('sends the path’s headers — the one expression production depends on', async () => {
+    // src/server.ts is excluded from the coverage gate, so the connection
+    // between the resolved path and the running client used to be a line no
+    // test could see: deleting the headers there left the whole suite green.
+    // The expression lives here now, and both server.ts and the end-to-end
+    // test call THIS.
+    const idp = await startFakeAuthentik();
+    closers.push(idp.close);
+
+    const path = resolveIdpPath(new URL(idp.jwksUri), {
+      key: 'OIDC_JWKS_URI',
+      env: { IDP_PUBLIC_HOST: 'auth.mindsignals1.com' } as NodeJS.ProcessEnv,
+    });
+    if (!path.ok) throw new Error(path.reason);
+
+    const jwks = createJwksFor(path.path);
+    await jwks({ alg: 'RS256', kid: 'authentik-kid-1' }).catch(() => undefined);
+
+    expect(idp.jwksCalls[0]?.host).toBe('auth.mindsignals1.com');
+  });
+
+  it('adds nothing on the public path', async () => {
+    const idp = await startFakeAuthentik();
+    closers.push(idp.close);
+
+    const path = resolveIdpPath(new URL(idp.jwksUri), {
+      key: 'OIDC_JWKS_URI',
+      env: {} as NodeJS.ProcessEnv,
+    });
+    if (!path.ok) throw new Error(path.reason);
+
+    const jwks = createJwksFor(path.path);
+    await jwks({ alg: 'RS256', kid: 'authentik-kid-1' }).catch(() => undefined);
+
+    expect(idp.jwksCalls[0]?.host).toBe(new URL(idp.jwksUri).host);
   });
 });

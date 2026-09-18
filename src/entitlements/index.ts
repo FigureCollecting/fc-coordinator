@@ -67,6 +67,26 @@ export {
 
 export { isEntitlementSubject, ENTITLEMENT_SUBJECT_PATTERN } from './subject.js';
 
+/**
+ * THE IdP TRANSPORT RULE, exported because it governs TWO settings and the
+ * second one belongs to the host: `OPENFGA_OIDC_TOKEN_ENDPOINT` here and
+ * `OIDC_JWKS_URI` in the application's own auth configuration. Reaching into
+ * ./idpEndpoint.js past this barrel would make it an internal with an outside
+ * consumer, which is the arrangement this file exists to prevent.
+ */
+export {
+  resolveIdpPath,
+  idpPathsDisagree,
+  MESH_HOST_SUFFIX,
+  IDP_PUBLIC_HOST_KEY,
+  JWKS_URI_KEY,
+  TOKEN_ENDPOINT_KEY,
+  type IdpPath,
+  type IdpPathKind,
+  type IdpPathOptions,
+  type IdpPathResult,
+} from './idpEndpoint.js';
+
 export {
   mintEntitlementAssertion,
   initEntitlementSigning,

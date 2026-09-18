@@ -31,6 +31,14 @@ const EXPECTED_FUNCTIONS = [
   'initOpenFgaTransport',
   // the identity rule, exported so a host can check its own source against it
   'isEntitlementSubject',
+  // the IdP transport rule. It governs the token endpoint AND the host's own
+  // OIDC_JWKS_URI, so a host that copies this directory takes the rule with it
+  // rather than writing a second, slightly different copy — which is exactly
+  // the state R7 found and removed.
+  'resolveIdpPath',
+  // and the boot check that refuses a HALF-finished repoint, which needs both
+  // settings at once and so belongs to neither resolver
+  'idpPathsDisagree',
   // observability
   'entitlementGrantCounters',
   'entitlementMintCounters',
@@ -47,7 +55,16 @@ const EXPECTED_FUNCTIONS = [
 ].sort();
 
 /** Exported values that are not functions. */
-const EXPECTED_VALUES = ['ENTITLEMENT_SUBJECT_PATTERN'].sort();
+const EXPECTED_VALUES = [
+  'ENTITLEMENT_SUBJECT_PATTERN',
+  // Both named rather than inlined, because a deployment reads them: the
+  // suffix says which hosts may be reached in the clear, and the key is the
+  // variable a manifest must set when one is.
+  'MESH_HOST_SUFFIX',
+  'IDP_PUBLIC_HOST_KEY',
+  'JWKS_URI_KEY',
+  'TOKEN_ENDPOINT_KEY',
+].sort();
 
 describe('src/entitlements public surface', () => {
   it('exports exactly the documented names', () => {

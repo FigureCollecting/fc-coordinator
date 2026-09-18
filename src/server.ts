@@ -13,6 +13,10 @@
 //      OIDC_ISSUER / OIDC_AUDIENCE / OIDC_JWKS_URI / COORDINATOR_PUBLIC_ORIGIN
 //      (all REQUIRED, no defaults — see auth/config.ts for why) plus the
 //      optional DPOP_* and DEVICE_CACHE_TTL_SECONDS tuning knobs,
+//      IDP_PUBLIC_HOST, REQUIRED only when an IdP URL names the in-cluster
+//      Authentik mirror: it is the public authority every such request
+//      presents, because Authentik derives the token issuer from the request
+//      (entitlements/idpEndpoint.ts). OIDC_ISSUER does NOT change with it,
 //      COORDINATOR_ROUTE_PREFIX (default /api — everything except /healthz is
 //      served under it, and the edge must NOT rewrite it away),
 //      SPINE_READ_URL (+ SPINE_READ_TIMEOUT_MS) for the mesh hop, OPENFGA_* for
@@ -25,7 +29,7 @@
 // ============================================================================
 import { buildApp } from './app.js';
 import { resolveAuthConfig, resolveRoutePrefix } from './auth/config.js';
-import { createAccessTokenVerifier, createRemoteJwks } from './auth/oidc.js';
+import { createAccessTokenVerifier, createJwksFor } from './auth/oidc.js';
 import { createDeviceStore } from './auth/plugin.js';
 import { createCoordinatorPool, describeTarget } from './db/pool.js';
 import type { LogLevel } from './platform/logger.js';
@@ -54,7 +58,11 @@ const app = buildApp({
     config: authConfig,
     devices: createDeviceStore(pool),
     verifyAccessToken: createAccessTokenVerifier({
-      jwks: createRemoteJwks(authConfig.jwksUri),
+      // ONE CALL, AND IT IS TESTED WHERE IT LIVES. The URL and the headers it
+      // must be fetched with travel together in `jwksPath`, so this file
+      // cannot reassemble them wrongly — which it previously could, invisibly,
+      // because this file is outside the coverage gate.
+      jwks: createJwksFor(authConfig.jwksPath),
       issuer: authConfig.issuer,
       audience: authConfig.audience,
       algorithms: authConfig.oidcAlgorithms,
@@ -81,6 +89,10 @@ app.log.info(
     // The public shape, stated once: origin + prefix is exactly what a client's
     // DPoP `htu` must name, so an operator can compare it against the edge.
     public_base: `${authConfig.origin}${routePrefix}`,
+    // WHICH WIRE the JWKS fetch travels, and what authority it presents on it.
+    // The credential's own path is logged by initOpenFgaAuth; this is the
+    // edge's half, and the two can legitimately differ during a migration.
+    idp: authConfig.jwksPath.description,
   },
   'coordinator starting',
 );

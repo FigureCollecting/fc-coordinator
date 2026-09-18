@@ -171,6 +171,54 @@ export interface EntitlementAuditEvent {
    * used to tell them apart.
    */
   openfga_code?: number;
+  /**
+   * `true` when this check RE-MINTED its credential before reaching the answer
+   * on this line, and ABSENT otherwise — never `false`.
+   *
+   * WHY IT IS HERE AT ALL. The re-mint is the one failure the client can
+   * recover from by itself, and until this field it left no per-subject trace:
+   * the recovery bumps a process counter that nothing in this service exposes,
+   * and the retry's answer is emitted as an ordinary line. Measured on merged
+   * `develop` 71edd9a by driving the path and printing the events, a check that
+   * recovered from a rotated credential and a check that never had a problem
+   * produced IDENTICAL records, differing only in `latency_ms`. So the question
+   * an operator actually has during a credential incident — WHOSE credential
+   * rotated, and when — had no answer in the log, and fc-infra's
+   * `acceptance-u6.sh --case c` had to report its `B2-remint` case as NOT-RUN.
+   *
+   * WHY A FIELD RATHER THAN A DIAGNOSTIC ROUTE. A route means a new listener, a
+   * new `Server`, a new `AuthorizationPolicy` and a new ingress rule in the
+   * workload whose egress R7 is narrowing to one identity-gated hop — widening
+   * ingress to observe a narrowing. And a counter is per PROCESS: it gives a
+   * rate and can never name a subject.
+   *
+   * ABSENT, NOT `false`, and that is this repo's own rule about itself: "an
+   * audit field that appears when there is nothing to report is a field nobody
+   * can trust" (test/entitlements/openfga-status.test.ts). The optional-spread
+   * idiom below is the one `model_id`, `grpc_code` and `openfga_code` use.
+   *
+   * IT IS NOT CARRIED ON A CACHED REPLAY OR A COALESCED WAITER, and that is a
+   * deliberate exception to the cache's "the ORIGINAL decision, replayed"
+   * rule. Every other field on this line describes the ANSWER, so replaying it
+   * is right. This one describes what the CALL had to do to get it, and a
+   * cache hit did nothing — so on a replay it would be the single field that
+   * was false about the call it described. It would also have made the field
+   * uncountable: a grant is cached for 30 s, so one recovery would have
+   * printed `reminted` on every unprovoked read of that subject inside the
+   * window. Present on this line means: this call re-minted.
+   */
+  reminted?: true;
+  /**
+   * The OpenFGA number that PROVOKED the re-mint, so one line reads "allow,
+   * recovered from 1010".
+   *
+   * ABSENT when the refusal was a CANONICAL gRPC status, because then OpenFGA
+   * sent no number of its own and there is nothing to report. One vocabulary
+   * per field, the same rule that keeps `grpc_code` and `openfga_code` apart:
+   * putting `unauthenticated` here would make a lookup of this field's values
+   * return two kinds of thing.
+   */
+  remint_cause?: number;
   /** Why, when the code does not say: `bad_body`, `token_mint_failed`, `rest_url_configured`. */
   reason?: string;
 }
@@ -208,6 +256,9 @@ interface Decision {
   decision: EntitlementDecision;
   grpcCode?: string;
   openfgaCode?: number;
+  /** A re-mint happened on the way to this answer. See EntitlementAuditEvent. */
+  reminted?: true;
+  remintCause?: number;
   reason?: string;
 }
 
@@ -422,6 +473,14 @@ interface CheckOutcome {
   grpcCode?: string;
   /** OpenFGA's own number, when it sent one outside the canonical gRPC range. */
   openfgaCode?: number;
+  /**
+   * Set on EVERY outcome that followed a re-mint, including one where the
+   * retry was refused too: "refused twice" and "refused once" are different
+   * incidents and the record must not read them the same way.
+   */
+  reminted?: true;
+  /** The OpenFGA number that provoked it. Absent when the refusal was canonical. */
+  remintCause?: number;
   /** Why, when the reason is not simply the code. */
   reason?: string;
 }
@@ -505,6 +564,22 @@ async function check(subject: string, env: NodeJS.ProcessEnv, nowMs: number): Pr
   const canRemint = openFgaAuthMode(env) === 'oidc';
   let reminted = false;
   /**
+   * The number that bought the re-mint, kept so the audit line can say what it
+   * recovered FROM. Stays undefined when the refusal was a canonical gRPC code:
+   * there is no OpenFGA number to report and inventing one would put two
+   * vocabularies in one field.
+   */
+  let remintCause: number | undefined;
+  /**
+   * Every outcome reached AFTER a re-mint carries it, including a second
+   * refusal. Applied here, on the way out, rather than at four return sites
+   * that would each have to remember.
+   */
+  const stamp = (outcome: CheckOutcome): CheckOutcome =>
+    reminted
+      ? { ...outcome, reminted: true, ...(remintCause === undefined ? {} : { remintCause }) }
+      : outcome;
+  /**
    * The bearer this Check last put on the wire, so an `unauthenticated` can say
    * WHICH token was refused rather than only that one was.
    *
@@ -526,7 +601,7 @@ async function check(subject: string, env: NodeJS.ProcessEnv, nowMs: number): Pr
       // through to an unauthenticated Check: OpenFGA would answer
       // `unauthenticated` and the outcome would be identical, but the record
       // would name the wrong cause.
-      return { allowed: false, errored: true, reason: 'token_mint_failed' };
+      return stamp({ allowed: false, errored: true, reason: 'token_mint_failed' });
     }
 
     const bearer = auth['authorization'];
@@ -570,12 +645,12 @@ async function check(subject: string, env: NodeJS.ProcessEnv, nowMs: number): Pr
         // type declarations for a security decision, which is the one thing
         // this file's header refuses to do. The cost is exact and is disclosed
         // rather than chased: these two lines are the only uncovered ones in
-        // this file (98.66% line, 98.16% branch, against an 85% gate). Do not
+        // this file (98.83% line, 98.67% branch, against an 85% gate). Do not
         // "fix" the number by deleting the guard.
         console.error('[ENTITLEMENT] OpenFGA Check response has no boolean `allowed` — denying');
-        return { allowed: false, errored: true, grpcCode: 'ok', reason: 'bad_body' };
+        return stamp({ allowed: false, errored: true, grpcCode: 'ok', reason: 'bad_body' });
       }
-      return { allowed, errored: false, grpcCode: 'ok' };
+      return stamp({ allowed, errored: false, grpcCode: 'ok' });
     } catch (err) {
       // `from` normalises: a ConnectError keeps its code, and anything else the
       // transport throws becomes `unknown` rather than escaping the rule.
@@ -592,6 +667,7 @@ async function check(subject: string, env: NodeJS.ProcessEnv, nowMs: number): Pr
           : openfgaCode >= OPENFGA_AUTH_MIN && openfgaCode < OPENFGA_FORBIDDEN;
       if (staleCredential && canRemint && !reminted) {
         reminted = true;
+        remintCause = openfgaCode;
         bump('reminted');
         continue;
       }
@@ -614,12 +690,12 @@ async function check(subject: string, env: NodeJS.ProcessEnv, nowMs: number): Pr
         `grpc=${grpcCode}${openfgaCode === undefined ? '' : ` openfga=${String(openfgaCode)}`}`,
         safeFailureText(connectError.rawMessage, presentedToken),
       );
-      return {
+      return stamp({
         allowed: false,
         errored: true,
         grpcCode,
         ...(openfgaCode === undefined ? {} : { openfgaCode }),
-      };
+      });
     }
   }
 }
@@ -733,6 +809,21 @@ export async function grantsForSubject(
       ...(modelId ? { model_id: modelId } : {}),
       ...(decision.grpcCode === undefined ? {} : { grpc_code: decision.grpcCode }),
       ...(decision.openfgaCode === undefined ? {} : { openfga_code: decision.openfgaCode }),
+      // ONLY ON THE LINE FOR THE CALL THAT ACTUALLY RE-MINTED. Every other
+      // field here describes THE ANSWER and is therefore replayed from the
+      // cache verbatim, which is that cache's stated rule; `reminted`
+      // describes what THIS CALL had to do to obtain it, and a cache hit or a
+      // coalesced waiter did nothing. Carrying it onto a replay made it the
+      // one field on the line that was false about the call it described —
+      // and, because a grant is cached for 30 s, made `grep reminted` return
+      // one recovery plus every unprovoked read of that subject for the next
+      // half minute. An operator counting rotations counted echoes.
+      ...(source !== 'openfga' || decision.reminted === undefined
+        ? {}
+        : { reminted: decision.reminted }),
+      ...(source !== 'openfga' || decision.remintCause === undefined
+        ? {}
+        : { remint_cause: decision.remintCause }),
       ...(decision.reason === undefined ? {} : { reason: decision.reason }),
     });
   };
@@ -800,6 +891,8 @@ export async function grantsForSubject(
       decision: name,
       ...(outcome.grpcCode === undefined ? {} : { grpcCode: outcome.grpcCode }),
       ...(outcome.openfgaCode === undefined ? {} : { openfgaCode: outcome.openfgaCode }),
+      ...(outcome.reminted === undefined ? {} : { reminted: outcome.reminted }),
+      ...(outcome.remintCause === undefined ? {} : { remintCause: outcome.remintCause }),
       ...(outcome.reason === undefined || outcome.reason === 'unconfigured'
         ? {}
         : { reason: outcome.reason }),

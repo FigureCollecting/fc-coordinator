@@ -21,6 +21,14 @@ export default defineConfig({
         // server.ts is the process entrypoint: listen/SIGTERM wiring with no
         // logic of its own. It is exercised by the image healthcheck, not by
         // a unit test that would have to bind a port to prove `listen` works.
+        //
+        // THE EXCLUSION IS ONLY HONEST WHILE THAT SENTENCE IS TRUE, and it
+        // stopped being true once the entrypoint assembled the mesh JWKS
+        // client by hand: deleting the headers there left the whole suite
+        // green. The decision moved into `createJwksFor` (src/auth/oidc.ts),
+        // which is covered and which both this file and the end-to-end test
+        // call. Anything that is a DECISION rather than wiring belongs on the
+        // other side of this line.
         'src/server.ts',
       ],
       thresholds: {
