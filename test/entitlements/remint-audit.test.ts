@@ -195,18 +195,51 @@ describe('the two lines are now DIFFERENT, which is the whole point', () => {
     expect(shape(events[1] as EntitlementAuditEvent)).not.toHaveProperty('reminted');
   });
 
-  it('the cached replay carries the original decision, re-mint and all', async () => {
-    // The module's stated rule for the cache is "the ORIGINAL decision,
-    // replayed" — a cached error-deny reported as a plain deny reads like a
-    // revocation that never happened. The same argument applies here, and
-    // `source: cache` is what separates a replay from a fresh re-mint for
-    // anyone counting them.
+  it('a cached REPLAY carries no re-mint, because the replay did not re-mint', async () => {
+    // REVERSED AFTER REVIEW, and the argument that reversed it is about what
+    // the field MEANS. The cache's rule is "the original decision, replayed",
+    // and every other field describes THE ANSWER: `decision`, `grpc_code`,
+    // `openfga_code`, `reason`. `reminted` describes what THIS CALL had to do
+    // to obtain it, and a cache hit did nothing — so carrying it was the one
+    // field on the line that was literally false about the call it described.
+    //
+    // It was also operationally wrong. A grant is cached for 30 s by default,
+    // so `kubectl logs | grep reminted` returned the recovery AND every
+    // unprovoked read of the same subject for the next half minute, and the
+    // acceptance assertion that greps for it could not tell a real rotation
+    // from its own echo.
     fga.script([{ status: 1010 }, { allowed: true }]);
 
     await grantsForSubject(SUB, T0, env());
     await grantsForSubject(SUB, T0 + 1, env());
     expect(events).toHaveLength(2);
-    expect(events[1]).toMatchObject({ source: 'cache', reminted: true, remint_cause: 1010 });
+    expect(events[1]).toMatchObject({ source: 'cache', decision: 'allow' });
+    expect(Object.keys(events[1] as object)).not.toContain('reminted');
+    expect(Object.keys(events[1] as object)).not.toContain('remint_cause');
+  });
+
+  it('a COALESCED caller carries no re-mint either — it waited, it did not mint', async () => {
+    fga.script([{ status: 1010 }, { allowed: true }]);
+
+    const [, second] = await Promise.all([
+      grantsForSubject(SUB, T0, env()),
+      grantsForSubject(SUB, T0, env()),
+    ]);
+    expect(second).toEqual(['inventory_levels']);
+    const coalesced = events.find((e) => e.source === 'coalesced');
+    expect(coalesced).toBeDefined();
+    expect(Object.keys(coalesced as object)).not.toContain('reminted');
+  });
+
+  it('so grepping the field counts RECOVERIES, not echoes of one', async () => {
+    // The property the fc-infra acceptance rests on, stated as a count.
+    fga.script([{ status: 1010 }, { allowed: true }]);
+
+    await grantsForSubject(SUB, T0, env());
+    await grantsForSubject(SUB, T0 + 1, env());
+    await grantsForSubject(SUB, T0 + 2, env());
+    expect(events).toHaveLength(3);
+    expect(events.filter((e) => 'reminted' in e)).toHaveLength(1);
   });
 });
 

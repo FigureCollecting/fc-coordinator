@@ -197,9 +197,15 @@ export interface EntitlementAuditEvent {
    * can trust" (test/entitlements/openfga-status.test.ts). The optional-spread
    * idiom below is the one `model_id`, `grpc_code` and `openfga_code` use.
    *
-   * IT IS CARRIED ON A CACHED REPLAY TOO, because the cache's stated rule is
-   * "the ORIGINAL decision, replayed" — every other field is. `source` is what
-   * separates a replay from a fresh recovery for anyone counting them.
+   * IT IS NOT CARRIED ON A CACHED REPLAY OR A COALESCED WAITER, and that is a
+   * deliberate exception to the cache's "the ORIGINAL decision, replayed"
+   * rule. Every other field on this line describes the ANSWER, so replaying it
+   * is right. This one describes what the CALL had to do to get it, and a
+   * cache hit did nothing — so on a replay it would be the single field that
+   * was false about the call it described. It would also have made the field
+   * uncountable: a grant is cached for 30 s, so one recovery would have
+   * printed `reminted` on every unprovoked read of that subject inside the
+   * window. Present on this line means: this call re-minted.
    */
   reminted?: true;
   /**
@@ -803,8 +809,21 @@ export async function grantsForSubject(
       ...(modelId ? { model_id: modelId } : {}),
       ...(decision.grpcCode === undefined ? {} : { grpc_code: decision.grpcCode }),
       ...(decision.openfgaCode === undefined ? {} : { openfga_code: decision.openfgaCode }),
-      ...(decision.reminted === undefined ? {} : { reminted: decision.reminted }),
-      ...(decision.remintCause === undefined ? {} : { remint_cause: decision.remintCause }),
+      // ONLY ON THE LINE FOR THE CALL THAT ACTUALLY RE-MINTED. Every other
+      // field here describes THE ANSWER and is therefore replayed from the
+      // cache verbatim, which is that cache's stated rule; `reminted`
+      // describes what THIS CALL had to do to obtain it, and a cache hit or a
+      // coalesced waiter did nothing. Carrying it onto a replay made it the
+      // one field on the line that was false about the call it described —
+      // and, because a grant is cached for 30 s, made `grep reminted` return
+      // one recovery plus every unprovoked read of that subject for the next
+      // half minute. An operator counting rotations counted echoes.
+      ...(source !== 'openfga' || decision.reminted === undefined
+        ? {}
+        : { reminted: decision.reminted }),
+      ...(source !== 'openfga' || decision.remintCause === undefined
+        ? {}
+        : { remint_cause: decision.remintCause }),
       ...(decision.reason === undefined ? {} : { reason: decision.reason }),
     });
   };
