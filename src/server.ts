@@ -29,7 +29,7 @@
 // ============================================================================
 import { buildApp } from './app.js';
 import { resolveAuthConfig, resolveRoutePrefix } from './auth/config.js';
-import { createAccessTokenVerifier, createRemoteJwks } from './auth/oidc.js';
+import { createAccessTokenVerifier, createJwksFor } from './auth/oidc.js';
 import { createDeviceStore } from './auth/plugin.js';
 import { createCoordinatorPool, describeTarget } from './db/pool.js';
 import type { LogLevel } from './platform/logger.js';
@@ -58,9 +58,11 @@ const app = buildApp({
     config: authConfig,
     devices: createDeviceStore(pool),
     verifyAccessToken: createAccessTokenVerifier({
-      // The headers are empty on the public path and carry the public
-      // authority on the in-cluster mirror. Resolved at boot, never here.
-      jwks: createRemoteJwks(authConfig.jwksUri, { headers: authConfig.jwksPath.headers }),
+      // ONE CALL, AND IT IS TESTED WHERE IT LIVES. The URL and the headers it
+      // must be fetched with travel together in `jwksPath`, so this file
+      // cannot reassemble them wrongly — which it previously could, invisibly,
+      // because this file is outside the coverage gate.
+      jwks: createJwksFor(authConfig.jwksPath),
       issuer: authConfig.issuer,
       audience: authConfig.audience,
       algorithms: authConfig.oidcAlgorithms,

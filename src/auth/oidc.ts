@@ -21,6 +21,9 @@
 // ============================================================================
 import * as http from 'node:http';
 import * as https from 'node:https';
+// TYPE ONLY: erased at runtime, so the edge takes no dependency on the
+// entitlement module's graph to describe a path the entitlement module defines.
+import type { IdpPath } from '../entitlements/index.js';
 import {
   createRemoteJWKSet,
   customFetch,
@@ -106,20 +109,24 @@ export interface RemoteJwksOptions {
  * is the set of keys every access token is verified against, so a followed
  * redirect is a key-substitution primitive.
  */
-function meshFetch(headers: Readonly<Record<string, string>>): FetchImplementation {
+function meshFetch(): FetchImplementation {
   return async (url, options) => {
     const target = new URL(url);
     const client = target.protocol === 'https:' ? https : http;
-    // jose's own headers first (accept, user-agent), then ours — so the
-    // authority this hop must present cannot be overwritten by a default.
-    const merged: Record<string, string> = {};
-    for (const [name, value] of options.headers) merged[name] = value;
-    for (const [name, value] of Object.entries(headers)) merged[name] = value;
+    // ONE ROUTE FOR THE HEADERS, and it is jose's. An earlier version also
+    // merged its own copy on top, which was defence in depth against a hazard
+    // that cannot occur as wired — and the cost was that three mutations
+    // (drop our merge, drop the option, swap the order) all survived the whole
+    // suite, because either route alone still delivered the header. Two
+    // mechanisms that cannot be told apart are one mechanism and one place for
+    // a future edit to go wrong unobserved.
+    const headers: Record<string, string> = {};
+    for (const [name, value] of options.headers) headers[name] = value;
 
     return await new Promise<Response>((resolve, reject) => {
       const request = client.request(
         target,
-        { method: options.method, headers: merged, signal: options.signal },
+        { method: options.method, headers, signal: options.signal },
         (response) => {
           const chunks: Buffer[] = [];
           response.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -143,7 +150,17 @@ function meshFetch(headers: Readonly<Record<string, string>>): FetchImplementati
           });
         },
       );
-      request.on('error', reject);
+      // REJECT WITH THE SIGNAL'S OWN REASON WHEN IT FIRED. jose maps a timeout
+      // BY NAME — `err.name === 'TimeoutError'` — and node's abort surfaces as
+      // `AbortError` with the TimeoutError demoted to `cause`, so a timeout on
+      // this path arrived as ERR_ABORT rather than jose's ERR_JWKS_TIMEOUT. The
+      // budget was always right to the millisecond; the identity was not, and a
+      // replacement transport should not quietly change the error taxonomy of
+      // the thing it replaces. `AbortSignal.timeout().reason` is a DOMException
+      // named TimeoutError, which is exactly what jose looks for.
+      request.on('error', (err) =>
+        reject(options.signal.aborted ? (options.signal.reason as Error) : err),
+      );
       request.end();
     });
   };
@@ -159,11 +176,20 @@ function meshFetch(headers: Readonly<Record<string, string>>): FetchImplementati
  * the cache still behaves through the transport substitution below.
  */
 export function createRemoteJwks(url: URL, options: RemoteJwksOptions = {}): RemoteJWKSet {
-  const headers = options.headers ?? {};
+  // LOWER-CASED FIRST, because the decision below is a lookup and HTTP header
+  // names are case-insensitive. `resolveIdpPath` always lower-cases, so
+  // production was never exposed — but this function is exported with an
+  // unconstrained `headers` option, and a caller who spelled it `Host`, the way
+  // HTTP prints it, fell back to undici and had the header stripped: the exact
+  // configured-looking silent failure this whole unit exists to prevent.
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(options.headers ?? {})) {
+    headers[name.toLowerCase()] = value;
+  }
   // The substitution is installed ONLY when a `host` is asked for. Every other
   // deployment keeps jose's own fetch, byte for byte, so the public path is not
   // quietly moved onto a transport this repo maintains.
-  const transport = headers['host'] === undefined ? {} : { [customFetch]: meshFetch(headers) };
+  const transport = headers['host'] === undefined ? {} : { [customFetch]: meshFetch() };
   return createRemoteJWKSet(url, {
     cacheMaxAge: options.cacheMaxAgeMs ?? 600_000,
     cooldownDuration: options.cooldownMs ?? 30_000,
@@ -171,6 +197,27 @@ export function createRemoteJwks(url: URL, options: RemoteJwksOptions = {}): Rem
     headers,
     ...transport,
   });
+}
+
+/**
+ * THE PRODUCTION WIRING, IN A PLACE A TEST CAN SEE IT.
+ *
+ * This is one expression, and it used to live in src/server.ts — which is
+ * excluded from the coverage gate as "the process entrypoint, listen/SIGTERM
+ * wiring with no logic of its own". That stopped being true the moment the
+ * entrypoint carried the decision that makes the mirrored JWKS fetch work:
+ * deleting the headers there left all 819 tests green, because the end-to-end
+ * test re-typed the same expression by hand instead of calling it.
+ *
+ * So the expression is here, both callers use it, and the mutation goes red.
+ * It also takes `path.url` rather than a separately-passed URL, which removes
+ * the way the target and its headers could ever disagree.
+ */
+export function createJwksFor(
+  path: IdpPath,
+  options: Omit<RemoteJwksOptions, 'headers'> = {},
+): RemoteJWKSet {
+  return createRemoteJwks(path.url, { ...options, headers: path.headers });
 }
 
 /** Map jose's error taxonomy onto our reasons. Never surfaced to the client. */
