@@ -65,7 +65,7 @@ const NOW_ISO = '2026-09-14T12:00:00.000Z';
 const GTIN = '04573102591234';
 
 const ENV_KEYS = [
-  'OPENFGA_API_URL',
+  'OPENFGA_GRPC_URL',
   'OPENFGA_STORE_ID',
   'ENTITLEMENT_SIGNING_KEY_PEM',
   'ENTITLEMENT_SIGNING_KID',
@@ -130,7 +130,7 @@ async function start(options: { allow: boolean } = { allow: true }): Promise<Har
   process.env['ENTITLEMENT_SIGNING_KID'] = KID;
 
   const fga = await startFakeOpenFga(() => options.allow);
-  process.env['OPENFGA_API_URL'] = fga.baseUrl;
+  process.env['OPENFGA_GRPC_URL'] = fga.baseUrl;
   process.env['OPENFGA_STORE_ID'] = '01KXA5NRJYR0GYKX4NWQ2ANDZS';
 
   const spine = await startFakeSpineRead({ keys: kp.keys });
@@ -377,7 +377,7 @@ describe('a fully credentialed Connect unary POST', () => {
     // THE ASSERTION THIS WHOLE FILE EXISTS FOR: the uuid the DPoP proof was
     // verified for is the uuid OpenFGA was asked about. Two modules built on
     // two branches, one identity, and no way for the client to name its own.
-    expect(JSON.stringify(harness.fga.calls[0]?.body)).toContain(`user:${SUB}`);
+    expect(harness.fga.calls[0]?.user).toBe(`user:${SUB}`);
     expect(harness.spine.calls[0]?.entitlementOutcome).toBe('granted');
   });
 

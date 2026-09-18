@@ -61,7 +61,7 @@ const NOW_ISO = '2026-09-14T12:00:00.000Z';
 const GTIN = '04573102591234';
 
 const ENV_KEYS = [
-  'OPENFGA_API_URL',
+  'OPENFGA_GRPC_URL',
   'OPENFGA_STORE_ID',
   'ENTITLEMENT_SIGNING_KEY_PEM',
   'ENTITLEMENT_SIGNING_KID',
@@ -117,7 +117,7 @@ async function start(routePrefix: string): Promise<Harness> {
   process.env['ENTITLEMENT_SIGNING_KID'] = KID;
 
   const fga = await startFakeOpenFga(() => true);
-  process.env['OPENFGA_API_URL'] = fga.baseUrl;
+  process.env['OPENFGA_GRPC_URL'] = fga.baseUrl;
   process.env['OPENFGA_STORE_ID'] = '01KXA5NRJYR0GYKX4NWQ2ANDZS';
 
   const spine = await startFakeSpineRead({ keys: kp.keys });

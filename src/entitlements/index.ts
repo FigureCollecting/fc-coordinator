@@ -10,10 +10,12 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * THIS DIRECTORY IS SELF-CONTAINED AND PORTS VERBATIM.
  *
- * It imports node builtins, `axios`, and `@figurecollecting/ingest-contract`.
- * NOTHING ELSE — no database driver, no ORM, no user model, no application
- * config, no logger of this app's (which is why it writes to `console` and not
- * to platform/logger). It is a directory copy away from its next host, and
+ * It imports node builtins, `axios` (the OIDC token mint), Connect and
+ * protobuf (the OpenFGA Check, which is gRPC), `@figurecollecting/ingest-contract`,
+ * and its own generated wire types under ./gen. NOTHING ELSE — no database
+ * driver, no ORM, no user model, no application config, no logger of this app's
+ * (which is why it writes to `console` and not to platform/logger). It is a
+ * directory copy away from its next host, and
  * test/entitlements/portability.test.ts fails the build if that stops being
  * true.
  *
@@ -41,6 +43,7 @@
  *   import { entitlementHeaderFor, initEntitlementSigning } from './entitlements/index.js';
  *
  *   initEntitlementSigning();                       // once, at boot
+ *   initOpenFgaTransport();                         // once, at boot — THROWS on OPENFGA_API_URL
  *   const assertion = await entitlementHeaderFor(authentikUuid);
  *   await spineRead.compare(seed, nowIso, assertion);   // null => no header
  *
@@ -53,6 +56,7 @@ export {
   entitlementHeaderFor,
   grantsForSubject,
   entitlementGrantCounters,
+  initOpenFgaTransport,
   resetEntitlementGrantsForTest,
   setEntitlementAuditSink,
   type EntitlementAuditEvent,

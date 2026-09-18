@@ -17,6 +17,7 @@ import type { FastifyInstance } from 'fastify';
 import {
   initEntitlementSigning,
   initOpenFgaAuth,
+  initOpenFgaTransport,
   setEntitlementAuditSink,
 } from '../entitlements/index.js';
 import { createCompareRoutes, type CompareRoutesDeps } from './compare.js';
@@ -85,6 +86,11 @@ export function registerConnect(app: FastifyInstance, options: ConnectOptions): 
   if (options.initSigning !== false) {
     initEntitlementSigning();
     initOpenFgaAuth();
+    // WHICH CREDENTIAL, then WHICH WIRE. The line above says how the Check
+    // authenticates; this one says what carries it, and it THROWS if the
+    // manifest still names the retired HTTP endpoint. Boot is the right place
+    // to fail: a pod that will deny every read is better stopped than started.
+    initOpenFgaTransport();
   }
 
   const resolveIdentity = options.resolveIdentity ?? decoratorIdentityResolver();

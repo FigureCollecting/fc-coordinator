@@ -49,8 +49,9 @@ npm start        # node dist/server.js
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | collector endpoint; falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` |
 | `SPINE_READ_URL` | unset | ingest-server Connect base URL; **unset means Compare answers `UNAVAILABLE`** and no transport is built |
 | `SPINE_READ_TIMEOUT_MS` | `10000` | per-call deadline on the mesh hop |
-| `OPENFGA_API_URL` `OPENFGA_STORE_ID` | unset | the entitlement Check; **unset means every Check denies** |
-| `OPENFGA_MODEL_ID` `OPENFGA_APP_OBJECT` `OPENFGA_TIMEOUT_MS` | unset / `app:figurecollecting` / `2000` | optional Check settings. A `OPENFGA_TIMEOUT_MS` of `0` is refused and falls back, because axios reads it as "wait forever" |
+| `OPENFGA_GRPC_URL` `OPENFGA_STORE_ID` | unset | the entitlement Check, which is **gRPC over h2c on port 8081** (e.g. `http://openfga-mc-fc-ha.authz.svc.cluster.local:8081`); **unset means every Check denies** |
+| `OPENFGA_API_URL` | must be unset | the retired HTTP endpoint. **Setting it stops the process at boot**, naming the rename — there is no HTTP path left, so a manifest that still carries it would otherwise redact every read while looking configured |
+| `OPENFGA_MODEL_ID` `OPENFGA_APP_OBJECT` `OPENFGA_TIMEOUT_MS` | unset / `app:figurecollecting` / `2000` | optional Check settings. `OPENFGA_TIMEOUT_MS` becomes the gRPC call deadline. A `0` is refused and falls back: a deadline of zero has already expired when the call starts and would deny every read instantly |
 | `OPENFGA_OIDC_TOKEN_ENDPOINT` `OPENFGA_OIDC_CLIENT_ID` `OPENFGA_OIDC_USERNAME` `OPENFGA_OIDC_PASSWORD` | unset | the minted credential. **Setting any one of them puts the process on the OIDC path**, and a partial set fails closed there rather than degrading to an unauthenticated Check |
 | `OPENFGA_OIDC_CLIENT_SECRET` `OPENFGA_OIDC_SCOPE` `OPENFGA_OIDC_REFRESH_SKEW_SECONDS` `OPENFGA_OIDC_TIMEOUT_MS` | unset / `openid` / `120` / `5000` | optional provider settings |
 | `OPENFGA_API_TOKEN` | unset | the preshared token, for local runs and break-glass. **Ignored when the OIDC path is configured**, with one warning saying so |
@@ -81,13 +82,99 @@ what keeps the one unauthenticated route off the public surface. A request to
 token, key, device and nonce are all valid, but whose proof names the stripped
 path, is rejected.
 
+### The OpenFGA wire
+
+The Check is **gRPC**, `openfga.v1.OpenFGAService/Check` on port 8081 over
+cleartext h2c, with mesh mTLS added by the Linkerd proxy. It is not a second
+API: upstream declares `Check` with a `google.api.http` annotation mapping it to
+`POST /stores/{store_id}/check`, so the REST endpoint this service used until
+now was a grpc-gateway transcoding **of** this service. Moving to gRPC moves to
+the primary definition. (Ross, 2026-09-17: "communications between all api
+endpoints … is to be gRPC (with mTLS, whether homegrown, mesh, or both)".)
+
+The wire types are **vendored and generated in-repo**: `proto/openfga/v1/openfga_service.proto`
+is a slice of `buf.build/openfga/api` carrying the Check and nothing else, and
+the generated TypeScript is committed inside `src/entitlements/gen/` so the
+portable directory travels whole. Regenerate with `npm run proto:generate`
+(`buf generate`, via the `@bufbuild/buf` and `@bufbuild/protoc-gen-es`
+devDependencies); CI compiles the committed output and never runs the generator.
+
+The alternative was the buf registry's npm packages (`@buf/openfga_api.*`),
+which would put a second external registry in the install path of every CI run
+and every image build and pin the artifact to a protobuf-es version chosen by
+the registry rather than by this repo. Vendoring costs a drift risk instead, and
+`test/entitlements/openfga-wire.test.ts` is what pays it. The **actual upstream
+file** is vendored as `test/fixtures/upstream-openfga_service.proto`, byte for
+byte, with its sha256 asserted — the first version of that suite carried a
+hand-copied table of field numbers, which is the same class of artifact as the
+slice it was checking, and two hand-copies agreeing proves only that one hand
+made the same decision twice. The numbers are now **parsed** out of upstream and
+compared with the generated descriptor; the reserved set is **derived** as
+"upstream's fields minus the ones the slice carries" rather than listed. CI does
+not fetch anything, because a suite that goes red when GitHub is slow is a suite
+people learn to ignore; the hash is what makes the offline copy evidence.
+
+That test is not theoretical — the proof-of-concept this work was built on
+numbered `authorization_model_id` 5, which upstream gives to `bool trace`, and it
+passed because both ends of it used the same wrong slice.
+
+### OpenFGA's own status numbers
+
+**OpenFGA does not speak canonical gRPC statuses**, and this is the single
+sharpest edge on the hop. gRPC defines codes 0–16; OpenFGA writes its own
+numbers into the `grpc-status` trailer, from `errors_ignore.proto`:
+
+| | |
+|---|---|
+| `AuthErrorCode` | 1001 invalid_subject · 1002 invalid_audience · 1003 invalid_issuer · 1004 invalid_claims · 1005 invalid_bearer_token · 1010 bearer_token_missing · 1500 unauthenticated · 1600 forbidden |
+| `ErrorCode` | 2000 validation_error · 2001 authorization_model_not_found · … |
+
+Connect-ES refuses a status outside the canonical range and reports
+`Code.Internal` with the message `invalid grpc-status: 1010`, handing the raw
+trailer through as the error's metadata. So a client that keys its re-mint on
+`Code.Unauthenticated` **never re-mints against the real service** — the stale
+token that bought one re-mint and a successful Check under REST becomes a
+permanent error-deny. `grants.ts` therefore reads the number back off the
+metadata **before** mapping anything.
+
+**The rule is the range, not a list of observed codes**, and the measurement is
+what forced that. The same seven cases against the real binary, OIDC authn mode:
+
+| case | v1.5.9 | v1.20.0 |
+|---|---|---|
+| valid token, granted tuple | `0`, allowed | `0`, allowed |
+| no bearer | 1010 | 1010 |
+| expired token (the rotation shape) | **1005** | **1004** |
+| wrong audience | 1002 | 1004 |
+| wrong issuer | 1003 | 1004 |
+| malformed token | 1005 | 1004 |
+| unknown model id | 2001 | 2001 |
+
+The codes **moved between versions**. A fix enumerating the three anyone had
+seen would have been right on one version and silently wrong on the other, and
+on v1.5.9 the expired-token case — the whole reason the fix exists — emits 1005.
+So the boundary is OpenFGA's own, taken from its HTTP transcoding, which is the
+behaviour being carried across: every `AuthErrorCode` below `forbidden`
+transcodes to 401 and `forbidden` transcodes to 403; the old client retried 401
+and never retried 403. **1000–1599 buys one re-mint, 1600 buys none, and
+everything else fails closed with the number recorded.**
+
+**The failure text never reaches the log raw.** Connect puts `grpc-message`
+verbatim into the error's message for a canonical code, so a service, proxy or
+debug build that echoes the Authorization header back would land this process's
+credential in the application log. The bearer just presented is removed **by
+identity** (this module knows exactly what it sent, so there is no pattern to be
+wrong about), a generic `Bearer …` rule catches a credential that is not ours,
+and the whole thing is bounded at 200 characters — a 50 KB trailer is otherwise
+a 50 KB log line, once per read.
+
 ### The OpenFGA credential
 
 The Check presents a **minted** token, not a configured one. The authorization
 service authenticates callers against an OIDC provider whose tokens live ten
 minutes, so a static environment value is correct for ten minutes and then
-denies forever — silently, because a 401 is caught, counted as an error and
-turned into a deny. Every read would come back redacted with nothing in the log
+denies forever — silently, because an `unauthenticated` is caught, counted as an
+error and turned into a deny. Every read would come back redacted with nothing in the log
 but a recurring "Check failed".
 
 - `client_credentials` with a **username and password**, which looks wrong and
@@ -101,11 +188,14 @@ but a recurring "Check failed".
 - **Fails closed**: a mint failure denies and the Check is never made. Falling
   through to an unauthenticated Check would produce the same redacted read and
   a 401 in the log, sending an operator to the wrong system.
-- A **401 from OpenFGA** buys exactly one forced re-mint, then a deny. One, not
-  a loop: a credential that is wrong rather than stale must not become a request
-  storm against the provider.
-- The boot line names which path is active, and says `INCOMPLETE` with the
-  missing variable when the provider is only half configured.
+- An **`unauthenticated` from OpenFGA** buys exactly one forced re-mint, then a
+  deny. One, not a loop: a credential that is wrong rather than stale must not
+  become a request storm against the provider. `permission_denied` buys none —
+  that is a decision, and a fresh token cannot change it.
+- Two boot lines, because they answer different questions. The credential line
+  names which path is active and says `INCOMPLETE` with the missing variable
+  when the provider is only half configured. The transport line names the wire:
+  `[ENTITLEMENT] openfga: grpc h2c <host>:8081`.
 
 ### The entitlement audit line
 
@@ -120,10 +210,28 @@ One structured line per decision, at info level, on `app.log`:
 `decision` is `allow` / `deny` / `error` / `unconfigured` / `bad_subject`, and
 `source` is `openfga` / `cache` / `coalesced` / `none`. A cache hit is a
 decision and says so, replaying the **original** outcome — a cached error-deny
-reported as a plain deny reads like a revocation that never happened. `error`
-carries `http_status` where there was one, so a 504 is distinguishable from a
-401, and `reason` where the status does not say: `transport`, `bad_body`,
-`token_mint_failed`.
+reported as a plain deny reads like a revocation that never happened.
+
+`grpc_code` carries the gRPC status the call ended on, lower-underscore as gRPC
+names them (`ok`, `unauthenticated`, `permission_denied`, `unavailable`,
+`deadline_exceeded`, `internal`). It is present whenever the call was
+**attempted** and absent on the decisions that never reach the wire, and it
+**replaces** `http_status` outright rather than sitting beside it. `reason` is
+kept for the causes a status cannot express: `bad_body`, `token_mint_failed`,
+`rest_url_configured`.
+
+`openfga_code` carries OpenFGA's **own** error number when it sent one — see
+the next section. It sits beside `grpc_code` rather than replacing it because
+they answer different questions: `grpc_code` is what the transport concluded,
+and therefore what the mesh, the proxy and any hop telemetry recorded (always
+`internal` for these), while `openfga_code` is what the service actually said
+and is the only one that can be looked up.
+
+One distinction is genuinely lost and is better said than hidden: over HTTP a
+refused connection had no status and a served error had one, so `transport` and
+`http_error` could be told apart. gRPC gives a refused connection and a server
+answering "I am unavailable" the same code, and no part of the protocol
+separates them, so the record says `unavailable` and does not guess.
 
 **Why it exists here and not in OpenFGA.** OpenFGA logs no authenticated
 subject, and the multicluster gateway collapses every caller into one mesh
@@ -143,17 +251,36 @@ Unset, it falls back to the console rather than dropping the trail.
 
 ### Fail-closed on the Check
 
-Any answer that is not an explicit `allowed: true` is a deny, and a non-2xx is
-an **error**-deny rather than a revocation. This already held — the Check is
-`axios.post` with no `validateStatus`, and axios's default rejects on anything
-outside 2xx, which is what turns a sidecar's fast 504 during a partition into a
-deny rather than letting it sail past a check for a thrown connection error.
+Any answer that is not an explicit `allowed: true` is a deny, and a failure is
+an **error**-deny rather than a revocation.
 
-`test/entitlements/fail-closed.test.ts` pins it, and pins it so it cannot pass
-for the wrong reason: every non-2xx fixture carries `{"allowed": true}`, so a
-mutation adding `validateStatus: () => true` turns the body into an accepted
-grant and the suite red. There is a source assertion beside it, because
-behaviour alone cannot catch every way the rule could be loosened.
+Under HTTP this rule was inherited: the Check was `axios.post` with no
+`validateStatus`, and axios's default rejects anything outside 2xx, which is
+what turned a sidecar's fast 504 during a partition into a deny. gRPC has
+nothing to inherit — a unary call either resolves with a message or throws a
+`ConnectError` carrying a `Code` — so the rule is now written out in full, and
+written as a **total** one: the only path that returns a grant is the one that
+received `allowed === true`, and the catch enumerates no codes at all.
+Enumerating them is how the class nobody thought of becomes the class that
+fails open.
+
+`test/entitlements/fail-closed.test.ts` pins it so it cannot pass for the wrong
+reason: the fake grants every Check it is not told to refuse, so a mutation that
+treated an unreachable OpenFGA as a pass turns the suite red — measured, seven
+cases including one that minted a signed assertion for a service that was never
+reached. Source assertions sit beside it, because behaviour alone cannot catch
+the transport quietly coming back: `grants.ts` is asserted to contain no
+`axios`, no `maxRedirects`, no `validateStatus`, and exactly one named gRPC code
+(`Unauthenticated`, in the retry branch).
+
+`test/entitlements/wire-surprise.test.ts` is the successor to the redirect
+finding. gRPC has no redirects, so the specific trap is gone, but the reasoning
+that found it was not about redirects — it was that the rule had been verified
+against the failures someone thought to list. The question is re-asked on a raw
+h2c socket: a middlebox answering 301/302/303/307/308 (denies, and the target
+records no request), an ingress answering HTML or the old REST JSON with a 200
+(`unknown`), and correct framing carrying bytes that are not a `CheckResponse`
+(`internal`).
 
 ### Edge authentication (OIDC + DPoP)
 
@@ -484,9 +611,28 @@ cache is bounded. The port changed ESM import specifiers and the header comment;
 `entitlementSubject.legacy.ts` and the `authentikId` model field were **not**
 carried across — the subject comes straight from the identity resolver.
 
-It imports node builtins, `axios` and `@figurecollecting/ingest-contract` and
-nothing else — not this app's logger, which is why it writes to `console`.
-`test/entitlements/portability.test.ts` fails the build if that stops being
-true, and `test/import-graph.test.ts` asserts the built graph resolves `axios`
-**only** from inside `dist/entitlements/`, never as a transitive of the fc-shared
-barrel.
+It imports node builtins, `axios` (the OIDC token mint), `@connectrpc/connect`,
+`@connectrpc/connect-node` and `@bufbuild/protobuf` (the OpenFGA Check, which is
+gRPC), `@figurecollecting/ingest-contract`, and its own generated wire types
+under `gen/` — and nothing else, in particular not this app's logger, which is
+why it writes to `console`.
+
+Connect was **admitted** to that set rather than hidden behind an injected seam,
+and the argument is in the guard's own header. In short: this module's entire
+claim is that an answer which is not an explicit `allowed: true` is a deny, and
+over gRPC that rule is stated in the transport's vocabulary — the mapping from
+`Code` to error-deny **is** the fail-closed guarantee. Behind a seam that
+mapping moves into the host, every future host re-implements the one rule the
+directory exists to guarantee, and the suite that proves it can no longer prove
+it about anything real. The line was never "no transport" (the token mint has
+always been axios); it is "no host coupling", and the relative-path rule still
+enforces that absolutely. If this module were published outside the estate the
+seam would win instead.
+
+`test/entitlements/portability.test.ts` fails the build if that stops being true
+— it walks the directory recursively, so the generated types are held to the
+same rule, and it forbids Connect's **server** symbols outright because the
+module is a client. `test/import-graph.test.ts` asserts the built graph resolves
+`axios` **only** from inside `dist/entitlements/`, never as a transitive of the
+fc-shared barrel, and that the gRPC client and the generated descriptor really
+are in the emitted output.

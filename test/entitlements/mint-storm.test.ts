@@ -36,6 +36,8 @@
  * NOTHING FAILS OPEN. Every one of these requests denies and the per-subject
  * retry bound holds exactly — 100 checks for 50 subjects, never a loop.
  */
+import { inspect } from 'node:util';
+import { Code } from '@connectrpc/connect';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   entitlementGrantCounters,
@@ -60,6 +62,14 @@ const SUBJECTS = 50;
  */
 const CONCURRENT_MINT_CEILING = 5;
 const PASSWORD = 'app-password-never-print-me';
+/**
+ * Hung off every refusal as gRPC response metadata. It stands in for anything
+ * the far side might attach to an error — a session cookie from an ingress, an
+ * internal hostname, a request id that identifies a user — and it is here
+ * because a ConnectError CARRIES that metadata, which the axios error did not.
+ * The leak it guards is `console.error(err)` instead of `console.error(err.message)`.
+ */
+const SERVER_METADATA_SECRET = 'trailer-secret-never-print-me';
 
 let fga: FakeOpenFga;
 let idp: FakeTokenEndpoint;
@@ -71,7 +81,7 @@ const subjects = (n: number): string[] =>
 
 const env = (): NodeJS.ProcessEnv =>
   ({
-    OPENFGA_API_URL: fga.baseUrl,
+    OPENFGA_GRPC_URL: fga.baseUrl,
     OPENFGA_STORE_ID: STORE,
     OPENFGA_OIDC_TOKEN_ENDPOINT: idp.url,
     OPENFGA_OIDC_CLIENT_ID: 'openfga',
@@ -81,13 +91,13 @@ const env = (): NodeJS.ProcessEnv =>
 
 /** Fifty subjects arriving in one tick, all refused. */
 const stormConcurrent = async (): Promise<ReadonlyArray<readonly string[]>> => {
-  fga.reply({ status: 401, body: { code: 'unauthenticated' } });
+  fga.reply({ code: Code.Unauthenticated, metadata: { 'x-fake-trailer': SERVER_METADATA_SECRET } });
   return Promise.all(subjects(SUBJECTS).map((s) => grantsForSubject(s, T0, env())));
 };
 
 /** The same fifty, one after another. */
 const stormSequential = async (): Promise<void> => {
-  fga.reply({ status: 401, body: { code: 'unauthenticated' } });
+  fga.reply({ code: Code.Unauthenticated, metadata: { 'x-fake-trailer': SERVER_METADATA_SECRET } });
   for (const s of subjects(SUBJECTS)) await grantsForSubject(s, T0, env());
 };
 
@@ -141,6 +151,10 @@ describe('50 subjects against a permanently unauthenticated OpenFGA', () => {
   }, 60_000);
 
   it('CONCURRENT: one re-mint serves the whole fleet — was 26, now 2', async () => {
+    // RE-MEASURED AFTER THE MOVE TO gRPC, and the headline is unchanged: 2.
+    // Three consecutive runs gave exactly 2 where the HTTP measurement gave 2
+    // with more spread, because one multiplexed connection makes the retry wave
+    // tighter rather than wider.
     await stormConcurrent();
 
     // The headline. A band, not a point: the lower bound catches a fake that
@@ -160,10 +174,7 @@ describe('50 subjects against a permanently unauthenticated OpenFGA', () => {
     // sent. Reverting that threading turns this line red, not the count above.
     expect(c['token_refresh_blind']).toBeUndefined();
 
-    // Every retrying subject asked, and the answers account for all of them:
-    // one discarded its own token and re-minted, one found a re-mint already in
-    // flight, and the rest took a token they had not tried. Those forty-eight
-    // are mints that did not happen.
+    // Every retrying subject asked, and the answers account for all of them.
     expect(c['token_refresh_requested']).toBe(SUBJECTS);
     expect(
       (c['token_refresh_discarded'] ?? 0) +
@@ -171,7 +182,26 @@ describe('50 subjects against a permanently unauthenticated OpenFGA', () => {
         (c['token_refresh_empty'] ?? 0) +
         (c['token_refresh_blind'] ?? 0),
     ).toBe(SUBJECTS);
-    expect(c['token_refresh_superseded']).toBeGreaterThan(SUBJECTS / 2);
+
+    // WHICH PROTECTED OUTCOME THEY GOT MOVED WITH THE TRANSPORT, and the
+    // measurement is worth writing down rather than smoothing over. Over
+    // HTTP/1.1 the fifty 401s came back on many sockets and therefore
+    // staggered, so most subjects reached the refresh path after a NEWER token
+    // was already cached and were counted `superseded` (measured: more than
+    // half). Over gRPC all fifty streams are multiplexed on ONE h2 connection,
+    // so the refusals arrive in one batch: the first subject discards the token
+    // it presented and the other forty-nine find the cache already EMPTY.
+    // Measured, and identical across three runs: discarded 1, empty 49,
+    // superseded 0.
+    //
+    // BOTH ARE THE PROTECTED OUTCOME — neither throws away a token it cannot
+    // show was its own — so the assertion is on the property rather than on
+    // whichever of the two the interleaving produces. The one that must never
+    // appear is `blind`, asserted above.
+    expect((c['token_refresh_discarded'] ?? 0) + (c['token_refresh_empty'] ?? 0)).toBe(SUBJECTS);
+    // At most a handful discarded, which is the same claim the mint ceiling
+    // makes from the other side: a discard is what buys a forced mint.
+    expect(c['token_refresh_discarded'] ?? 0).toBeLessThanOrEqual(CONCURRENT_MINT_CEILING);
 
     // One cold mint, and every forced mint bought by a discard of the caller's
     // own token. Single flight is intact: all fifty arrived in one tick.
@@ -210,17 +240,32 @@ describe('50 subjects against a permanently unauthenticated OpenFGA', () => {
     // A hundred failures produce a hundred log lines, which is the condition
     // under which a leak is least likely to be noticed and most likely to be
     // shipped to an aggregator. The module's hygiene rule is asserted at the
-    // volume that tests it — and this is the only assertion in the repository
-    // that catches grants.ts logging an axios error OBJECT, whose serialised
-    // request config carries the bearer.
+    // volume that tests it.
+    //
+    // THE VECTOR CHANGED WITH THE TRANSPORT, and the assertion had to follow it
+    // rather than be carried over. Under axios the danger was logging the error
+    // OBJECT, whose serialised request config carried the bearer we sent. A
+    // ConnectError carries no request config — but it does carry `metadata`,
+    // the response headers and trailers, and Node's inspector prints a Headers
+    // object's contents. So the leak is now the far side's data rather than
+    // ours, and the fake attaches a secret-shaped trailer to every refusal so
+    // that `console.error(err)` in place of `console.error(err.message)` turns
+    // this red. The three original assertions stay: a mutation that started
+    // logging the whole error, or the auth headers, still has to get past them.
     await stormConcurrent();
 
     expect(printed.length).toBeGreaterThan(0);
-    const text = JSON.stringify(printed);
+    // JSON.stringify alone would MISS this: a Headers object serialises to
+    // `{}`, so the leak it is guarding would be invisible to it. The log is
+    // therefore also rendered the way a console renders it.
+    const text =
+      JSON.stringify(printed) +
+      printed.map((line) => line.map((arg) => inspect(arg)).join(' ')).join('\n');
     expect(text).not.toContain(PASSWORD);
     // Any of them, not just the first: the IdP mints a distinct token per grant
     // and a leak of the twenty-sixth is a leak.
     expect(text).not.toMatch(/token-\d+/);
     expect(text).not.toContain('Bearer');
+    expect(text).not.toContain(SERVER_METADATA_SECRET);
   }, 60_000);
 });

@@ -3,13 +3,22 @@
  *
  * openfga-token.test.ts proves the provider mints, caches, refreshes and fails
  * closed on its own. This file proves the Check USES it: that the bearer on the
- * wire is the minted one, that a 401 buys exactly one re-mint and not a loop,
- * and — the property that keeps an operator honest — that a failed mint stops
- * the Check happening at all rather than sending it unauthenticated.
+ * wire is the minted one, that an `unauthenticated` buys exactly one re-mint
+ * and not a loop, and — the property that keeps an operator honest — that a
+ * failed mint stops the Check happening at all rather than sending it
+ * unauthenticated.
+ *
+ * THE TRIGGER IS NOW A gRPC CODE, NOT A STATUS. The rule is unchanged and the
+ * hinge moved: `Code.Unauthenticated` is what HTTP 401 was, and
+ * `Code.PermissionDenied` is what 403 was. They are not interchangeable — one
+ * says "I do not know who you are", which a fresh token can fix, and the other
+ * says "I know, and no", which it cannot. Retrying the second is how a denial
+ * becomes a mint storm.
  *
  * Both fakes are real sockets, so what is asserted is the request that went out,
  * not the one the code meant to make.
  */
+import { Code } from '@connectrpc/connect';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { grantsForSubject, resetEntitlementGrantsForTest } from '../../src/entitlements/grants.js';
 import {
@@ -28,7 +37,7 @@ let idp: FakeTokenEndpoint;
 
 const env = (over: Record<string, string | undefined> = {}): NodeJS.ProcessEnv =>
   ({
-    OPENFGA_API_URL: fga.baseUrl,
+    OPENFGA_GRPC_URL: fga.baseUrl,
     OPENFGA_STORE_ID: STORE,
     OPENFGA_OIDC_TOKEN_ENDPOINT: idp.url,
     OPENFGA_OIDC_CLIENT_ID: 'openfga',
@@ -95,12 +104,12 @@ describe('the Check under the OIDC credential', () => {
   });
 });
 
-describe('a 401 from OpenFGA', () => {
+describe('an `unauthenticated` from OpenFGA', () => {
   it('forces exactly ONE re-mint and then succeeds, if the new token is accepted', async () => {
     // The real shape of a rotation race: the cached token was valid when it was
     // cached and is not any more. The 401 applies to the FIRST call only, so
     // the retry meets a healthy OpenFGA — no timer, no race.
-    fga.replyOnce({ status: 401, body: { code: 'unauthenticated' } });
+    fga.replyOnce({ code: Code.Unauthenticated });
     idp.reply({ body: { access_token: 'token-2', expires_in: 600 } });
 
     expect(await grantsForSubject(SUB, T0, env())).toEqual(['inventory_levels']);
@@ -111,7 +120,7 @@ describe('a 401 from OpenFGA', () => {
   });
 
   it('denies with an error after ONE retry — it never loops', async () => {
-    fga.reply({ status: 401, body: { code: 'unauthenticated' } });
+    fga.reply({ code: Code.Unauthenticated });
 
     const grants = await grantsForSubject(SUB, T0, env());
 
@@ -123,9 +132,9 @@ describe('a 401 from OpenFGA', () => {
   });
 
   it('does NOT re-mint on the static path — there is nothing to re-mint', async () => {
-    fga.reply({ status: 401, body: { code: 'unauthenticated' } });
+    fga.reply({ code: Code.Unauthenticated });
     const staticEnv = {
-      OPENFGA_API_URL: fga.baseUrl,
+      OPENFGA_GRPC_URL: fga.baseUrl,
       OPENFGA_STORE_ID: STORE,
       OPENFGA_API_TOKEN: 'preshared',
     } as NodeJS.ProcessEnv;
@@ -138,8 +147,8 @@ describe('a 401 from OpenFGA', () => {
     expect(idp.calls).toHaveLength(0);
   });
 
-  it('does not retry a 403, which is a decision rather than a stale credential', async () => {
-    fga.reply({ status: 403, body: { code: 'forbidden' } });
+  it('does not retry a permission_denied, which is a decision rather than a stale credential', async () => {
+    fga.reply({ code: Code.PermissionDenied });
 
     expect(await grantsForSubject(SUB, T0, env())).toEqual([]);
     expect(fga.calls).toHaveLength(1);
@@ -151,7 +160,7 @@ describe('with no credential configured at all', () => {
     // The documented local-dev shape. It is a DIFFERENT state from "a
     // credential was configured and could not be obtained", and the two must
     // not collapse into each other.
-    const bare = { OPENFGA_API_URL: fga.baseUrl, OPENFGA_STORE_ID: STORE } as NodeJS.ProcessEnv;
+    const bare = { OPENFGA_GRPC_URL: fga.baseUrl, OPENFGA_STORE_ID: STORE } as NodeJS.ProcessEnv;
 
     expect(await grantsForSubject(SUB, T0, bare)).toEqual(['inventory_levels']);
     expect(fga.calls[0]?.authorization).toBeUndefined();
