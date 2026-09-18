@@ -32,8 +32,22 @@ import * as http from 'node:http';
 import type { AddressInfo, Socket } from 'node:net';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 
-/** The provider slug, matching fc-infra's `openfga-oidc.yaml` blueprint. */
-export const PROVIDER_SLUG = 'fc-coordinator';
+/**
+ * TWO PROVIDERS ON ONE AUTHENTIK, and conflating them is how an acceptance step
+ * reads a working mesh path as a failure.
+ *
+ * `openfga` issues the OpenFGA SERVICE ACCOUNT's token — the credential this
+ * unit moves onto the mirror. fc-infra pins its issuer in three merged places,
+ * e.g. `nodes/fc-ha-01/multicluster/openfga-oidc-STAGE9.yaml:83`:
+ * `https://auth.mindsignals1.com/application/o/openfga/`.
+ *
+ * `fc-coordinator` issues the USER's token, and it is that provider's key set
+ * the coordinator fetches — `OIDC_JWKS_URI` ends `/application/o/fc-coordinator/jwks/`.
+ *
+ * Same host, same mirror, different issuer paths. The fixture serves both.
+ */
+export const OPENFGA_PROVIDER_SLUG = 'openfga';
+export const USER_PROVIDER_SLUG = 'fc-coordinator';
 
 export interface AuthentikCall {
   method: string;
@@ -60,9 +74,14 @@ export interface FakeAuthentik {
   close: () => Promise<void>;
 }
 
-/** Exactly Authentik's `request.build_absolute_uri(url)` for `issuer_mode: per_provider`. */
+/**
+ * Exactly Authentik's `request.build_absolute_uri(url)` for
+ * `issuer_mode: per_provider`, for the OPENFGA provider — the token this unit
+ * moves. Scheme from `X-Forwarded-Proto`, authority from `Host`, both taken
+ * from the request and neither from configuration.
+ */
 export const issuerFor = (host: string | undefined, forwardedProto: string | undefined): string =>
-  `${forwardedProto ?? 'http'}://${host ?? ''}/application/o/${PROVIDER_SLUG}/`;
+  `${forwardedProto ?? 'http'}://${host ?? ''}/application/o/${OPENFGA_PROVIDER_SLUG}/`;
 
 export async function startFakeAuthentik(): Promise<FakeAuthentik> {
   const { privateKey, publicKey } = await generateKeyPair('RS256');
@@ -122,7 +141,7 @@ export async function startFakeAuthentik(): Promise<FakeAuthentik> {
   return {
     origin,
     tokenEndpoint: `${origin}/application/o/token/`,
-    jwksUri: `${origin}/application/o/${PROVIDER_SLUG}/jwks/`,
+    jwksUri: `${origin}/application/o/${USER_PROVIDER_SLUG}/jwks/`,
     calls,
     get jwksCalls() {
       return calls.filter((c) => c.path.endsWith('/jwks/'));

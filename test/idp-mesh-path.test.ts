@@ -31,7 +31,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { decodeJwt } from 'jose';
-import { createAccessTokenVerifier, createRemoteJwks } from '../src/auth/oidc.js';
+import { createAccessTokenVerifier, createJwksFor } from '../src/auth/oidc.js';
 import { resolveAuthConfig } from '../src/auth/config.js';
 import {
   getOpenFgaToken,
@@ -40,7 +40,14 @@ import {
 import { issuerFor, startFakeAuthentik, type FakeAuthentik } from './helpers/fakeAuthentik.js';
 
 const PUBLIC_HOST = 'auth.mindsignals1.com';
-const PUBLIC_ISSUER = `https://${PUBLIC_HOST}/application/o/fc-coordinator/`;
+/**
+ * The issuer of the token this unit moves: the OPENFGA service account's, from
+ * the `openfga` provider. NOT `/application/o/fc-coordinator/`, which is the
+ * USER-token provider whose key set `OIDC_JWKS_URI` names. Both live on the
+ * same Authentik and both reach it through the same mirror; only one of them
+ * is the credential the mint returns. fc-infra pins this in three merged files.
+ */
+const PUBLIC_ISSUER = `https://${PUBLIC_HOST}/application/o/openfga/`;
 const T0 = 1_780_000_000_000;
 
 let idp: FakeAuthentik;
@@ -113,7 +120,9 @@ describe('the JWKS fetch through the mirror', () => {
 
     // A real jose resolver against a real socket. The kid will not match any
     // key it is asked for; the fetch is the thing under test.
-    const jwks = createRemoteJwks(config.jwksUri, { headers: config.jwksPath.headers });
+    // THE WIRING PRODUCTION USES, not a hand-typed copy of it: src/server.ts
+    // calls this exact function, so deleting the headers inside it fails here.
+    const jwks = createJwksFor(config.jwksPath);
     await jwks({ alg: 'RS256', kid: 'authentik-kid-1' }).catch(() => undefined);
 
     expect(idp.jwksCalls).toHaveLength(1);
@@ -134,13 +143,23 @@ describe('the JWKS fetch through the mirror', () => {
       IDP_PUBLIC_HOST: PUBLIC_HOST,
     });
     const verify = createAccessTokenVerifier({
-      jwks: createRemoteJwks(config.jwksUri, { headers: config.jwksPath.headers }),
+      jwks: createJwksFor(config.jwksPath),
       issuer: config.issuer,
       audience: config.audience,
       algorithms: ['RS256'],
     });
 
     expect((await verify(token as string)).ok).toBe(true);
+  });
+
+  it('names the USER provider, whose key set this is — not the one that minted the token', async () => {
+    // The two are different providers on one Authentik and the difference is
+    // load-bearing for the acceptance step an operator runs: the mint returns
+    // `/application/o/openfga/` and the key set lives at
+    // `/application/o/fc-coordinator/jwks/`. Comparing one against the other
+    // reads a working mesh path as a failure.
+    expect(idp.jwksUri).toContain('/application/o/fc-coordinator/jwks/');
+    expect(PUBLIC_ISSUER).toContain('/application/o/openfga/');
   });
 
   it('the public https path fetches with no injected headers at all', async () => {
