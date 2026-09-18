@@ -192,3 +192,57 @@ describe('resolveAuthConfig and the in-cluster IdP mirror', () => {
     expect(config.jwksPath.description).toBe('public https auth.figurecollecting.com');
   });
 });
+
+// ===========================================================================
+// THE TWO IdP URLs MUST AGREE (adversarial review of PR #10, SHOULD-3)
+//
+// resolveAuthConfig is where this is enforced because it is the boot-time
+// resolver that already THROWS, and because it is the only one that sees both
+// variables: the token endpoint's own module fails soft by contract — the mint
+// returns null and every check denies — so a token endpoint moved to the
+// mirror on its own produced a RUNNING pod that redacted every read. The JWKS
+// half already crash-looped. Now both do.
+// ===========================================================================
+describe('resolveAuthConfig refuses a half-finished repoint', () => {
+  const JWKS_MESH = 'http://authentik-mc-fc-ha.authz.svc.cluster.local:9000/application/o/fc-coordinator/jwks/';
+  const TOKEN_MESH = 'http://authentik-mc-fc-ha.authz.svc.cluster.local:9000/application/o/token/';
+  const TOKEN_PUBLIC = 'https://auth.mindsignals1.com/application/o/token/';
+  const PUBLIC_HOST = 'auth.mindsignals1.com';
+
+  it('throws when only the token endpoint names the mirror', () => {
+    expect(() =>
+      resolveAuthConfig({
+        ...COMPLETE,
+        IDP_PUBLIC_HOST: PUBLIC_HOST,
+        OPENFGA_OIDC_TOKEN_ENDPOINT: TOKEN_MESH,
+      }),
+    ).toThrow(/OPENFGA_OIDC_TOKEN_ENDPOINT/);
+  });
+
+  it('throws when only the JWKS URI names the mirror', () => {
+    expect(() =>
+      resolveAuthConfig({
+        ...COMPLETE,
+        OIDC_JWKS_URI: JWKS_MESH,
+        IDP_PUBLIC_HOST: PUBLIC_HOST,
+        OPENFGA_OIDC_TOKEN_ENDPOINT: TOKEN_PUBLIC,
+      }),
+    ).toThrow(/OIDC_JWKS_URI/);
+  });
+
+  it('accepts both on the mirror together', () => {
+    const config = resolveAuthConfig({
+      ...COMPLETE,
+      OIDC_JWKS_URI: JWKS_MESH,
+      IDP_PUBLIC_HOST: PUBLIC_HOST,
+      OPENFGA_OIDC_TOKEN_ENDPOINT: TOKEN_MESH,
+    });
+    expect(config.jwksPath.kind).toBe('mesh');
+  });
+
+  it('accepts both public together, which is today production', () => {
+    expect(
+      resolveAuthConfig({ ...COMPLETE, OPENFGA_OIDC_TOKEN_ENDPOINT: TOKEN_PUBLIC }).jwksPath.kind,
+    ).toBe('public');
+  });
+});

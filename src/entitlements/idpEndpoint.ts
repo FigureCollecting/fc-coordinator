@@ -136,6 +136,20 @@ const isMeshHost = (hostname: string): boolean =>
  * spelled as a configuration: a "public" host that is a second mirror name
  * mints tokens OpenFGA refuses, silently, exactly as no header at all would.
  */
+/**
+ * One label of a hostname. Deliberately strict, because the two values this
+ * refuses both PARSE as URLs and both mint tokens OpenFGA rejects in silence:
+ * `*`, and a fully-qualified name with a trailing dot — which is a different
+ * string to an issuer check that compares bytes.
+ */
+const HOSTNAME_LABEL = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+
+const isHostname = (hostname: string): boolean =>
+  // An IPv6 literal arrives bracketed and has already been validated by the
+  // parser; a name has to look like a name.
+  hostname.startsWith('[') ||
+  (hostname !== '' && !hostname.endsWith('.') && hostname.split('.').every((l) => HOSTNAME_LABEL.test(l)));
+
 function validatePublicHost(raw: string | undefined, key: string): IdpPathResult | string {
   const value = (raw ?? '').trim();
   if (value === '') {
@@ -158,9 +172,28 @@ function validatePublicHost(raw: string | undefined, key: string): IdpPathResult
   } catch {
     return invalid;
   }
-  if (parsed.host !== value.toLowerCase() || parsed.username !== '' || parsed.password !== '') {
+  // Nothing but an authority: no userinfo, no path, no query, no fragment.
+  if (
+    parsed.username !== '' ||
+    parsed.password !== '' ||
+    parsed.pathname !== '/' ||
+    parsed.search !== '' ||
+    parsed.hash !== ''
+  ) {
     return invalid;
   }
+  // AN EXPLICIT `:443` IS ACCEPTED AND NORMALISED AWAY, which is a behaviour
+  // and not a leniency. The parser strips a default port, so comparing against
+  // `parsed.host` alone rejected the one `host:port` form an operator actually
+  // writes — with a message promising that form was allowed. And it must not
+  // be sent verbatim either: `Host: auth.mindsignals1.com:443` makes Authentik
+  // build `https://auth.mindsignals1.com:443/application/o/openfga/`, which is
+  // not the issuer OpenFGA pins, so it would cause precisely the silent
+  // refusal these headers exist to prevent. Accept the spelling, present the
+  // authority — and the boot line shows which, so nothing is hidden.
+  const spelled = value.toLowerCase();
+  if (spelled !== parsed.host && spelled !== `${parsed.hostname}:443`) return invalid;
+  if (!isHostname(parsed.hostname)) return invalid;
   if (isMeshHost(parsed.hostname)) {
     return {
       ok: false,
@@ -184,6 +217,16 @@ export function resolveIdpPath(url: URL, options: IdpPathOptions): IdpPathResult
   const { key, env, refusalSuffix = '' } = options;
   const mesh = isMeshHost(url.hostname);
   const loopback = LOOPBACK_HOSTS.has(url.hostname);
+
+  // EVERY PATH, not only the public one. The https rule below used to be the
+  // only scheme check, so `ftp:` or `file:` to a cluster-local name classified
+  // as a healthy mirror and printed a boot line saying so. It failed closed
+  // downstream — axios refuses the protocol before dialling — but a boot line
+  // announcing a working mirror for a provider that cannot mint is the exact
+  // thing ./openfgaToken.ts's boot rule exists to prevent.
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    return { ok: false, reason: `${key} must use http or https, got '${url.protocol}'${refusalSuffix}` };
+  }
 
   if (!mesh && !loopback) {
     // THE RULE THAT IS NOT BEING RELAXED, and its message is unchanged to the
@@ -232,4 +275,57 @@ export function resolveIdpPath(url: URL, options: IdpPathOptions): IdpPathResult
       description: `${kind === 'mesh' ? 'mesh mirror' : 'loopback'} ${url.host} presenting Host ${validated}`,
     },
   };
+}
+
+/** The two settings that name the identity provider. Both, or neither, on the mirror. */
+export const JWKS_URI_KEY = 'OIDC_JWKS_URI';
+export const TOKEN_ENDPOINT_KEY = 'OPENFGA_OIDC_TOKEN_ENDPOINT';
+
+/** `true` on the mirror, `false` off it, `null` when there is nothing to classify. */
+function onMesh(raw: string | undefined): boolean | null {
+  const value = (raw ?? '').trim();
+  if (value === '') return null;
+  try {
+    return isMeshHost(new URL(value).hostname);
+  } catch {
+    // Unparseable is somebody else's error to report, with their own message
+    // and their own redaction rules. Reporting it twice, in two vocabularies,
+    // sends an operator to the wrong line.
+    return null;
+  }
+}
+
+/**
+ * THE HALF-FINISHED REPOINT, REFUSED AT BOOT. Returns the reason, or null.
+ *
+ * WHY THIS EXISTS AND WHY IT IS A HARD FAILURE. The two IdP settings fail in
+ * opposite directions when the mirror is named without a public host. The JWKS
+ * URI is resolved by ../auth/config.ts, which THROWS, so the pod crash-loops
+ * and an operator sees it in one reading. The token endpoint is resolved by
+ * ./openfgaToken.ts, whose whole contract is to fail SOFT — a mint that cannot
+ * happen returns null and every entitlement check denies — so moving that half
+ * alone produced a RUNNING pod that redacted every read, with nothing but a log
+ * line to say why. That asymmetry made the deployment note "setting these
+ * crash-loops the pod" true of one order of operations and false of the other.
+ *
+ * ANCHORED ON `mesh`, NOT ON ALL THREE KINDS BEING EQUAL. A loopback fixture
+ * beside a public URL is a development shape, not a partial migration, and
+ * refusing it would buy nothing and break every local run. What cannot happen
+ * is one hop inside the cluster and the other outside it.
+ *
+ * THE COST, STATED: the two hops can no longer be migrated one at a time. They
+ * move together or not at all. That is a real constraint on a rollout — and it
+ * is the price of removing a configuration whose failure mode is a silent,
+ * total, fail-closed outage.
+ */
+export function idpPathsDisagree(env: NodeJS.ProcessEnv): string | null {
+  const jwks = onMesh(env[JWKS_URI_KEY]);
+  const token = onMesh(env[TOKEN_ENDPOINT_KEY]);
+  if (jwks === null || token === null || jwks === token) return null;
+
+  const [inside, outside] = jwks ? [JWKS_URI_KEY, TOKEN_ENDPOINT_KEY] : [TOKEN_ENDPOINT_KEY, JWKS_URI_KEY];
+  return (
+    `${inside} names the in-cluster mesh mirror and ${outside} does not — the two identity-provider ` +
+    `hops move together or not at all, because a half-finished repoint denies every read instead of failing loudly`
+  );
 }

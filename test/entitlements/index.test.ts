@@ -36,6 +36,9 @@ const EXPECTED_FUNCTIONS = [
   // rather than writing a second, slightly different copy — which is exactly
   // the state R7 found and removed.
   'resolveIdpPath',
+  // and the boot check that refuses a HALF-finished repoint, which needs both
+  // settings at once and so belongs to neither resolver
+  'idpPathsDisagree',
   // observability
   'entitlementGrantCounters',
   'entitlementMintCounters',
@@ -59,6 +62,8 @@ const EXPECTED_VALUES = [
   // variable a manifest must set when one is.
   'MESH_HOST_SUFFIX',
   'IDP_PUBLIC_HOST_KEY',
+  'JWKS_URI_KEY',
+  'TOKEN_ENDPOINT_KEY',
 ].sort();
 
 describe('src/entitlements public surface', () => {

@@ -37,6 +37,7 @@ import { describe, expect, it } from 'vitest';
 import {
   IDP_PUBLIC_HOST_KEY,
   MESH_HOST_SUFFIX,
+  idpPathsDisagree,
   resolveIdpPath,
 } from '../../src/entitlements/idpEndpoint.js';
 
@@ -240,5 +241,126 @@ describe('loopback, which every fixture in this suite is reached over', () => {
     expect(
       ok(resolve('http://127.0.0.1:9000/token', { IDP_PUBLIC_HOST: PUBLIC_HOST })).path.description,
     ).toBe('loopback 127.0.0.1:9000 presenting Host auth.mindsignals1.com');
+  });
+});
+
+// ===========================================================================
+// HARDENING FROM THE ADVERSARIAL REVIEW OF PR #10
+// ===========================================================================
+describe('the public host accepts the form an operator actually writes', () => {
+  it('accepts an explicit :443 and PRESENTS it without the default port', () => {
+    // The message promised `host:port`, and the URL parser strips a default
+    // port, so the one host:port form anyone writes by hand was refused by a
+    // message saying it was allowed. Accepted now — and NORMALISED, because
+    // `Host: auth.mindsignals1.com:443` would make Authentik build
+    // `https://auth.mindsignals1.com:443/application/o/openfga/` and OpenFGA
+    // pins the issuer WITHOUT the port. Sending it verbatim would produce
+    // exactly the refusal these headers exist to prevent.
+    const { path } = ok(resolve(MIRROR, { IDP_PUBLIC_HOST: 'auth.mindsignals1.com:443' }));
+    expect(path.headers['host']).toBe('auth.mindsignals1.com');
+    expect(path.description).toContain('presenting Host auth.mindsignals1.com');
+  });
+
+  it('keeps a NON-default port, which is a real authority and not redundant spelling', () => {
+    expect(ok(resolve(MIRROR, { IDP_PUBLIC_HOST: 'auth.mindsignals1.com:8443' })).path.headers['host'])
+      .toBe('auth.mindsignals1.com:8443');
+  });
+
+  it('REFUSES a name the URL parser rewrites, such as a Cyrillic homograph', () => {
+    // `\u0430uth.mindsignals1.com` parses to `xn--uth-5cd.mindsignals1.com`. It is a
+    // DIFFERENT authority to the one written, and what would go on the wire is
+    // the punycode form — so accepting it would mean the Host header did not
+    // say what the manifest said. Refused rather than silently rewritten: an
+    // operator who wants an internationalised host writes the A-label.
+    const refused = resolve(MIRROR, { IDP_PUBLIC_HOST: '\u0430uth.mindsignals1.com' });
+    expect(refused.ok).toBe(false);
+    if (refused.ok) return;
+    expect(refused.reason).toContain(IDP_PUBLIC_HOST_KEY);
+  });
+
+  it('accepts the same host written in capitals, which is the same authority', () => {
+    expect(ok(resolve(MIRROR, { IDP_PUBLIC_HOST: 'AUTH.Mindsignals1.COM' })).path.headers['host'])
+      .toBe('auth.mindsignals1.com');
+  });
+
+  it.each([
+    ['a wildcard', '*'],
+    ['a trailing dot, which is a different name to a strict issuer check', 'auth.mindsignals1.com.'],
+    ['an empty label', 'auth..mindsignals1.com'],
+    ['a leading dot', '.mindsignals1.com'],
+  ])('REFUSES %s, which would mint tokens OpenFGA refuses in silence', (_label, value) => {
+    expect(resolve(MIRROR, { IDP_PUBLIC_HOST: value }).ok).toBe(false);
+  });
+});
+
+describe('the scheme is checked on EVERY path, not only the public one', () => {
+  it.each([
+    ['ftp', 'ftp://authentik-mc-fc-ha.authz.svc.cluster.local:9000/token'],
+    ['file', 'file://authentik-mc-fc-ha.authz.svc.cluster.local/token'],
+  ])('REFUSES %s to a mesh host rather than calling it a healthy mirror', (_label, raw) => {
+    // It failed closed downstream — axios refuses the protocol before dialling
+    // — but it printed a boot line saying the mirror was configured and well,
+    // which is the one thing openfgaToken.ts's boot rule exists to prevent.
+    const refused = resolve(raw, { IDP_PUBLIC_HOST: PUBLIC_HOST });
+    expect(refused.ok).toBe(false);
+    if (refused.ok) return;
+    expect(refused.reason).toContain(KEY);
+  });
+
+  it('REFUSES a non-http scheme to loopback too', () => {
+    expect(resolve('ftp://127.0.0.1:9000/token').ok).toBe(false);
+  });
+});
+
+describe('the two IdP URLs must agree about whether the path is in-cluster', () => {
+  const JWKS_MESH = 'http://authentik-mc-fc-ha.authz.svc.cluster.local:9000/application/o/fc-coordinator/jwks/';
+  const JWKS_PUBLIC = 'https://auth.mindsignals1.com/application/o/fc-coordinator/jwks/';
+  const TOKEN_MESH = 'http://authentik-mc-fc-ha.authz.svc.cluster.local:9000/application/o/token/';
+  const TOKEN_PUBLIC = 'https://auth.mindsignals1.com/application/o/token/';
+
+  const check = (over: Record<string, string | undefined>): string | null =>
+    idpPathsDisagree({ IDP_PUBLIC_HOST: PUBLIC_HOST, ...over } as NodeJS.ProcessEnv);
+
+  it('accepts both on the mirror', () => {
+    expect(check({ OIDC_JWKS_URI: JWKS_MESH, OPENFGA_OIDC_TOKEN_ENDPOINT: TOKEN_MESH })).toBeNull();
+  });
+
+  it('accepts both public', () => {
+    expect(check({ OIDC_JWKS_URI: JWKS_PUBLIC, OPENFGA_OIDC_TOKEN_ENDPOINT: TOKEN_PUBLIC })).toBeNull();
+  });
+
+  it('REFUSES the token endpoint moved alone — the shape that boots and denies everything', () => {
+    // WHY THIS IS THE DANGEROUS ONE. A mesh JWKS URI with no public host THROWS
+    // and the pod crash-loops, which an operator sees immediately. The token
+    // endpoint fails SOFT by design — the mint returns null and every check
+    // denies — so a half-finished repoint produces a running pod that redacts
+    // every read. Refusing the mismatch at boot turns that into the crash the
+    // other half already was.
+    const reason = check({ OIDC_JWKS_URI: JWKS_PUBLIC, OPENFGA_OIDC_TOKEN_ENDPOINT: TOKEN_MESH });
+    expect(reason).not.toBeNull();
+    expect(reason).toContain('OPENFGA_OIDC_TOKEN_ENDPOINT');
+    expect(reason).toContain('OIDC_JWKS_URI');
+  });
+
+  it('REFUSES the JWKS URI moved alone', () => {
+    expect(check({ OIDC_JWKS_URI: JWKS_MESH, OPENFGA_OIDC_TOKEN_ENDPOINT: TOKEN_PUBLIC })).not.toBeNull();
+  });
+
+  it('says nothing when the token endpoint is unconfigured — that is not a half-repoint', () => {
+    // OpenFGA unconfigured is a documented state with its own warning. Pairing
+    // it with an agreement failure would report the wrong problem.
+    expect(check({ OIDC_JWKS_URI: JWKS_MESH })).toBeNull();
+    expect(check({ OIDC_JWKS_URI: JWKS_PUBLIC })).toBeNull();
+  });
+
+  it('leaves loopback alone, which is every fixture in this suite', () => {
+    // The rule is anchored on MESH, not on strict equality of the three kinds:
+    // a loopback fixture beside a public URL is a development shape, not a
+    // partial migration, and refusing it would buy nothing.
+    expect(check({ OIDC_JWKS_URI: JWKS_PUBLIC, OPENFGA_OIDC_TOKEN_ENDPOINT: 'http://127.0.0.1:9/token' })).toBeNull();
+  });
+
+  it('says nothing about a URL it cannot parse, leaving that to the resolver that reports it', () => {
+    expect(check({ OIDC_JWKS_URI: 'not a url', OPENFGA_OIDC_TOKEN_ENDPOINT: TOKEN_MESH })).toBeNull();
   });
 });

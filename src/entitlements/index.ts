@@ -76,8 +76,11 @@ export { isEntitlementSubject, ENTITLEMENT_SUBJECT_PATTERN } from './subject.js'
  */
 export {
   resolveIdpPath,
+  idpPathsDisagree,
   MESH_HOST_SUFFIX,
   IDP_PUBLIC_HOST_KEY,
+  JWKS_URI_KEY,
+  TOKEN_ENDPOINT_KEY,
   type IdpPath,
   type IdpPathKind,
   type IdpPathOptions,

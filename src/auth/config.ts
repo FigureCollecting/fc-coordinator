@@ -44,7 +44,7 @@
 // instead of a note in a runbook. See test/connect/prefix.test.ts.
 // ============================================================================
 
-import { resolveIdpPath, type IdpPath } from '../entitlements/index.js';
+import { idpPathsDisagree, resolveIdpPath, type IdpPath } from '../entitlements/index.js';
 
 export type Env = Record<string, string | undefined>;
 
@@ -188,6 +188,16 @@ export function resolveAuthConfig(env: Env = process.env): AuthConfig {
   const resolved = resolveIdpPath(jwksUri, { key: 'OIDC_JWKS_URI', env: env as NodeJS.ProcessEnv });
   if (!resolved.ok) throw new Error(resolved.reason);
   const jwksPath = resolved.path;
+
+  // BOTH IdP HOPS MOVE TOGETHER, and this is the only boot-time resolver that
+  // sees both settings. The token endpoint's own module fails SOFT by contract
+  // — a mint it cannot make returns null and every entitlement check denies —
+  // so a repoint that moved that half alone left a RUNNING pod redacting every
+  // read, while the same mistake on this half crash-looped. Refusing the
+  // mismatch here makes the two halves fail the same way. See
+  // entitlements/idpEndpoint.ts for the argument and its cost.
+  const disagreement = idpPathsDisagree(env as NodeJS.ProcessEnv);
+  if (disagreement !== null) throw new Error(disagreement);
 
   const originRaw = required(env, 'COORDINATOR_PUBLIC_ORIGIN');
   let origin: URL;
