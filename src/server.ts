@@ -15,8 +15,9 @@
 //      optional DPOP_* and DEVICE_CACHE_TTL_SECONDS tuning knobs,
 //      IDP_PUBLIC_HOST, REQUIRED only when an IdP URL names the in-cluster
 //      Authentik mirror: it is the public authority every such request
-//      presents, because Authentik derives the token issuer from the request
-//      (entitlements/idpEndpoint.ts). OIDC_ISSUER does NOT change with it,
+//      presents in Host and X-Forwarded-Host, because Authentik derives the
+//      token issuer from the request and the multicluster gateway rewrites
+//      Host (entitlements/idpEndpoint.ts). OIDC_ISSUER does NOT change with it,
 //      COORDINATOR_ROUTE_PREFIX (default /api — everything except /healthz is
 //      served under it, and the edge must NOT rewrite it away),
 //      SPINE_READ_URL (+ SPINE_READ_TIMEOUT_MS) for the mesh hop, OPENFGA_* for

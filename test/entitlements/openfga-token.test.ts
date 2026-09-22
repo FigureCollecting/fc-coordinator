@@ -952,7 +952,7 @@ describe('the boot line names the IdP path', () => {
       ),
     );
     expect(String(logs[1]?.[0])).toBe(
-      '[ENTITLEMENT] idp: mesh mirror authentik-mc-fc-ha.authz.svc.cluster.local:9000 presenting Host auth.mindsignals1.com',
+      '[ENTITLEMENT] idp: mesh mirror authentik-mc-fc-ha.authz.svc.cluster.local:9000 presenting Host and X-Forwarded-Host auth.mindsignals1.com',
     );
   });
 

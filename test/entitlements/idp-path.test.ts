@@ -20,8 +20,9 @@
  * WHY THE PUBLIC HOST IS REQUIRED RATHER THAN OPTIONAL, which is the part that
  * is not obvious from the transport change alone. Authentik derives the token's
  * `iss` from the REQUEST — `request.build_absolute_uri`, in both issuer modes —
- * so a mint reached through the mirror without `Host` and `X-Forwarded-Proto`
- * returns a token whose issuer names `authentik-mc-fc-ha.authz.svc.cluster.local`.
+ * so a mint reached through the mirror without `X-Forwarded-Host` and
+ * `X-Forwarded-Proto` returns a token whose issuer names the in-cluster Service:
+ * the multicluster gateway rewrites `Host`, so `Host` alone cannot carry it.
  * OpenFGA pins the public issuer, refuses every such token, and the refusal
  * surfaces as reads coming back redacted. A mesh URL with no public host is
  * therefore not a working configuration with a missing nicety; it is a
@@ -99,10 +100,13 @@ describe('the mesh mirror path', () => {
     expect(path.publicHost).toBe(PUBLIC_HOST);
   });
 
-  it('carries the two headers Authentik needs to mint a PUBLIC issuer', () => {
+  it('carries the three headers Authentik needs to mint a PUBLIC issuer', () => {
+    // X-Forwarded-Host is the one that survives the multicluster gateway, which
+    // rewrites Host to its local target (measured on prod 2026-09-22).
     const { path } = ok(resolve(MIRROR, { IDP_PUBLIC_HOST: PUBLIC_HOST }));
     expect(path.headers).toEqual({
       host: PUBLIC_HOST,
+      'x-forwarded-host': PUBLIC_HOST,
       'x-forwarded-proto': 'https',
     });
   });
@@ -110,7 +114,7 @@ describe('the mesh mirror path', () => {
   it('names the mirror AND the authority it presents, so a boot log is diagnostic', () => {
     const { path } = ok(resolve(MIRROR, { IDP_PUBLIC_HOST: PUBLIC_HOST }));
     expect(path.description).toBe(
-      'mesh mirror authentik-mc-fc-ha.authz.svc.cluster.local:9000 presenting Host auth.mindsignals1.com',
+      'mesh mirror authentik-mc-fc-ha.authz.svc.cluster.local:9000 presenting Host and X-Forwarded-Host auth.mindsignals1.com',
     );
   });
 
@@ -151,6 +155,7 @@ describe('the mesh mirror path', () => {
   it('accepts a public host carrying a port, which an edge on a non-443 port needs', () => {
     const { path } = ok(resolve(MIRROR, { IDP_PUBLIC_HOST: 'auth.mindsignals1.com:8443' }));
     expect(path.headers['host']).toBe('auth.mindsignals1.com:8443');
+    expect(path.headers['x-forwarded-host']).toBe('auth.mindsignals1.com:8443');
   });
 
   it('matches the suffix on a LABEL boundary, so a lookalike domain is still refused', () => {
@@ -217,7 +222,11 @@ describe('loopback, which every fixture in this suite is reached over', () => {
       resolve('http://127.0.0.1:9000/application/o/token/', { IDP_PUBLIC_HOST: PUBLIC_HOST }),
     );
     expect(path.kind).toBe('loopback');
-    expect(path.headers).toEqual({ host: PUBLIC_HOST, 'x-forwarded-proto': 'https' });
+    expect(path.headers).toEqual({
+      host: PUBLIC_HOST,
+      'x-forwarded-host': PUBLIC_HOST,
+      'x-forwarded-proto': 'https',
+    });
   });
 
   it('produces the SAME headers as the mesh path, which is what makes that proof transfer', () => {
@@ -240,7 +249,7 @@ describe('loopback, which every fixture in this suite is reached over', () => {
     );
     expect(
       ok(resolve('http://127.0.0.1:9000/token', { IDP_PUBLIC_HOST: PUBLIC_HOST })).path.description,
-    ).toBe('loopback 127.0.0.1:9000 presenting Host auth.mindsignals1.com');
+    ).toBe('loopback 127.0.0.1:9000 presenting Host and X-Forwarded-Host auth.mindsignals1.com');
   });
 });
 
@@ -258,7 +267,8 @@ describe('the public host accepts the form an operator actually writes', () => {
     // exactly the refusal these headers exist to prevent.
     const { path } = ok(resolve(MIRROR, { IDP_PUBLIC_HOST: 'auth.mindsignals1.com:443' }));
     expect(path.headers['host']).toBe('auth.mindsignals1.com');
-    expect(path.description).toContain('presenting Host auth.mindsignals1.com');
+    expect(path.headers['x-forwarded-host']).toBe('auth.mindsignals1.com');
+    expect(path.description).toContain('presenting Host and X-Forwarded-Host auth.mindsignals1.com');
   });
 
   it('keeps a NON-default port, which is a real authority and not redundant spelling', () => {
