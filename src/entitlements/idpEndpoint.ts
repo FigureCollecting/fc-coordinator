@@ -32,7 +32,11 @@
  * WHY THE PUBLIC HOST IS MANDATORY ON THE MESH PATH rather than a nicety.
  * Authentik derives the issuer from the REQUEST — `request.build_absolute_uri`,
  * in BOTH issuer modes, read from its source — so the `iss` of a token minted
- * through the mirror is built out of the `Host` header and `X-Forwarded-Proto`.
+ * through the mirror is built out of `X-Forwarded-Host` (else `Host`) and
+ * `X-Forwarded-Proto`. The multicluster gateway REWRITES `Host` to its local
+ * target, measured on prod 2026-09-22, so only `X-Forwarded-Host` carries the
+ * public authority to Authentik. `Host` is still sent for a proxy that does
+ * not rewrite it.
  * Reached as the mirror with no headers, it mints
  * `http://authentik-mc-fc-ha.authz.svc.cluster.local:9000/application/o/…`,
  * OpenFGA's pinned issuer refuses every one of them, and the user-visible
@@ -267,12 +271,18 @@ export function resolveIdpPath(url: URL, options: IdpPathOptions): IdpPathResult
       kind,
       url,
       publicHost: validated,
-      // `x-forwarded-proto` is the header Django reads for the SCHEME half of
-      // the issuer, and it is https because the public issuer is https. It is
-      // not derived from this hop, which is the whole point: this hop is
-      // cleartext and the issuer must not say so.
-      headers: Object.freeze({ host: validated, 'x-forwarded-proto': 'https' }),
-      description: `${kind === 'mesh' ? 'mesh mirror' : 'loopback'} ${url.host} presenting Host ${validated}`,
+      // `x-forwarded-host` is the AUTHORITY half of the issuer: the gateway
+      // rewrites `host`, and Authentik prefers this header over it.
+      // `x-forwarded-proto` is the SCHEME half, https because the public issuer
+      // is, not because this cleartext hop is.
+      headers: Object.freeze({
+        host: validated,
+        'x-forwarded-host': validated,
+        'x-forwarded-proto': 'https',
+      }),
+      description:
+        `${kind === 'mesh' ? 'mesh mirror' : 'loopback'} ${url.host} ` +
+        `presenting Host and X-Forwarded-Host ${validated}`,
     },
   };
 }

@@ -156,7 +156,11 @@ describe('resolveAuthConfig and the in-cluster IdP mirror', () => {
     });
     expect(config.jwksUri.href).toBe(MIRROR);
     expect(config.jwksPath.kind).toBe('mesh');
-    expect(config.jwksPath.headers).toEqual({ host: PUBLIC_HOST, 'x-forwarded-proto': 'https' });
+    expect(config.jwksPath.headers).toEqual({
+      host: PUBLIC_HOST,
+      'x-forwarded-host': PUBLIC_HOST,
+      'x-forwarded-proto': 'https',
+    });
   });
 
   it('REFUSES the mirror when IDP_PUBLIC_HOST is unset', () => {

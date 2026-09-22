@@ -12,11 +12,16 @@
  *       return request.build_absolute_uri(url)
  *
  * `build_absolute_uri` takes the scheme from `X-Forwarded-Proto` (Django's
- * SECURE_PROXY_SSL_HEADER, which is how Authentik runs behind a proxy) and the
- * authority from the `Host` header. So a mint reached through the in-cluster
- * mirror WITHOUT those two headers returns a token whose `iss` names the
- * mirror, OpenFGA's issuer check refuses it, and the refusal arrives as a
- * redacted read with no line saying why.
+ * SECURE_PROXY_SSL_HEADER) and the authority from `X-Forwarded-Host` when it
+ * is present, `Host` otherwise (Authentik's front server,
+ * internal/utils/web/host.go and packages/ak-axum/src/extract/host.rs).
+ *
+ * THE MIRROR REWRITES `Host`. The Linkerd multicluster gateway replaces it with
+ * its local target's authority before Authentik sees the request, measured on
+ * prod 2026-09-22 (fc-infra acceptance-u6.sh case d). So on this path `Host`
+ * can never carry the public authority and only `X-Forwarded-Host` can. This
+ * fixture applies the same rewrite: a mint without `X-Forwarded-Host` returns
+ * a token whose `iss` names the in-cluster Service, which OpenFGA refuses.
  *
  * A fake with a pinned issuer agrees with a client that sends no headers, and
  * agreement between two things built from the same assumption is not evidence
@@ -49,13 +54,23 @@ import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 export const OPENFGA_PROVIDER_SLUG = 'openfga';
 export const USER_PROVIDER_SLUG = 'fc-coordinator';
 
+/**
+ * The authority the multicluster gateway rewrites `Host` to: the mirror's
+ * local target Service, as measured on prod 2026-09-22.
+ */
+export const GATEWAY_TARGET_AUTHORITY = 'authentik-mc.authz.svc.cluster.local:9000';
+
 export interface AuthentikCall {
   method: string;
   path: string;
-  /** As it arrived on the wire. The authority Authentik will put in `iss`. */
+  /** As the client sent it, before the gateway rewrote it. Not what `iss` uses. */
   host: string | undefined;
+  /** Decides the AUTHORITY in `iss` when present. */
+  forwardedHost: string | undefined;
   /** Django's SECURE_PROXY_SSL_HEADER. Decides the SCHEME in `iss`. */
   forwardedProto: string | undefined;
+  /** `host`, `forwarded` and every `x-forwarded-*` header, exactly as sent. */
+  proxyHeaders: Record<string, string>;
 }
 
 export interface FakeAuthentik {
@@ -75,13 +90,26 @@ export interface FakeAuthentik {
 }
 
 /**
- * Exactly Authentik's `request.build_absolute_uri(url)` for
- * `issuer_mode: per_provider`, for the OPENFGA provider — the token this unit
- * moves. Scheme from `X-Forwarded-Proto`, authority from `Host`, both taken
- * from the request and neither from configuration.
+ * Authentik's `request.build_absolute_uri(url)` for `issuer_mode: per_provider`
+ * and the OPENFGA provider, as reached through the mirror. Scheme from
+ * `X-Forwarded-Proto`; authority from `X-Forwarded-Host`, else the `Host` the
+ * gateway rewrote, never the `Host` the client sent.
  */
-export const issuerFor = (host: string | undefined, forwardedProto: string | undefined): string =>
-  `${forwardedProto ?? 'http'}://${host ?? ''}/application/o/${OPENFGA_PROVIDER_SLUG}/`;
+export const issuerFor = (call: Pick<AuthentikCall, 'forwardedHost' | 'forwardedProto'>): string =>
+  `${call.forwardedProto ?? 'http'}://${call.forwardedHost ?? GATEWAY_TARGET_AUTHORITY}/application/o/${OPENFGA_PROVIDER_SLUG}/`;
+
+const first = (value: string | string[] | undefined): string | undefined =>
+  Array.isArray(value) ? value[0] : value;
+
+const proxyHeadersOf = (headers: http.IncomingHttpHeaders): Record<string, string> => {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (name === 'host' || name === 'forwarded' || name.startsWith('x-forwarded-')) {
+      out[name] = Array.isArray(value) ? value.join(', ') : (value ?? '');
+    }
+  }
+  return out;
+};
 
 export async function startFakeAuthentik(): Promise<FakeAuthentik> {
   const { privateKey, publicKey } = await generateKeyPair('RS256');
@@ -100,9 +128,9 @@ export async function startFakeAuthentik(): Promise<FakeAuthentik> {
           method: req.method ?? '',
           path,
           host: req.headers.host,
-          forwardedProto: Array.isArray(req.headers['x-forwarded-proto'])
-            ? req.headers['x-forwarded-proto'][0]
-            : req.headers['x-forwarded-proto'],
+          forwardedHost: first(req.headers['x-forwarded-host']),
+          forwardedProto: first(req.headers['x-forwarded-proto']),
+          proxyHeaders: proxyHeadersOf(req.headers),
         };
         calls.push(call);
 
@@ -113,7 +141,7 @@ export async function startFakeAuthentik(): Promise<FakeAuthentik> {
         }
 
         // The token endpoint. `iss` comes from THIS request, as Authentik's does.
-        const issuer = issuerFor(call.host, call.forwardedProto);
+        const issuer = issuerFor(call);
         const token = await new SignJWT({})
           .setProtectedHeader({ alg: 'RS256', kid: 'authentik-kid-1' })
           .setIssuer(issuer)

@@ -471,8 +471,9 @@ interface OidcConfig {
   endpoint: string;
   /**
    * Sent with the mint. Empty on the public path; on the mirror it carries
-   * `Host` and `X-Forwarded-Proto`, which is what makes Authentik mint a token
-   * whose `iss` is the PUBLIC issuer rather than the mirror's own name.
+   * `Host`, `X-Forwarded-Host` and `X-Forwarded-Proto`, which is what makes
+   * Authentik mint a token whose `iss` is the PUBLIC issuer rather than the
+   * mirror's own name.
    */
   headers: Readonly<Record<string, string>>;
   clientId: string;
@@ -566,8 +567,9 @@ async function mint(config: OidcConfig, nowMs: number, reason: MintReason): Prom
       maxRedirects: 0,
       // The path's headers, never assembled here. On the public hop there are
       // none and this is the same request it always was; on the mirror they are
-      // `Host` and `X-Forwarded-Proto`, and without them Authentik mints an
-      // issuer naming the in-cluster Service that OpenFGA refuses silently.
+      // `Host`, `X-Forwarded-Host` and `X-Forwarded-Proto`, and without them
+      // Authentik mints an issuer naming the in-cluster Service that OpenFGA
+      // refuses silently.
       headers: { 'content-type': 'application/x-www-form-urlencoded', ...config.headers },
     });
     const data: unknown = response.data;
