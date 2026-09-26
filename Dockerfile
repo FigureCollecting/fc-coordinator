@@ -32,6 +32,8 @@ RUN apt-get update && \
 # .npmrc maps @figurecollecting to GitHub Packages; it carries only a
 # ${NODE_AUTH_TOKEN} placeholder, never a real token.
 COPY package*.json .npmrc ./
+# package.json installs fc-api-contract from a vendored pack until 0.2.0 is published.
+COPY vendor ./vendor
 
 # ============================================================================
 # Builder Stage — compiles TypeScript to ESM in dist/
@@ -84,6 +86,7 @@ RUN apt-get update && \
 WORKDIR /app
 
 COPY package*.json .npmrc ./
+COPY vendor ./vendor
 
 # Production dependencies only. Token via BuildKit secret mount — never a layer.
 RUN --mount=type=secret,id=node_auth_token \
