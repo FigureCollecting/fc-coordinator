@@ -33,7 +33,7 @@ describe('migrations — numbered-SQL doctrine', () => {
     // refuses a back-dated prefix (exit 6), so this file can never be added
     // later to a database that has already applied 0001 — it is 0000 or it is a
     // hand-run psql nobody can prove.
-    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql']);
+    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql']);
   });
 
   it('contains no transaction control — the runner owns the boundaries (psql -1)', () => {
@@ -101,23 +101,24 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     await pg?.stop();
   });
 
-  it('applies all three migrations in one run and records them in the ledger', async () => {
+  it('applies all four migrations in one run and records them in the ledger', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=3 skipped=0');
+    expect(run.output).toContain('applied=4 skipped=0');
 
     const ledger = await asMigratorDb('SELECT filename FROM schema_migrations ORDER BY filename');
     expect(ledger.stdout.trim().split('\n')).toEqual([
       '0000_grants.sql',
       '0001_identity.sql',
       '0002_collection.sql',
+      '0003_sync.sql',
     ]);
   });
 
   it('is a no-op on re-run', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=3');
+    expect(run.output).toContain('applied=0 skipped=4');
   });
 
   // ── The two-role split, proven rather than described ──────────────────────
@@ -239,6 +240,58 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     expect(read.stdout.trim()).toBe('12800');
   });
 
+  // 0003: the app role gets exactly the verbs the sync path uses. The feed and the receipts are
+  // append-only, and facet tombstones are rows, so nothing the app holds may be deleted.
+  describe('0003_sync grants for the application role', () => {
+    const USER = '77777777-7777-7777-7777-777777777777';
+    const denied = (run: ExecResult): void => {
+      expect(run.exitCode).not.toBe(0);
+      expect(run.output).toMatch(/42501|permission denied/i);
+    };
+
+    beforeAll(async () => {
+      await asMigratorDb(`INSERT INTO app_user (id) VALUES ('${USER}')`);
+    });
+
+    it('lets the app append to the feed, and refuses UPDATE and DELETE on it', async () => {
+      const append = await asApp(
+        `INSERT INTO feed_event (user_id, facet_key, version, op, payload) VALUES ('${USER}', 'holding/x/status', '2026-09-26T00:00:00.000000Z', 'delete', '') RETURNING seq`,
+      );
+      expect(append.exitCode).toBe(0);
+      expect(append.stdout.trim().split('\n')[0]).toMatch(/^\d+$/);
+      denied(await asApp("UPDATE feed_event SET payload = '' WHERE false"));
+      denied(await asApp('DELETE FROM feed_event WHERE false'));
+    });
+
+    it('lets the app write receipts once, and refuses UPDATE and DELETE on them', async () => {
+      const write = await asApp(
+        `INSERT INTO mutation_receipt (user_id, client_id, request_sha256, outcomes) VALUES ('${USER}', 'c1', sha256('x'), '')`,
+      );
+      expect(write.exitCode).toBe(0);
+      denied(await asApp("UPDATE mutation_receipt SET outcomes = '' WHERE false"));
+      denied(await asApp('DELETE FROM mutation_receipt WHERE false'));
+    });
+
+    it('lets the app upsert facet_state and feed_cursor, and refuses DELETE on both', async () => {
+      expect((await asApp("UPDATE facet_state SET payload = '' WHERE false")).exitCode).toBe(0);
+      expect((await asApp('UPDATE feed_cursor SET acked_seq = 0 WHERE false')).exitCode).toBe(0);
+      denied(await asApp('DELETE FROM facet_state WHERE false'));
+      denied(await asApp('DELETE FROM feed_cursor WHERE false'));
+    });
+
+    it('pairs a DELETE with an empty payload and an UPSERT with a non-empty one', async () => {
+      const bad = await asApp(
+        `INSERT INTO feed_event (user_id, facet_key, version, op, payload) VALUES ('${USER}', 'k', '2026-09-26T00:00:00.000000Z', 'delete', '{}')`,
+      );
+      expect(bad.exitCode).not.toBe(0);
+      expect(bad.output).toMatch(/check constraint/i);
+      const empty = await asApp(
+        `INSERT INTO feed_event (user_id, facet_key, version, op, payload) VALUES ('${USER}', 'k', '2026-09-26T00:00:00.000000Z', 'upsert', '')`,
+      );
+      expect(empty.exitCode).not.toBe(0);
+    });
+  });
+
   it('refuses to run as a SUPERUSER', async () => {
     const run = await migrate({ PGUSER: 'postgres', PGPASSWORD: 'postgres' });
     expect(run.exitCode).toBe(2);
@@ -272,7 +325,7 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
   it('still exits 0 on a correctly named directory', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=3');
+    expect(run.output).toContain('applied=0 skipped=4');
   });
 
   it('refuses the whole run when an applied migration has been edited on disk', async () => {

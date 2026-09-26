@@ -22,7 +22,11 @@ import { describe, expect, it } from 'vitest';
 import type { FastifyRequest } from 'fastify';
 import {
   CALLER_IDENTITY_DECORATOR,
+  decoratorDeviceResolver,
   decoratorIdentityResolver,
+  identityContextValues,
+  kCallerDevice,
+  kCallerSubject,
 } from '../../src/connect/identity.js';
 
 const SUB = '7f3a1c62-9d44-4e51-8b0a-2c6d5e1f9a33';
@@ -85,5 +89,38 @@ describe('decoratorIdentityResolver', () => {
     expect(
       decoratorIdentityResolver()(requestWith({ [CALLER_IDENTITY_DECORATOR]: { sub: upper } })),
     ).toEqual({ sub: upper });
+  });
+});
+
+describe('decoratorDeviceResolver', () => {
+  const DEVICE = '0f3a5c7e-9b1d-2f4a-6c8e-0b2d4f6a8c0e';
+
+  it('reads the DPoP-bound device id the edge decorates', () => {
+    expect(decoratorDeviceResolver()(requestWith({ [CALLER_IDENTITY_DECORATOR]: { sub: SUB, deviceId: DEVICE } }))).toBe(DEVICE);
+  });
+
+  it.each([
+    ['no decorator', {}],
+    ['a null decorator', { [CALLER_IDENTITY_DECORATOR]: null }],
+    ['the enrolment bootstrap (deviceId null)', { [CALLER_IDENTITY_DECORATOR]: { sub: SUB, deviceId: null } }],
+    ['an empty device id', { [CALLER_IDENTITY_DECORATOR]: { sub: SUB, deviceId: '' } }],
+    ['a non-string device id', { [CALLER_IDENTITY_DECORATOR]: { sub: SUB, deviceId: 7 } }],
+  ])('returns null for %s', (_label, props) => {
+    expect(decoratorDeviceResolver()(requestWith(props))).toBeNull();
+  });
+
+  it('puts subject and device into the Connect handler context together', () => {
+    const values = identityContextValues(
+      () => ({ sub: SUB }),
+      () => DEVICE,
+    )(requestWith({}));
+    expect(values.get(kCallerSubject)).toBe(SUB);
+    expect(values.get(kCallerDevice)).toBe(DEVICE);
+  });
+
+  it('defaults the device to the decorator', () => {
+    const values = identityContextValues(() => null)(requestWith({ [CALLER_IDENTITY_DECORATOR]: { sub: SUB, deviceId: DEVICE } }));
+    expect(values.get(kCallerSubject)).toBeNull();
+    expect(values.get(kCallerDevice)).toBe(DEVICE);
   });
 });

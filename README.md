@@ -415,6 +415,7 @@ transaction control in a pending file, `6` out-of-order file.
 |---|---|
 | `0001_identity.sql` | `app_user` (id **is** the Authentik uuid), `device` (DPoP `jkt` + public JWK, revoke-never-delete) |
 | `0002_collection.sql` | `collection`, `holding` — the HOLDING layer; spine references are TEXT, never foreign keys |
+| `0003_sync.sql` | `facet_state` (authoritative), `feed_event`, `feed_cursor`, `mutation_receipt` for SyncService; versions are `TEXT COLLATE "C"` with a grammar CHECK; the app role may not delete from any of them |
 
 ## Shared baseline
 
@@ -636,3 +637,20 @@ module is a client. `test/import-graph.test.ts` asserts the built graph resolves
 `axios` **only** from inside `dist/entitlements/`, never as a transitive of the
 fc-shared barrel, and that the gRPC client and the generated descriptor really
 are in the emitted output.
+
+## `coordinator.v1` — SyncService
+
+Delta, Push and Status over `0003_sync.sql`, behind the same DPoP guard as
+Compare. The user is the token `sub` and the device is the DPoP binding.
+Push takes a per-user advisory lock first, so per user `seq` order is commit
+order and Delta never skips a late commit. Versions are ordered by
+fc-api-contract's `compareVersion` in the handler, never by SQL `<`.
+`test/sync/` runs on a glibc `en_US` Postgres so a locale comparison would show.
+
+A replayed `client_id` repeats each event's first outcome and reason (APPLIED
+as DUPLICATE); `current` is read at the replay. The REJECTED checks run in
+sync.proto's listed order, before any STALE or APPLIED routing, and a payload
+over 65,536 UTF-8 bytes is `payload_invalid`. Load bounds: a Push waits at
+most 5 s for its user's lock (then UNAVAILABLE), one user may have 8 Pushes
+running or queued per replica (then UNAVAILABLE), a queued Push whose client
+leaves is dropped, and a Connect request body over 16 MiB is RESOURCE_EXHAUSTED.
