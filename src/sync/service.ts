@@ -26,9 +26,11 @@ import {
 } from '@figurecollecting/fc-api-contract';
 import { kCallerDevice, kCallerSubject } from '../connect/identity.js';
 import { decodeCursor, encodeCursor } from './cursor.js';
-import { KeyedSerialiser } from './serialise.js';
+import { KeyedSerialiser, QueueFull } from './serialise.js';
 import {
+  LOCK_NOT_AVAILABLE,
   applyEvent,
+  boundLockWaits,
   feedHead,
   issuedHead,
   lockUser,
@@ -51,9 +53,20 @@ export const MAX_PAGE = 1000;
 export const MAX_BATCH = 200;
 /** Printable ASCII, no space, 1 to 128 characters: a uuid fits and the receipt key stays indexable. */
 const CLIENT_ID = /^[\x21-\x7e]{1,128}$/;
+/** A Push waits this long for its user's lock, then answers UNAVAILABLE rather than hold a connection. */
+export const PUSH_LOCK_TIMEOUT_MS = 5_000;
+/** Pushes one user may have running or waiting on one replica; one device sends one at a time. */
+export const MAX_QUEUED_PUSHES = 8;
+/**
+ * The largest request body read, before any handler runs. 200 notes of 10,000 U+0001, which
+ * JSON.stringify writes as \u0001 and the JSON envelope escapes again, are 14,064,954 bytes.
+ */
+export const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 
 export interface SyncRoutesDeps {
   db: SyncPool;
+  /** The per-user Push queue; tests pass one in to watch it. */
+  writers?: KeyedSerialiser;
 }
 
 interface Caller {
@@ -112,7 +125,7 @@ async function replay(tx: SqlClient, userId: string, recorded: PushResponse): Pr
 
 export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) => void {
   const { db } = deps;
-  const writers = new KeyedSerialiser();
+  const writers = deps.writers ?? new KeyedSerialiser(MAX_QUEUED_PUSHES);
 
   const delta = async (req: DeltaRequest, ctx: HandlerContext): Promise<DeltaResponse> => {
     const caller = callerOf(ctx);
@@ -144,6 +157,7 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
     const deviceHex = normaliseDeviceId(caller.deviceId);
 
     const write = async (tx: TxClient): Promise<PushResponse> => {
+      await boundLockWaits(tx, PUSH_LOCK_TIMEOUT_MS);
       await lockUser(tx, caller.userId);
       const receipt = await readReceipt(tx, caller.userId, req.clientId);
       if (receipt !== undefined) {
@@ -174,7 +188,18 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
       await writeReceipt(tx, caller.userId, req.clientId, requestSha256, Buffer.from(outcomesOf(response)));
       return response;
     };
-    return writers.run(caller.userId, () => transaction(db, write));
+    try {
+      // The signal aborts when the client goes away, which drops this Push if it is still queued.
+      return await writers.run(caller.userId, () => transaction(db, write), ctx.signal);
+    } catch (err) {
+      if (err instanceof QueueFull) {
+        throw new ConnectError(`at most ${MAX_QUEUED_PUSHES} Pushes per user may run or wait here: retry later`, Code.ResourceExhausted);
+      }
+      if ((err as { code?: unknown }).code === LOCK_NOT_AVAILABLE) {
+        throw new ConnectError("this user's writes are held elsewhere: retry later", Code.Unavailable);
+      }
+      throw err;
+    }
   };
 
   const status = async (_req: unknown, ctx: HandlerContext): Promise<StatusResponse> => {

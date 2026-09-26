@@ -72,3 +72,72 @@ describe('KeyedSerialiser', () => {
     expect(serialiser.activeKeys).toBe(0);
   });
 });
+
+describe('KeyedSerialiser with a bound and a client that goes away', () => {
+  it('refuses a task past the bound for its key, running or waiting, and takes other keys', async () => {
+    const serialiser = new KeyedSerialiser(2);
+    const held = gate();
+    const a = serialiser.run('u1', () => held.wait);
+    const b = serialiser.run('u1', async () => 'b');
+    await expect(serialiser.run('u1', async () => 'c')).rejects.toMatchObject({ name: 'QueueFull' });
+    expect(serialiser.depth('u1')).toBe(2);
+    expect(await serialiser.run('u2', async () => 'other')).toBe('other');
+    held.open();
+    await a;
+    expect(await b).toBe('b');
+    expect(await serialiser.run('u1', async () => 'after')).toBe('after');
+  });
+
+  it('drops a waiting task whose signal aborts: it never runs, frees its place, and the next still waits its turn', async () => {
+    const serialiser = new KeyedSerialiser(2);
+    const log: string[] = [];
+    const held = gate();
+    const a = serialiser.run('u1', async () => {
+      await held.wait;
+      log.push('a');
+    });
+    const leaving = new AbortController();
+    const dropped = serialiser.run('u1', async () => log.push('dropped'), leaving.signal);
+    expect(serialiser.depth('u1')).toBe(2);
+
+    leaving.abort(new Error('client went away'));
+    await expect(dropped).rejects.toThrow('client went away');
+    expect(serialiser.depth('u1')).toBe(1);
+
+    const next = serialiser.run('u1', async () => log.push('next'));
+    await tick();
+    expect(log).toEqual([]);
+    held.open();
+    await Promise.all([a, next]);
+    expect(log).toEqual(['a', 'next']);
+    expect(serialiser.activeKeys).toBe(0);
+  });
+
+  it('refuses a task whose signal has already aborted without queueing it', async () => {
+    const serialiser = new KeyedSerialiser();
+    const gone = AbortSignal.abort(new Error('already gone'));
+    let ran = false;
+    await expect(
+      serialiser.run('u1', async () => {
+        ran = true;
+      }, gone),
+    ).rejects.toThrow('already gone');
+    expect(ran).toBe(false);
+    expect(serialiser.depth('u1')).toBe(0);
+  });
+
+  it('lets a running task finish when its signal aborts', async () => {
+    const serialiser = new KeyedSerialiser();
+    const leaving = new AbortController();
+    const held = gate();
+    const running = serialiser.run('u1', async () => {
+      await held.wait;
+      return 'committed';
+    }, leaving.signal);
+    await tick();
+    leaving.abort();
+    held.open();
+    expect(await running).toBe('committed');
+    expect(serialiser.depth('u1')).toBe(0);
+  });
+});

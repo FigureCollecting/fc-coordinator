@@ -2,7 +2,7 @@
 // in a real database, and every call signed with the repo's makeProof helper.
 import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
-import { create, fromBinary } from '@bufbuild/protobuf';
+import { create, fromBinary, toJsonString } from '@bufbuild/protobuf';
 import { createClient } from '@connectrpc/connect';
 import { createConnectTransport } from '@connectrpc/connect-node';
 import {
@@ -24,6 +24,7 @@ import {
 } from '@figurecollecting/fc-api-contract';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { makeProof, TEST_ORIGIN } from '../helpers/auth.js';
+import { KeyedSerialiser } from '../../src/sync/serialise.js';
 import { DISPLAY, ok, startSyncApp, SyncCaller, SYNC_SERVICE_PATH, type SyncApp } from '../helpers/syncClient.js';
 import { startSyncDatabase, type SyncDatabase } from '../helpers/syncDatabase.js';
 
@@ -672,30 +673,157 @@ describe('(2) commit order: a Delta reader never skips a late-committing lower s
 });
 
 describe('a user whose Pushes queue behind its lock', () => {
-  it('holds one pooled connection on this replica, so another user is answered meanwhile', async () => {
+  it('holds one pooled connection on this replica, answers another user meanwhile, and refuses a ninth Push', async () => {
     const a = await SyncCaller.enrol(h);
     const b = await SyncCaller.enrol(h);
+    const scored = (caller: SyncCaller, i: number) => ({
+      clientId: randomUUID(),
+      events: [upsert(userFacetKey(randomUUID(), 'score'), mint(caller, i), score(2))],
+    });
     // Another replica holds A's lock; the test pool has 12 connections.
     const holder = await db.admin.connect();
     await holder.query('BEGIN');
     await holder.query('SELECT pg_advisory_xact_lock($1, hashtext($2))', [LOCK_NAMESPACE, a.userId]);
     let pushes: ReturnType<SyncCaller['push']>[] = [];
-    let answered: unknown;
+    let refused: unknown;
+    let statusB: unknown;
+    let pushB: unknown;
     let waiters = -1;
     try {
-      pushes = Array.from({ length: 12 }, (_, i) =>
-        a.push({ clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(a, i), score(2))] }),
-      );
+      pushes = Array.from({ length: 9 }, (_, i) => a.push(scored(a, i)));
       await until(async () => (await lockWaiters()) >= 1, 'a push to queue on the lock');
-      answered = await within(b.status(), 5_000);
+      // Eight fit the queue, running one included; the ninth to arrive is answered at once.
+      refused = await within(Promise.race(pushes), 4_000);
+      statusB = await within(b.status(), 5_000);
+      pushB = await within(b.push(scored(b, 0)), 5_000);
       waiters = await lockWaiters();
     } finally {
       await holder.query('ROLLBACK');
       holder.release();
     }
-    expect(answered).not.toBe('timed out');
+    expect(refused).toMatchObject({ ok: false, status: 429, code: 'resource_exhausted' });
+    expect(statusB).not.toBe('timed out');
+    expect(pushB).not.toBe('timed out');
+    expect(ok(pushB as Awaited<ReturnType<SyncCaller['push']>>).results[0]!.outcome).toBe(PushOutcome.APPLIED);
     expect(waiters).toBe(1);
-    expect((await Promise.all(pushes)).map((r) => ok(r).results[0]!.outcome)).toEqual(Array(12).fill(PushOutcome.APPLIED));
+
+    const answers = await Promise.all(pushes);
+    expect(answers.filter((r) => r.ok).map((r) => ok(r).results[0]!.outcome)).toEqual(Array(8).fill(PushOutcome.APPLIED));
+    expect(answers.filter((r) => !r.ok)).toHaveLength(1);
+    expect(await feedCount(a.userId)).toBe(8);
+    expect(ok(await a.push(scored(a, 9))).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+  });
+
+  it('gives up on a lock held elsewhere after 5 s with UNAVAILABLE, writes nothing, and serves the next Push', async () => {
+    const a = await SyncCaller.enrol(h);
+    const holder = await db.admin.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT pg_advisory_xact_lock($1, hashtext($2))', [LOCK_NAMESPACE, a.userId]);
+    let answer: unknown;
+    let elapsed = -1;
+    try {
+      const started = performance.now();
+      answer = await within(a.push({ clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(a), score(4))] }), 9_000);
+      elapsed = performance.now() - started;
+    } finally {
+      await holder.query('ROLLBACK');
+      holder.release();
+    }
+    expect(answer).toMatchObject({ ok: false, status: 503, code: 'unavailable' });
+    expect(elapsed).toBeGreaterThanOrEqual(4_950);
+    expect(elapsed).toBeLessThan(8_000);
+    expect(await feedCount(a.userId)).toBe(0);
+    expect(ok(await a.push({ clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(a, 1), score(5))] })).results[0]!.outcome).toBe(
+      PushOutcome.APPLIED,
+    );
+  }, 30_000);
+
+  it('drops a queued Push whose client went away: it frees its place and never writes', async () => {
+    const writers = new KeyedSerialiser(8);
+    const h3 = await startSyncApp(db.app, h.issuer, writers);
+    let first: ReturnType<SyncCaller['push']> | undefined;
+    try {
+      const baseUrl = await h3.app.listen({ port: 0, host: '127.0.0.1' });
+      const a = (await SyncCaller.enrol(h)).via(h3);
+      ok(await a.status());
+      const kept = userFacetKey(randomUUID(), 'score');
+      const dropped = userFacetKey(randomUUID(), 'score');
+
+      const holder = await db.admin.connect();
+      await holder.query('BEGIN');
+      await holder.query('SELECT pg_advisory_xact_lock($1, hashtext($2))', [LOCK_NAMESPACE, a.userId]);
+      let gone: unknown;
+      try {
+        first = a.push({ clientId: randomUUID(), events: [upsert(kept, mint(a, 1), score(1))] });
+        await until(async () => writers.depth(a.userId) === 1 && (await lockWaiters()) >= 1, 'the first push to wait on the lock');
+
+        const url = `${SYNC_SERVICE_PATH}/Push`;
+        const leaving = new AbortController();
+        const second = fetch(`${baseUrl}${url}`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'connect-protocol-version': '1',
+            authorization: `DPoP ${a.token}`,
+            dpop: await makeProof(a.key, { htm: 'POST', htu: `${TEST_ORIGIN}${url}`, accessToken: a.token, nonce: a.nonce! }),
+          },
+          body: toJsonString(PushRequestSchema, create(PushRequestSchema, { clientId: randomUUID(), events: [upsert(dropped, mint(a, 2), score(2))] })),
+          signal: leaving.signal,
+        }).catch((err: unknown) => err);
+        await until(async () => writers.depth(a.userId) === 2, 'the second push to queue');
+        leaving.abort();
+        gone = await second;
+        await until(async () => writers.depth(a.userId) === 1, 'the abandoned push to leave the queue');
+      } finally {
+        await holder.query('ROLLBACK');
+        holder.release();
+      }
+      expect((gone as Error).name).toBe('AbortError');
+      expect(ok(await first!).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+      await until(async () => writers.depth(a.userId) === 0, 'the queue to empty');
+      const { rows } = await db.admin.query<{ facet_key: string }>('SELECT facet_key FROM feed_event WHERE user_id = $1', [a.userId]);
+      expect(rows.map((r) => r.facet_key)).toEqual([kept]);
+    } finally {
+      await first?.catch(() => undefined);
+      await h3.close();
+    }
+  });
+});
+
+// 200 events of the largest payload JSON.stringify writes for a valid facet: a 10,000 code point
+// note of U+0001 is \u0001 each, 7 bytes once the JSON envelope escapes the backslash.
+describe('the Connect read cap', () => {
+  const CAP = 16 * 1024 * 1024;
+
+  it('takes the largest Push a conforming client sends', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const payload = JSON.stringify({ note: '\u0001'.repeat(10_000), edited_at: '2026-09-26T09:15:00.123456789+18:00', tz: 'A'.repeat(64) });
+    const at = new Date(Date.now() - 60_000);
+    const events = Array.from({ length: 200 }, (_, i) =>
+      upsert(userFacetKey(randomUUID(), 'note'), canonicalVersion({ instant: at, counter: 9_999_999_999 - i, deviceId: caller.deviceId }), payload),
+    );
+    const request = { clientId: '~'.repeat(128), events };
+    const bytes = Buffer.byteLength(toJsonString(PushRequestSchema, create(PushRequestSchema, request)));
+    expect(bytes).toBe(14_064_954);
+    expect(bytes).toBeLessThan(CAP);
+
+    const res = ok(await caller.push(request));
+    expect(res.results.map((r) => r.outcome)).toEqual(Array(200).fill(PushOutcome.APPLIED));
+  });
+
+  it.each([
+    [CAP, 200],
+    [CAP + 1, 429],
+  ])('answers a Push body of %i bytes with HTTP %i', async (size, statusCode) => {
+    const caller = await SyncCaller.enrol(h);
+    const body = toJsonString(
+      PushRequestSchema,
+      create(PushRequestSchema, { clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(caller), score(3))] }),
+    );
+    const res = await caller.send('Push', body.padEnd(size, ' '));
+    expect(res.statusCode).toBe(statusCode);
+    expect(await feedCount(caller.userId)).toBe(statusCode === 200 ? 1 : 0);
+    if (statusCode !== 200) expect(res.json()).toMatchObject({ code: 'resource_exhausted' });
   });
 });
 

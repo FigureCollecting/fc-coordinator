@@ -21,7 +21,7 @@ import {
   setEntitlementAuditSink,
 } from '../entitlements/index.js';
 import { createSpineReadClientFromEnv } from '../spine/spineReadClient.js';
-import { createSyncRoutes, type SyncRoutesDeps } from '../sync/service.js';
+import { createSyncRoutes, MAX_REQUEST_BYTES, type SyncRoutesDeps } from '../sync/service.js';
 import type { SyncPool } from '../sync/store.js';
 import { createCompareRoutes, type CompareRoutesDeps } from './compare.js';
 import {
@@ -128,5 +128,7 @@ export function registerConnect(app: FastifyInstance, options: ConnectOptions): 
     // outbound hop names this service as its parent.
     interceptors: [traceparentServerInterceptor()],
     contextValues: identityContextValues(resolveIdentity, resolveDevice),
+    // The largest Push, sized in ../sync/service.ts; any larger body is RESOURCE_EXHAUSTED unread.
+    readMaxBytes: MAX_REQUEST_BYTES,
   });
 }

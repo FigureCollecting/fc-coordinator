@@ -79,14 +79,17 @@ describe('a Push whose transaction fails', () => {
     ],
   };
 
-  function failingPool(failRollback: boolean): { pool: SyncPool; seen: string[]; release: ReturnType<typeof vi.fn> } {
-    const seen: string[] = [];
+  function failingPool(
+    failRollback: boolean,
+    lockError: Error = new Error('connection reset'),
+  ): { pool: SyncPool; seen: unknown[]; release: ReturnType<typeof vi.fn> } {
+    const seen: unknown[] = [];
     const release = vi.fn();
     const client: TxClient = {
-      query: async (text: string) => {
+      query: async (text: string, values?: readonly unknown[]) => {
         const lock = text.startsWith('SELECT pg_advisory_xact_lock');
-        seen.push(lock ? 'lock' : text);
-        if (lock) throw new Error('connection reset');
+        seen.push(lock ? 'lock' : values === undefined ? text : [text, ...values]);
+        if (lock) throw lockError;
         if (text === 'ROLLBACK' && failRollback) throw new Error('connection gone');
         return { rows: [] };
       },
@@ -99,9 +102,18 @@ describe('a Push whose transaction fails', () => {
     const { pool, seen, release } = failingPool(false);
     const res = await call(build(pool, { sub: SUB, device: DEVICE }), 'Push', batch);
     expect(res.statusCode).toBe(500);
-    expect(seen).toEqual(['BEGIN', 'lock', 'ROLLBACK']);
+    expect(seen).toEqual(['BEGIN', ["SELECT set_config('lock_timeout', $1, true)", '5000ms'], 'lock', 'ROLLBACK']);
     expect(release).toHaveBeenCalledTimes(1);
     expect(release.mock.calls[0]![0]).toBeUndefined();
+  });
+
+  it('answers UNAVAILABLE when the user lock is not granted within the lock timeout', async () => {
+    const timedOut = Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' });
+    const { pool, release } = failingPool(false, timedOut);
+    const res = await call(build(pool, { sub: SUB, device: DEVICE }), 'Push', batch);
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toMatchObject({ code: 'unavailable' });
+    expect(release).toHaveBeenCalledTimes(1);
   });
 
   it('discards the connection when the rollback itself fails', async () => {

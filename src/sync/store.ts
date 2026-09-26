@@ -68,6 +68,14 @@ export async function transaction<T>(pool: SyncPool, fn: (tx: TxClient) => Promi
   }
 }
 
+/** Bound every lock wait in this transaction; past it Postgres raises 55P03 (lock_not_available). */
+export async function boundLockWaits(tx: SqlClient, ms: number): Promise<void> {
+  await tx.query("SELECT set_config('lock_timeout', $1, true)", [`${ms}ms`]);
+}
+
+/** SQLSTATE lock_not_available: a wait passed boundLockWaits. */
+export const LOCK_NOT_AVAILABLE = '55P03';
+
 /**
  * Serialise every writer of one user's feed until commit. seq is taken inside this lock, so per
  * user seq order is commit order and a Delta reader cannot pass a seq that commits later.
