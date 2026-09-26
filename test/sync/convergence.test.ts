@@ -140,7 +140,7 @@ const command = fc.oneof(
       head: fc.nat({ max: HEADS.length - 1 }),
       field: fc.constantFrom(...FIELDS),
       remove: fc.nat({ max: 4 }).map((n) => n === 0),
-      bad: fc.nat({ max: 7 }).map((n) => n === 0),
+      bad: fc.nat({ max: 3 }).map((n) => n === 0),
       n: fc.nat({ max: 1000 }),
       tickMs: fc.nat({ max: 2 }),
     }),
