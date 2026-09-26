@@ -175,9 +175,17 @@ describe('Push', () => {
     const caller = await SyncCaller.enrol(h);
     const key = userFacetKey(randomUUID(), 'score');
     const future = canonicalVersion({ instant: new Date(Date.now() + MAX_FUTURE_SKEW_MS + 60_000), counter: 1, deviceId: caller.deviceId });
+    // A server-owned key the server holds a value for: REJECTED on it never carries `current`.
+    const serverKey = `identity/${randomUUID()}`;
+    const serverVersion = canonicalVersion({ instant: new Date(Date.now() - 60_000), counter: 0, deviceId: SERVER_DEVICE_ID });
+    await db.admin.query(
+      `WITH fed AS (INSERT INTO feed_event (user_id, facet_key, version, op, payload) VALUES ($1, $2, $3, 'upsert', '{}') RETURNING seq)
+       INSERT INTO facet_state (user_id, facet_key, version, op, payload, seq) SELECT $1, $2, $3, 'upsert', '{}', seq FROM fed`,
+      [caller.userId, serverKey, serverVersion],
+    );
     const batch = {
       clientId: randomUUID(),
-      events: [upsert(key, mint(caller), score(4)), upsert(key, future, score(5)), upsert(`identity/${randomUUID()}`, mint(caller, 2), '{}')],
+      events: [upsert(key, mint(caller), score(4)), upsert(key, future, score(5)), upsert(serverKey, mint(caller, 2), '{}')],
     };
     const first = await caller.pushBinary(batch);
     const shape = (r: PushResult) => [r.outcome, r.reason.split(':')[0], r.current?.version];
@@ -202,7 +210,7 @@ describe('Push', () => {
       expect(replay.message.results.map((r) => r.reason)).toEqual(first.message.results.map((r) => r.reason));
       expect(replay.bytes.equals(stored.rows[0]!.response)).toBe(true);
     }
-    expect(await feedCount(caller.userId)).toBe(1);
+    expect(await feedCount(caller.userId)).toBe(2);
   });
 
   // The client rule adopts a REJECTED `current` whole when it still holds the rejected edit. A
