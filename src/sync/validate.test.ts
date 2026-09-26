@@ -91,6 +91,7 @@ describe('validateEvent', () => {
   });
 
   // sync.proto: the REJECTED checks run in the listed order, so an event failing two gets the first.
+  const OVERSIZED = JSON.stringify({ status: 'owned', ...DISPLAY }) + ' '.repeat(MAX_PAYLOAD_BYTES);
   it.each([
     ['a malformed version on a server-owned key', { facetKey: 'identity/5b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0', version: 'x' }, 'version_malformed', false],
     ['a past-bound version on a server-owned key', { facetKey: 'identity/5b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0', version: at(MAX_FUTURE_SKEW_MS + 1) }, 'version_future', false],
@@ -105,10 +106,16 @@ describe('validateEvent', () => {
     ['a server-owned key with another device', { facetKey: 'identity/5b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0', version: at(-1000, '9c1e3a5b-7d9f-1b3d-5f7a-9c1e3b5d7f9a') }, 'facet_key_not_user_owned', false],
     ['a bare instant on a server-owned key', { facetKey: 'identity/5b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0', version: at(-1000).slice(0, 27) }, 'facet_key_not_user_owned', false],
     ['another device with a bad payload', { version: at(-1000, '9c1e3a5b-7d9f-1b3d-5f7a-9c1e3b5d7f9a'), payload: '{' }, 'device_mismatch', true],
+    ['a malformed version with an oversized payload', { version: 'x', payload: OVERSIZED }, 'version_malformed', true],
+    ['a past-bound version with an oversized payload', { version: at(MAX_FUTURE_SKEW_MS + 1), payload: OVERSIZED }, 'version_future', true],
+    ['a server-owned key with an oversized payload', { facetKey: 'identity/5b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0', payload: OVERSIZED }, 'facet_key_not_user_owned', false],
+    ['another device with an oversized payload', { version: at(-1000, '9c1e3a5b-7d9f-1b3d-5f7a-9c1e3b5d7f9a'), payload: OVERSIZED }, 'device_mismatch', true],
+    ['an oversized payload alone', { payload: OVERSIZED }, 'payload_invalid: payload over 65536 bytes', true],
   ])('answers %s with the first listed reason', (_why, over, reason, userOwned) => {
     const verdict = validateEvent(event(over), ctx);
     expect(verdict).toMatchObject({ ok: false, userOwned });
-    expect(verdict.ok === false && verdict.reason.split(':')[0]).toBe(reason);
+    // A bare code matches the reason's code; a full reason must match exactly.
+    expect(verdict.ok === false && (reason.includes(':') ? verdict.reason : verdict.reason.split(':')[0])).toBe(reason);
   });
 
   it('names the failing location without echoing the payload', () => {

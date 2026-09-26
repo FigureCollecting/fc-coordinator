@@ -18,6 +18,7 @@ import {
   SyncService,
   canonicalInstant,
   canonicalVersion,
+  compareVersion,
   isCanonicalVersion,
   parseVersion,
   userFacetKey,
@@ -90,6 +91,15 @@ function mint(caller: SyncCaller, counter = 0, offsetMs = -60_000): string {
 function mintTogether(caller: SyncCaller, ...counters: number[]): string[] {
   const instant = new Date(Date.now() - 60_000);
   return counters.map((counter) => canonicalVersion({ instant, counter, deviceId: caller.deviceId }));
+}
+
+/** Store a facet directly, past Push's validation, so it can hold a version Push would refuse. */
+async function storeFacet(caller: SyncCaller, facetKey: string, version: string, payload: string): Promise<void> {
+  await db.admin.query(
+    `WITH fed AS (INSERT INTO feed_event (user_id, facet_key, version, op, payload) VALUES ($1, $2, $3, 'upsert', $4) RETURNING seq)
+     INSERT INTO facet_state (user_id, facet_key, version, op, payload, seq) SELECT $1, $2, $3, 'upsert', $4, seq FROM fed`,
+    [caller.userId, facetKey, version, payload],
+  );
 }
 
 const upsert = (facetKey: string, version: string, payload: string) => ({
@@ -376,11 +386,7 @@ describe('Push', () => {
     const caller = await SyncCaller.enrol(h);
     const key = userFacetKey(randomUUID(), 'score');
     const ahead = canonicalVersion({ instant: new Date(Date.now() + 3_600_000), counter: 0, deviceId: caller.deviceId });
-    await db.admin.query(
-      `WITH fed AS (INSERT INTO feed_event (user_id, facet_key, version, op, payload) VALUES ($1, $2, $3, 'upsert', $4) RETURNING seq)
-       INSERT INTO facet_state (user_id, facet_key, version, op, payload, seq) SELECT $1, $2, $3, 'upsert', $4, seq FROM fed`,
-      [caller.userId, key, ahead, score(9)],
-    );
+    await storeFacet(caller, key, ahead, score(9));
     const past = canonicalVersion({ instant: new Date(Date.now() + MAX_FUTURE_SKEW_MS + 60_000), counter: 0, deviceId: caller.deviceId });
     const res = ok(await caller.push({ clientId: randomUUID(), events: [upsert(key, past, score(2))] })).results[0]!;
     expect(res.outcome).toBe(PushOutcome.REJECTED);
@@ -392,22 +398,20 @@ describe('Push', () => {
     const caller = await SyncCaller.enrol(h);
     const other = await SyncCaller.sibling(h, caller);
     const key = userFacetKey(randomUUID(), 'note');
-    const held = mint(caller, 0, -1_000);
-    ok(await caller.push({ clientId: randomUUID(), events: [upsert(key, held, note('held'))] }));
+    // Above every event below, the past-bound one included, so skipping a check would route it STALE.
+    const held = mint(caller, 0, 3_600_000);
+    await storeFacet(caller, key, held, note('held'));
     const older = (c: SyncCaller) => mint(c, 0, -120_000);
     const past = (c: SyncCaller) => canonicalVersion({ instant: new Date(Date.now() + MAX_FUTURE_SKEW_MS + 60_000), counter: 0, deviceId: c.deviceId });
     const oversized = note('x') + ' '.repeat(MAX_PAYLOAD_BYTES);
-    const res = ok(
-      await caller.push({
-        clientId: randomUUID(),
-        events: [
-          upsert(key, past(other), note('two checks')),
-          upsert(key, older(other), '{'),
-          upsert(key, older(caller), oversized),
-          upsert(key, older(caller), note('stale')),
-        ],
-      }),
-    );
+    const events = [
+      upsert(key, past(other), note('two checks')),
+      upsert(key, older(other), '{'),
+      upsert(key, older(caller), oversized),
+      upsert(key, older(caller), note('stale')),
+    ];
+    for (const e of events) expect(compareVersion(e.version, held)).toBeLessThan(0);
+    const res = ok(await caller.push({ clientId: randomUUID(), events }));
     expect(res.results.map((r) => [r.outcome, r.reason])).toEqual([
       [PushOutcome.REJECTED, expect.stringMatching(/^version_future: /)],
       [PushOutcome.REJECTED, expect.stringMatching(/^device_mismatch: /)],
