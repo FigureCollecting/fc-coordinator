@@ -29,6 +29,7 @@ import { buildApp } from '../../src/app.js';
 import { resolveAuthConfig } from '../../src/auth/config.js';
 import { createAccessTokenVerifier } from '../../src/auth/oidc.js';
 import { createDeviceStore } from '../../src/auth/plugin.js';
+import { productionConnectOptions } from '../../src/connect/register.js';
 import { makeDeviceKey, makeIssuer, makeProof, TEST_ORIGIN, type DeviceKey, type TestIssuer } from './auth.js';
 
 export const SYNC_SERVICE_PATH = '/coordinator.v1.SyncService';
@@ -39,9 +40,12 @@ export interface SyncApp {
   close(): Promise<void>;
 }
 
-/** Production wiring, as src/server.ts assembles it, minus the spine. */
-export async function startSyncApp(db: pg.Pool): Promise<SyncApp> {
-  const issuer = await makeIssuer();
+/**
+ * Production wiring, as src/server.ts assembles it, minus the spine. Pass the issuer of a running
+ * app to start a second replica on the same database that accepts the same tokens.
+ */
+export async function startSyncApp(db: pg.Pool, sharedIssuer?: TestIssuer): Promise<SyncApp> {
+  const issuer = sharedIssuer ?? (await makeIssuer());
   const config = resolveAuthConfig({
     OIDC_ISSUER: issuer.issuer,
     OIDC_AUDIENCE: issuer.audience,
@@ -61,7 +65,7 @@ export async function startSyncApp(db: pg.Pool): Promise<SyncApp> {
         algorithms: config.oidcAlgorithms,
       }),
     },
-    compare: { spineRead: null, initSigning: false, sync: { db } },
+    compare: { ...productionConnectOptions(db, {}), initSigning: false },
   });
   await app.ready();
   return { app, issuer, close: () => app.close() };
@@ -118,6 +122,11 @@ export class SyncCaller {
   /** A second device for the same user. */
   static async sibling(harness: SyncApp, of: SyncCaller): Promise<SyncCaller> {
     return SyncCaller.enrol(harness, of.userId);
+  }
+
+  /** This device and token, calling through another replica. */
+  via(harness: SyncApp): SyncCaller {
+    return new SyncCaller(harness.app, this.key, this.token, this.userId, this.deviceId);
   }
 
   /** Raw signed call. Retries once when the server asks for a nonce. */

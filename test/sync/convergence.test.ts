@@ -1,7 +1,7 @@
-// (1) Convergence. Two devices of one user edit offline, push and pull in random interleavings,
-// lose responses, and push concurrently. Each device follows the contract's client rules, so
-// the property is: both end on the same facet map, equal to a replay from an empty cursor and to
-// the server's authoritative facet_state.
+// (1) Convergence. Two devices of one user, each on its own replica, edit offline (some edits
+// invalid, so REJECTED), push and pull in random interleavings, lose responses, and push
+// concurrently. Each device follows the contract's client rules, so the property is: both end on
+// the same facet map, equal to a replay from an empty cursor and to the server's facet_state.
 import { randomUUID } from 'node:crypto';
 import fc from 'fast-check';
 import {
@@ -20,13 +20,17 @@ import { startSyncDatabase, type SyncDatabase } from '../helpers/syncDatabase.js
 
 let db: SyncDatabase;
 let h: SyncApp;
+let h2: SyncApp;
+let rejected = 0;
 
 beforeAll(async () => {
   db = await startSyncDatabase();
   h = await startSyncApp(db.app);
+  h2 = await startSyncApp(db.app, h.issuer);
 }, 240_000);
 
 afterAll(async () => {
+  await h2?.close();
   await h?.close();
   await db?.close();
 });
@@ -88,7 +92,8 @@ class SimDevice {
 
   private settle(sent: Edit, result: PushResult): void {
     expect(result.facetKey).toBe(sent.facetKey);
-    expect([PushOutcome.APPLIED, PushOutcome.DUPLICATE, PushOutcome.STALE]).toContain(result.outcome);
+    expect([PushOutcome.APPLIED, PushOutcome.DUPLICATE, PushOutcome.STALE, PushOutcome.REJECTED]).toContain(result.outcome);
+    if (result.outcome === PushOutcome.REJECTED) rejected += 1;
     const local = this.local.get(sent.facetKey);
     if (local?.version === sent.version) {
       if (result.current) this.adopt(result.current);
@@ -135,6 +140,7 @@ const command = fc.oneof(
       head: fc.nat({ max: HEADS.length - 1 }),
       field: fc.constantFrom(...FIELDS),
       remove: fc.nat({ max: 4 }).map((n) => n === 0),
+      bad: fc.nat({ max: 7 }).map((n) => n === 0),
       n: fc.nat({ max: 1000 }),
       tickMs: fc.nat({ max: 2 }),
     }),
@@ -162,7 +168,7 @@ describe('(1) convergence', () => {
         const clock: HlcClock = { wallMs: () => base + t, monoMs: () => t };
 
         const a = await SyncCaller.enrol(h);
-        const b = await SyncCaller.sibling(h, a);
+        const b = (await SyncCaller.sibling(h, a)).via(h2);
         const devices = [new SimDevice(a, clock), new SimDevice(b, clock)] as const;
 
         for (const cmd of commands) {
@@ -170,7 +176,8 @@ describe('(1) convergence', () => {
             case 'edit': {
               t += cmd.tickMs;
               const key = userFacetKey(HEADS[cmd.head]!, cmd.field);
-              devices[cmd.d].edit(key, cmd.remove ? SyncOp.DELETE : SyncOp.UPSERT, cmd.remove ? '' : payloadFor(cmd.field, cmd.n));
+              const payload = cmd.bad ? JSON.stringify({ unknown_field: true, ...DISPLAY }) : payloadFor(cmd.field, cmd.n);
+              devices[cmd.d].edit(key, cmd.remove ? SyncOp.DELETE : SyncOp.UPSERT, cmd.remove ? '' : payload);
               break;
             }
             case 'push':
@@ -204,8 +211,26 @@ describe('(1) convergence', () => {
         expect(sorted(devices[0].local)).toEqual(sorted(replay.local));
         expect(sorted(replay.local)).toEqual(sorted(authoritative));
       }),
-      { numRuns: 200 },
+      {
+        numRuns: 200,
+        // Found by review: A's invalid edit is REJECTED with the response lost, A pulls B's older
+        // write and keeps its pending edit, then the retry's REJECTED answer must carry B's write.
+        examples: [
+          [
+            [
+              { kind: 'edit', d: 1, head: 0, field: 'score', remove: false, bad: false, n: 3, tickMs: 1 },
+              { kind: 'edit', d: 0, head: 0, field: 'score', remove: false, bad: true, n: 0, tickMs: 1 },
+              { kind: 'push', d: 0, drop: true },
+              { kind: 'push', d: 1, drop: false },
+              { kind: 'delta', d: 0, limit: 4, drop: false },
+              { kind: 'push', d: 0, drop: false },
+            ],
+            1,
+          ],
+        ],
+      },
     );
     expect(runs).toBeGreaterThanOrEqual(200);
+    expect(rejected).toBeGreaterThan(50);
   }, 600_000);
 });

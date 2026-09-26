@@ -5,6 +5,8 @@ import { SyncOp, canonicalVersion, userFacetKey } from '@figurecollecting/fc-api
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../../src/app.js';
+import { productionConnectOptions } from '../../src/connect/register.js';
+import { SpineReadClient } from '../../src/spine/spineReadClient.js';
 import type { SyncPool, TxClient } from '../../src/sync/store.js';
 import { SYNC_SERVICE_PATH } from '../helpers/syncClient.js';
 
@@ -108,5 +110,21 @@ describe('a Push whose transaction fails', () => {
     expect(res.statusCode).toBe(500);
     expect(release).toHaveBeenCalledTimes(1);
     expect(release.mock.calls[0]![0]).toBeInstanceOf(Error);
+  });
+});
+
+describe('the Connect options the process serves', () => {
+  it('mount SyncService beside Compare', async () => {
+    app = buildApp({ db: stubDb, logLevel: 'silent', compare: { ...productionConnectOptions(neverPool, {}), initSigning: false } });
+    await app.ready();
+    for (const method of ['Delta', 'Push', 'Status']) {
+      expect(app.hasRoute({ method: 'POST', url: `${SYNC_SERVICE_PATH}/${method}` })).toBe(true);
+    }
+    expect(app.hasRoute({ method: 'POST', url: '/coordinator.v1.CompareService/Compare' })).toBe(true);
+  });
+
+  it('take the spine from SPINE_READ_URL and run degraded without it', () => {
+    expect(productionConnectOptions(neverPool, {}).spineRead).toBeNull();
+    expect(productionConnectOptions(neverPool, { SPINE_READ_URL: 'http://spine.test.invalid' }).spineRead).toBeInstanceOf(SpineReadClient);
   });
 });

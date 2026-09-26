@@ -18,6 +18,7 @@ import {
   isCanonicalVersion,
   parseVersion,
   userFacetKey,
+  type PushResult,
   type SyncEvent,
 } from '@figurecollecting/fc-api-contract';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -27,19 +28,54 @@ import { startSyncDatabase, type SyncDatabase } from '../helpers/syncDatabase.js
 
 let db: SyncDatabase;
 let h: SyncApp;
+/** A second replica on the same database: the only way a second writer meets the advisory lock. */
+let h2: SyncApp;
 
 beforeAll(async () => {
   db = await startSyncDatabase();
   h = await startSyncApp(db.app);
+  h2 = await startSyncApp(db.app, h.issuer);
 }, 240_000);
 
 afterAll(async () => {
+  await h2?.close();
   await h?.close();
   await db?.close();
 });
 
 const status = (s: string) => JSON.stringify({ status: s, ...DISPLAY });
 const note = (n: string) => JSON.stringify({ note: n, ...DISPLAY });
+const score = (n: number) => JSON.stringify({ score: n, ...DISPLAY });
+
+/** store.ts's advisory-lock namespace, 'sync' in ASCII. */
+const LOCK_NAMESPACE = 0x73796e63;
+
+async function waiting(event: string, statement: string): Promise<boolean> {
+  const { rows } = await db.admin.query(
+    `SELECT 1 FROM pg_stat_activity
+      WHERE usename = 'coordinator' AND wait_event_type = 'Lock' AND wait_event = $1 AND query LIKE $2`,
+    [event, `${statement}%`],
+  );
+  return rows.length > 0;
+}
+
+async function lockWaiters(): Promise<number> {
+  const { rows } = await db.admin.query<{ n: string }>(
+    "SELECT count(*) AS n FROM pg_stat_activity WHERE usename = 'coordinator' AND wait_event_type = 'Lock' AND wait_event = 'advisory'",
+  );
+  return Number(rows[0]!.n);
+}
+
+async function until(predicate: () => Promise<boolean>, what: string): Promise<void> {
+  for (let i = 0; i < 500; i += 1) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+const within = <T>(promise: Promise<T>, ms: number): Promise<T | 'timed out'> =>
+  Promise.race([promise, new Promise<'timed out'>((resolve) => setTimeout(() => resolve('timed out'), ms))]);
 
 /** A version for `caller`, `offsetMs` from now, with `counter`. */
 function mint(caller: SyncCaller, counter = 0, offsetMs = -60_000): string {
@@ -133,6 +169,66 @@ describe('Push', () => {
     const json = ok(await caller.push(batch));
     expect(json.results.map((r) => r.outcome)).toEqual([PushOutcome.DUPLICATE]);
     expect(await feedCount(caller.userId)).toBe(1);
+  });
+
+  it('replays APPLIED as DUPLICATE and each REJECTED with its first reason, byte-identical while nothing changes', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const key = userFacetKey(randomUUID(), 'score');
+    const future = canonicalVersion({ instant: new Date(Date.now() + MAX_FUTURE_SKEW_MS + 60_000), counter: 1, deviceId: caller.deviceId });
+    const batch = {
+      clientId: randomUUID(),
+      events: [upsert(key, mint(caller), score(4)), upsert(key, future, score(5)), upsert(`identity/${randomUUID()}`, mint(caller, 2), '{}')],
+    };
+    const first = await caller.pushBinary(batch);
+    const shape = (r: PushResult) => [r.outcome, r.reason.split(':')[0], r.current?.version];
+    const applied = first.message.results[0]!.current?.version;
+    expect(first.message.results.map(shape)).toEqual([
+      [PushOutcome.APPLIED, '', applied],
+      [PushOutcome.REJECTED, 'version_future', applied],
+      [PushOutcome.REJECTED, 'facet_key_not_user_owned', undefined],
+    ]);
+
+    const replays = [await caller.pushBinary(batch), await caller.pushBinary(batch)];
+    const stored = await db.admin.query<{ response: Buffer }>(
+      'SELECT response FROM mutation_receipt WHERE user_id = $1 AND client_id = $2',
+      [caller.userId, batch.clientId],
+    );
+    for (const replay of replays) {
+      expect(replay.message.results.map(shape)).toEqual([
+        [PushOutcome.DUPLICATE, '', applied],
+        [PushOutcome.REJECTED, 'version_future', applied],
+        [PushOutcome.REJECTED, 'facet_key_not_user_owned', undefined],
+      ]);
+      expect(replay.message.results.map((r) => r.reason)).toEqual(first.message.results.map((r) => r.reason));
+      expect(replay.bytes.equals(stored.rows[0]!.response)).toBe(true);
+    }
+    expect(await feedCount(caller.userId)).toBe(1);
+  });
+
+  // The client rule adopts a REJECTED `current` whole when it still holds the rejected edit. A
+  // device that lost the answer may since have pulled a sibling's write it did not adopt, being
+  // older than its pending edit, so a replay must carry the facet as held at the replay.
+  it.each([
+    ['a value the server held at the first answer', true],
+    ['no value at the first answer', false],
+  ])('answers a replayed REJECTED event with the facet as held now, from %s', async (_why, seeded) => {
+    const a = await SyncCaller.enrol(h);
+    const b = await SyncCaller.sibling(h, a);
+    const key = userFacetKey(randomUUID(), 'score');
+    const v1 = mint(b, 0, -600_000);
+    const v2 = mint(b, 0, -500_000);
+    const vA = mint(a, 0, -300_000);
+    if (seeded) ok(await b.push({ clientId: randomUUID(), events: [upsert(key, v1, score(3))] }));
+
+    const batch = { clientId: randomUUID(), events: [upsert(key, vA, score(11))] };
+    const lost = ok(await a.push(batch)).results[0]!;
+    expect(lost.outcome).toBe(PushOutcome.REJECTED);
+    expect(lost.current?.version).toBe(seeded ? v1 : undefined);
+
+    ok(await b.push({ clientId: randomUUID(), events: [upsert(key, v2, score(7))] }));
+    const replay = ok(await a.push(batch)).results[0]!;
+    expect(replay).toMatchObject({ outcome: PushOutcome.REJECTED, reason: lost.reason, version: v2 });
+    expect(replay.current).toMatchObject({ facetKey: key, version: v2, op: SyncOp.UPSERT, payload: score(7) });
   });
 
   it('refuses the same client_id with a different body as INVALID_ARGUMENT and writes nothing', async () => {
@@ -234,6 +330,22 @@ describe('Push', () => {
     expect(result.current).toBeUndefined();
   });
 
+  it('rejects a past-bound version as version_future even where the stored version is higher', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const key = userFacetKey(randomUUID(), 'score');
+    const ahead = canonicalVersion({ instant: new Date(Date.now() + 3_600_000), counter: 0, deviceId: caller.deviceId });
+    await db.admin.query(
+      `WITH fed AS (INSERT INTO feed_event (user_id, facet_key, version, op, payload) VALUES ($1, $2, $3, 'upsert', $4) RETURNING seq)
+       INSERT INTO facet_state (user_id, facet_key, version, op, payload, seq) SELECT $1, $2, $3, 'upsert', $4, seq FROM fed`,
+      [caller.userId, key, ahead, score(9)],
+    );
+    const past = canonicalVersion({ instant: new Date(Date.now() + MAX_FUTURE_SKEW_MS + 60_000), counter: 0, deviceId: caller.deviceId });
+    const res = ok(await caller.push({ clientId: randomUUID(), events: [upsert(key, past, score(2))] })).results[0]!;
+    expect(res.outcome).toBe(PushOutcome.REJECTED);
+    expect(res.reason.split(':')[0]).toBe('version_future');
+    expect(res.current?.version).toBe(ahead);
+  });
+
   it('accepts a version inside the future skew and rejects one past it', async () => {
     const caller = await SyncCaller.enrol(h);
     const key = userFacetKey(randomUUID(), 'score');
@@ -289,11 +401,26 @@ describe('Push', () => {
     expect(await feedCount(caller.userId)).toBe(200);
   });
 
-  it('refuses an empty client_id with INVALID_ARGUMENT', async () => {
+  it.each([
+    ['an empty client_id', ''],
+    ['a NUL inside', 'a\u0000b'],
+    ['129 characters', 'c'.repeat(129)],
+    ['4000 characters', 'd'.repeat(4000)],
+    ['a space inside', 'a b'],
+    ['a non-ASCII character', 'caf\u00e9'],
+  ])('refuses %s with INVALID_ARGUMENT, never an internal error', async (_why, clientId) => {
     const caller = await SyncCaller.enrol(h);
-    const res = await caller.push({ clientId: '', events: [upsert(userFacetKey(randomUUID(), 'score'), mint(caller), JSON.stringify({ score: 3, ...DISPLAY }))] });
-    expect(res).toMatchObject({ ok: false, code: 'invalid_argument' });
+    const res = await caller.push({ clientId, events: [upsert(userFacetKey(randomUUID(), 'score'), mint(caller), score(3))] });
+    expect(res).toMatchObject({ ok: false, status: 400, code: 'invalid_argument' });
     expect(await feedCount(caller.userId)).toBe(0);
+  });
+
+  it('takes a client_id of 128 printable ASCII characters', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const clientId = `${'~!'.repeat(63)}Az`;
+    const res = ok(await caller.push({ clientId, events: [upsert(userFacetKey(randomUUID(), 'score'), mint(caller), score(3))] }));
+    expect(clientId).toHaveLength(128);
+    expect(res.results[0]!.outcome).toBe(PushOutcome.APPLIED);
   });
 
   it('keys receipts per user: another user may reuse a client_id', async () => {
@@ -303,6 +430,26 @@ describe('Push', () => {
     ok(await a.push({ clientId, events: [upsert(userFacetKey(randomUUID(), 'score'), mint(a), JSON.stringify({ score: 3, ...DISPLAY }))] }));
     const res = ok(await b.push({ clientId, events: [upsert(userFacetKey(randomUUID(), 'score'), mint(b), JSON.stringify({ score: 4, ...DISPLAY }))] }));
     expect(res.results[0]!.outcome).toBe(PushOutcome.APPLIED);
+  });
+
+  it("never shows user B user A's facet through STALE, REJECTED or a replay of A's batch", async () => {
+    const a = await SyncCaller.enrol(h);
+    const b = await SyncCaller.enrol(h);
+    const k = userFacetKey(randomUUID(), 'note');
+    const k2 = userFacetKey(randomUUID(), 'note');
+    const aBatch = { clientId: randomUUID(), events: [upsert(k, mint(a, 0, -1_000), note('A-SECRET-1')), upsert(k2, mint(a, 1, -1_000), note('A-SECRET-2'))] };
+    ok(await a.push(aBatch));
+
+    const older = ok(await b.push({ clientId: randomUUID(), events: [upsert(k, mint(b, 0, -500_000), note('b'))] })).results[0]!;
+    expect(older.outcome).toBe(PushOutcome.APPLIED);
+    const rejected = ok(await b.push({ clientId: randomUUID(), events: [upsert(k2, mint(b, 0, -500_000), '{')] })).results[0]!;
+    expect(rejected.outcome).toBe(PushOutcome.REJECTED);
+    expect(rejected.current).toBeUndefined();
+
+    const replay = await b.push(aBatch);
+    expect(replay.raw.body).not.toContain('A-SECRET');
+    expect(ok(replay).results.map((r) => r.reason.split(':')[0])).toEqual(['device_mismatch', 'device_mismatch']);
+    expect(JSON.stringify((await drain(b)).events)).not.toContain('A-SECRET');
   });
 });
 
@@ -389,6 +536,8 @@ describe('Delta', () => {
 describe('Status', () => {
   it('reports the head cursor, zero pending review, and the Postgres clock in canonical form', async () => {
     const caller = await SyncCaller.enrol(h);
+    const other = await SyncCaller.enrol(h);
+    ok(await other.push({ clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(other), score(1))] }));
     const empty = ok(await caller.status());
     expect(empty.cursor).toBe(ok(await caller.delta({})).nextCursor);
 
@@ -407,27 +556,12 @@ describe('Status', () => {
   });
 });
 
+// The second writer runs on the other replica: a replica queues one user's Pushes before the
+// pool, so only another process meets the advisory lock.
 describe('(2) commit order: a Delta reader never skips a late-committing lower seq', () => {
-  async function waiting(event: string, statement: string): Promise<boolean> {
-    const { rows } = await db.admin.query(
-      `SELECT 1 FROM pg_stat_activity
-        WHERE usename = 'coordinator' AND wait_event_type = 'Lock' AND wait_event = $1 AND query LIKE $2`,
-      [event, `${statement}%`],
-    );
-    return rows.length > 0;
-  }
-
-  async function until(predicate: () => Promise<boolean>, what: string): Promise<void> {
-    for (let i = 0; i < 500; i += 1) {
-      if (await predicate()) return;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    throw new Error(`timed out waiting for ${what}`);
-  }
-
   it('holds the second writer until the first commits', async () => {
     const caller = await SyncCaller.enrol(h);
-    const sibling = await SyncCaller.sibling(h, caller);
+    const sibling = (await SyncCaller.sibling(h, caller)).via(h2);
     const reader = await SyncCaller.sibling(h, caller);
     const k1 = userFacetKey(randomUUID(), 'status');
     const k2 = userFacetKey(randomUUID(), 'status');
@@ -461,6 +595,73 @@ describe('(2) commit order: a Delta reader never skips a late-committing lower s
     } finally {
       blocker.release();
     }
+  });
+
+  it('holds the second writer while the first is parked after taking its seq', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const sibling = (await SyncCaller.sibling(h, caller)).via(h2);
+    const reader = await SyncCaller.sibling(h, caller);
+    const k1 = userFacetKey(randomUUID(), 'score');
+    const k2 = userFacetKey(randomUUID(), 'score');
+
+    // An uncommitted facet_state row for k1 parks the first Push at its upsert, after nextval.
+    const blocker = await db.admin.connect();
+    await blocker.query('BEGIN');
+    const v0 = mint(caller, 0, -900_000);
+    await blocker.query(
+      `WITH fed AS (INSERT INTO feed_event (user_id, facet_key, version, op, payload) VALUES ($1, $2, $3, 'upsert', '{}') RETURNING seq)
+       INSERT INTO facet_state (user_id, facet_key, version, op, payload, seq) SELECT $1, $2, $3, 'upsert', '{}', seq FROM fed`,
+      [caller.userId, k1, v0],
+    );
+    try {
+      const first = caller.push({ clientId: randomUUID(), events: [upsert(k1, mint(caller, 1), score(1))] });
+      await until(() => waiting('transactionid', 'WITH fed AS'), 'the first push to park at its upsert');
+
+      let secondDone = false;
+      const second = sibling.push({ clientId: randomUUID(), events: [upsert(k2, mint(sibling, 2), score(2))] }).finally(() => {
+        secondDone = true;
+      });
+      await until(async () => secondDone || (await waiting('advisory', 'SELECT pg_advisory_xact_lock')), 'the second push to finish or queue');
+
+      const between = ok(await reader.delta({}));
+      await blocker.query('ROLLBACK');
+      const [r1, r2] = await Promise.all([first, second]);
+      expect(ok(r1).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+      expect(ok(r2).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+
+      const after = await drain(reader, between.nextCursor);
+      expect([...between.events, ...after.events].map((e) => e.facetKey).sort()).toEqual([k1, k2].sort());
+    } finally {
+      blocker.release();
+    }
+  });
+});
+
+describe('a user whose Pushes queue behind its lock', () => {
+  it('holds one pooled connection on this replica, so another user is answered meanwhile', async () => {
+    const a = await SyncCaller.enrol(h);
+    const b = await SyncCaller.enrol(h);
+    // Another replica holds A's lock; the test pool has 12 connections.
+    const holder = await db.admin.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT pg_advisory_xact_lock($1, hashtext($2))', [LOCK_NAMESPACE, a.userId]);
+    let pushes: ReturnType<SyncCaller['push']>[] = [];
+    let answered: unknown;
+    let waiters = -1;
+    try {
+      pushes = Array.from({ length: 12 }, (_, i) =>
+        a.push({ clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(a, i), score(2))] }),
+      );
+      await until(async () => (await lockWaiters()) >= 1, 'a push to queue on the lock');
+      answered = await within(b.status(), 5_000);
+      waiters = await lockWaiters();
+    } finally {
+      await holder.query('ROLLBACK');
+      holder.release();
+    }
+    expect(answered).not.toBe('timed out');
+    expect(waiters).toBe(1);
+    expect((await Promise.all(pushes)).map((r) => ok(r).results[0]!.outcome)).toEqual(Array(12).fill(PushOutcome.APPLIED));
   });
 });
 

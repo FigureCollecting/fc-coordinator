@@ -20,7 +20,9 @@ import {
   initOpenFgaTransport,
   setEntitlementAuditSink,
 } from '../entitlements/index.js';
+import { createSpineReadClientFromEnv } from '../spine/spineReadClient.js';
 import { createSyncRoutes, type SyncRoutesDeps } from '../sync/service.js';
+import type { SyncPool } from '../sync/store.js';
 import { createCompareRoutes, type CompareRoutesDeps } from './compare.js';
 import {
   decoratorDeviceResolver,
@@ -72,6 +74,14 @@ export interface ConnectOptions extends CompareRoutesDeps {
    * hook use, still do. A prefix changes none of that.
    */
   routePrefix?: string;
+}
+
+/**
+ * The surface the process serves: Compare on the env's spine (null = degraded), Sync on the pool.
+ * Here rather than in server.ts, which is outside coverage, so dropping a service fails a test.
+ */
+export function productionConnectOptions(pool: SyncPool, env: NodeJS.ProcessEnv = process.env): ConnectOptions {
+  return { spineRead: createSpineReadClientFromEnv(env), sync: { db: pool } };
 }
 
 export function registerConnect(app: FastifyInstance, options: ConnectOptions): void {

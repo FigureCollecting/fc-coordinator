@@ -15,6 +15,7 @@ import {
   SyncOp,
   SyncService,
   normaliseDeviceId,
+  parseUserFacetKey,
   type DeltaRequest,
   type DeltaResponse,
   type PushRequest,
@@ -25,6 +26,7 @@ import {
 } from '@figurecollecting/fc-api-contract';
 import { kCallerDevice, kCallerSubject } from '../connect/identity.js';
 import { decodeCursor, encodeCursor } from './cursor.js';
+import { KeyedSerialiser } from './serialise.js';
 import {
   applyEvent,
   feedHead,
@@ -38,13 +40,17 @@ import {
   transaction,
   writeReceipt,
   type Facet,
+  type SqlClient,
   type SyncPool,
+  type TxClient,
 } from './store.js';
 import { validateEvent } from './validate.js';
 
 export const DEFAULT_PAGE = 500;
 export const MAX_PAGE = 1000;
 export const MAX_BATCH = 200;
+/** Printable ASCII, no space, 1 to 128 characters: a uuid fits and the receipt key stays indexable. */
+const CLIENT_ID = /^[\x21-\x7e]{1,128}$/;
 
 export interface SyncRoutesDeps {
   db: SyncPool;
@@ -83,8 +89,8 @@ function result(facetKey: string, outcome: PushOutcome, current: Facet | undefin
   });
 }
 
-// The receipt holds the answer a replay gets: APPLIED becomes DUPLICATE, every other result
-// (STALE, REJECTED and its reason) is repeated as first given.
+// The receipt holds the answer a replay gets: APPLIED becomes DUPLICATE, and every outcome and
+// reason is repeated as first given.
 const asReplay = (response: PushResponse): PushResponse =>
   create(PushResponseSchema, {
     results: response.results.map((r) =>
@@ -92,8 +98,20 @@ const asReplay = (response: PushResponse): PushResponse =>
     ),
   });
 
+// A REJECTED `current` is re-read on replay. The client adopts it whole while it holds the rejected
+// edit, and may since have pulled a write older than that edit, so a recorded one would undo it.
+async function replay(tx: SqlClient, userId: string, recorded: PushResponse): Promise<PushResponse> {
+  const results: PushResult[] = [];
+  for (const r of recorded.results) {
+    const reread = r.outcome === PushOutcome.REJECTED && parseUserFacetKey(r.facetKey) !== undefined;
+    results.push(reread ? result(r.facetKey, r.outcome, await readFacet(tx, userId, r.facetKey), r.reason) : r);
+  }
+  return create(PushResponseSchema, { results });
+}
+
 export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) => void {
   const { db } = deps;
+  const writers = new KeyedSerialiser();
 
   const delta = async (req: DeltaRequest, ctx: HandlerContext): Promise<DeltaResponse> => {
     const caller = callerOf(ctx);
@@ -115,8 +133,8 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
 
   const push = async (req: PushRequest, ctx: HandlerContext): Promise<PushResponse> => {
     const caller = callerOf(ctx);
-    if (req.clientId === '') {
-      throw new ConnectError('client_id is required: without it a retry cannot be recognised', Code.InvalidArgument);
+    if (!CLIENT_ID.test(req.clientId)) {
+      throw new ConnectError('client_id must be 1 to 128 printable ASCII characters, no spaces', Code.InvalidArgument);
     }
     if (req.events.length > MAX_BATCH) {
       throw new ConnectError(`a batch carries at most ${MAX_BATCH} events`, Code.InvalidArgument);
@@ -124,11 +142,15 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
     const requestSha256 = createHash('sha256').update(toBinary(PushRequestSchema, req)).digest();
     const deviceHex = normaliseDeviceId(caller.deviceId);
 
-    type Outcome = { replay: { requestSha256: Buffer; response: Buffer } } | { response: PushResponse };
-    const outcome = await transaction(db, async (tx): Promise<Outcome> => {
+    const write = async (tx: TxClient): Promise<PushResponse> => {
       await lockUser(tx, caller.userId);
       const receipt = await readReceipt(tx, caller.userId, req.clientId);
-      if (receipt !== undefined) return { replay: receipt };
+      if (receipt !== undefined) {
+        if (!receipt.requestSha256.equals(requestSha256)) {
+          throw new ConnectError('client_id was already used for a different batch', Code.InvalidArgument);
+        }
+        return replay(tx, caller.userId, fromBinary(PushResponseSchema, receipt.response));
+      }
 
       const now = await serverNow(tx);
       const results: PushResult[] = [];
@@ -149,14 +171,9 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
       }
       const response = create(PushResponseSchema, { results });
       await writeReceipt(tx, caller.userId, req.clientId, requestSha256, Buffer.from(toBinary(PushResponseSchema, asReplay(response))));
-      return { response };
-    });
-
-    if ('response' in outcome) return outcome.response;
-    if (!outcome.replay.requestSha256.equals(requestSha256)) {
-      throw new ConnectError('client_id was already used for a different batch', Code.InvalidArgument);
-    }
-    return fromBinary(PushResponseSchema, outcome.replay.response);
+      return response;
+    };
+    return writers.run(caller.userId, () => transaction(db, write));
   };
 
   const status = async (_req: unknown, ctx: HandlerContext): Promise<StatusResponse> => {

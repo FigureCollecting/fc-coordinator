@@ -32,10 +32,10 @@ import { buildApp } from './app.js';
 import { resolveAuthConfig, resolveRoutePrefix } from './auth/config.js';
 import { createAccessTokenVerifier, createJwksFor } from './auth/oidc.js';
 import { createDeviceStore } from './auth/plugin.js';
+import { productionConnectOptions } from './connect/register.js';
 import { createCoordinatorPool, describeTarget } from './db/pool.js';
 import type { LogLevel } from './platform/logger.js';
 import { startTelemetry } from './platform/telemetry.js';
-import { createSpineReadClientFromEnv } from './spine/spineReadClient.js';
 
 const port = Number(process.env['COORDINATOR_PORT'] ?? '5052');
 const host = process.env['COORDINATOR_HOST'] ?? '0.0.0.0';
@@ -77,7 +77,7 @@ const app = buildApp({
   // which is the whole point of the shared declaration in src/identity.ts. The
   // subject a caller is entitled AS is therefore the subject the DPoP proof was
   // verified for, and there is no path by which a client can name its own.
-  compare: { spineRead: createSpineReadClientFromEnv(), sync: { db: pool } },
+  compare: productionConnectOptions(pool),
 });
 
 // /healthz no longer reports the database target: it is the one unauthenticated
