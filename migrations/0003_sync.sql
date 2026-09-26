@@ -74,13 +74,14 @@ CREATE TABLE feed_cursor (
   PRIMARY KEY (user_id, device_id)
 );
 
--- Push idempotency per user (never global): the request hash and the exact response bytes a
--- replay of the same client_id is answered with.
+-- Push idempotency per user (never global): the request hash, and each event's first outcome and
+-- reason (a coordinator.v1 PushResponse without `current`). A replay repeats those and reads
+-- `current` afresh, so a sibling's later write reaches it.
 CREATE TABLE mutation_receipt (
   user_id         uuid NOT NULL REFERENCES app_user(id),
   client_id       text COLLATE "C" NOT NULL,
   request_sha256  bytea NOT NULL CHECK (octet_length(request_sha256) = 32),
-  response        bytea NOT NULL,
+  outcomes        bytea NOT NULL,
   created_at      timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (user_id, client_id)
 );

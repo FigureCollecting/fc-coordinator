@@ -265,10 +265,10 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
 
     it('lets the app write receipts once, and refuses UPDATE and DELETE on them', async () => {
       const write = await asApp(
-        `INSERT INTO mutation_receipt (user_id, client_id, request_sha256, response) VALUES ('${USER}', 'c1', sha256('x'), '')`,
+        `INSERT INTO mutation_receipt (user_id, client_id, request_sha256, outcomes) VALUES ('${USER}', 'c1', sha256('x'), '')`,
       );
       expect(write.exitCode).toBe(0);
-      denied(await asApp("UPDATE mutation_receipt SET response = '' WHERE false"));
+      denied(await asApp("UPDATE mutation_receipt SET outcomes = '' WHERE false"));
       denied(await asApp('DELETE FROM mutation_receipt WHERE false'));
     });
 

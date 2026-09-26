@@ -647,5 +647,8 @@ order and Delta never skips a late commit. Versions are ordered by
 fc-api-contract's `compareVersion` in the handler, never by SQL `<`.
 `test/sync/` runs on a glibc `en_US` Postgres so a locale comparison would show.
 
+A replayed `client_id` repeats each event's first outcome and reason (APPLIED
+as DUPLICATE); `current` is read at the replay.
+
 Until fc-api-contract 0.2.0 is published, `package.json` installs it from
 `vendor/`, a pack of the contract's WK-02 branch.

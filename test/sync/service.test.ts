@@ -2,13 +2,14 @@
 // in a real database, and every call signed with the repo's makeProof helper.
 import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
-import { create } from '@bufbuild/protobuf';
+import { create, fromBinary } from '@bufbuild/protobuf';
 import { createClient } from '@connectrpc/connect';
 import { createConnectTransport } from '@connectrpc/connect-node';
 import {
   MAX_FUTURE_SKEW_MS,
   PushOutcome,
   PushRequestSchema,
+  PushResponseSchema,
   SERVER_DEVICE_ID,
   StatusRequestSchema,
   SyncOp,
@@ -146,7 +147,7 @@ describe('(7) the edge guards Delta, Push and Status', () => {
 });
 
 describe('Push', () => {
-  it('(3) replays a client_id as DUPLICATE with the byte-identical stored response and one feed_event', async () => {
+  it('(3) replays a client_id as DUPLICATE and writes one feed_event', async () => {
     const caller = await SyncCaller.enrol(h);
     const key = userFacetKey(randomUUID(), 'status');
     const batch = { clientId: randomUUID(), events: [upsert(key, mint(caller), status('owned'))] };
@@ -155,13 +156,6 @@ describe('Push', () => {
     expect(first.message.results.map((r) => r.outcome)).toEqual([PushOutcome.APPLIED]);
 
     const replay = await caller.pushBinary(batch);
-    const stored = await db.admin.query<{ response: Buffer }>(
-      'SELECT response FROM mutation_receipt WHERE user_id = $1 AND client_id = $2',
-      [caller.userId, batch.clientId],
-    );
-    expect(replay.bytes.equals(stored.rows[0]!.response)).toBe(true);
-    expect((await caller.pushBinary(batch)).bytes.equals(replay.bytes)).toBe(true);
-
     expect(replay.message.results.map((r) => r.outcome)).toEqual([PushOutcome.DUPLICATE]);
     expect(replay.message.results[0]!.current).toEqual(first.message.results[0]!.current);
     expect(await feedCount(caller.userId)).toBe(1);
@@ -171,7 +165,7 @@ describe('Push', () => {
     expect(await feedCount(caller.userId)).toBe(1);
   });
 
-  it('replays APPLIED as DUPLICATE and each REJECTED with its first reason, byte-identical while nothing changes', async () => {
+  it('replays APPLIED as DUPLICATE and each REJECTED with its first reason, from a receipt of outcomes and reasons', async () => {
     const caller = await SyncCaller.enrol(h);
     const key = userFacetKey(randomUUID(), 'score');
     const future = canonicalVersion({ instant: new Date(Date.now() + MAX_FUTURE_SKEW_MS + 60_000), counter: 1, deviceId: caller.deviceId });
@@ -196,21 +190,51 @@ describe('Push', () => {
       [PushOutcome.REJECTED, 'facet_key_not_user_owned', undefined],
     ]);
 
-    const replays = [await caller.pushBinary(batch), await caller.pushBinary(batch)];
-    const stored = await db.admin.query<{ response: Buffer }>(
-      'SELECT response FROM mutation_receipt WHERE user_id = $1 AND client_id = $2',
+    const stored = await db.admin.query<{ outcomes: Buffer }>(
+      'SELECT outcomes FROM mutation_receipt WHERE user_id = $1 AND client_id = $2',
       [caller.userId, batch.clientId],
     );
-    for (const replay of replays) {
+    const recorded = fromBinary(PushResponseSchema, stored.rows[0]!.outcomes).results;
+    expect(recorded.map((r) => [r.facetKey, r.outcome, r.reason, r.version, r.current])).toEqual(
+      first.message.results.map((r) => [r.facetKey, r.outcome, r.reason, '', undefined]),
+    );
+
+    for (const replay of [await caller.pushBinary(batch), await caller.pushBinary(batch)]) {
       expect(replay.message.results.map(shape)).toEqual([
         [PushOutcome.DUPLICATE, '', applied],
         [PushOutcome.REJECTED, 'version_future', applied],
         [PushOutcome.REJECTED, 'facet_key_not_user_owned', undefined],
       ]);
       expect(replay.message.results.map((r) => r.reason)).toEqual(first.message.results.map((r) => r.reason));
-      expect(replay.bytes.equals(stored.rows[0]!.response)).toBe(true);
     }
     expect(await feedCount(caller.userId)).toBe(2);
+  });
+
+  // A replay repeats the recorded outcome and reason, but `current` is the facet as held at the
+  // replay: the client adopts it whole while it still holds the edit, and a sibling may have written.
+  it.each([
+    ['APPLIED', 'upserts', PushOutcome.DUPLICATE],
+    ['APPLIED', 'tombstones', PushOutcome.DUPLICATE],
+    ['STALE', 'upserts', PushOutcome.STALE],
+  ] as const)('answers a replayed %s, after a sibling %s the key, with its recorded outcome and the facet as held now', async (was, sibling, outcome) => {
+    const a = await SyncCaller.enrol(h);
+    const b = (await SyncCaller.sibling(h, a)).via(h2);
+    const key = userFacetKey(randomUUID(), 'score');
+    if (was === 'STALE') ok(await b.push({ clientId: randomUUID(), events: [upsert(key, mint(b, 0, -300_000), score(3))] }));
+    const batch = { clientId: randomUUID(), events: [upsert(key, mint(a, 0, -400_000), score(5))] };
+    const lost = ok(await a.push(batch)).results[0]!;
+    expect(PushOutcome[lost.outcome]).toBe(was);
+
+    const later = mint(b, 1, -200_000);
+    const write = sibling === 'upserts' ? upsert(key, later, score(8)) : { facetKey: key, version: later, op: SyncOp.DELETE, payload: '' };
+    ok(await b.push({ clientId: randomUUID(), events: [write] }));
+    const written = await feedCount(a.userId);
+
+    for (const replay of [ok(await a.push(batch)).results[0]!, ok(await a.via(h2).push(batch)).results[0]!]) {
+      expect(replay).toMatchObject({ facetKey: key, outcome, reason: '', version: later });
+      expect(replay.current).toMatchObject({ facetKey: key, version: later, op: write.op, payload: write.payload });
+    }
+    expect(await feedCount(a.userId)).toBe(written);
   });
 
   // The client rule adopts a REJECTED `current` whole when it still holds the rejected edit. A
@@ -234,9 +258,11 @@ describe('Push', () => {
     expect(lost.current?.version).toBe(seeded ? v1 : undefined);
 
     ok(await b.push({ clientId: randomUUID(), events: [upsert(key, v2, score(7))] }));
+    const written = await feedCount(a.userId);
     const replay = ok(await a.push(batch)).results[0]!;
     expect(replay).toMatchObject({ outcome: PushOutcome.REJECTED, reason: lost.reason, version: v2 });
     expect(replay.current).toMatchObject({ facetKey: key, version: v2, op: SyncOp.UPSERT, payload: score(7) });
+    expect(await feedCount(a.userId)).toBe(written);
   });
 
   it('refuses the same client_id with a different body as INVALID_ARGUMENT and writes nothing', async () => {
@@ -579,7 +605,7 @@ describe('(2) commit order: a Delta reader never skips a late-committing lower s
     const blocker = await db.admin.connect();
     await blocker.query('BEGIN');
     await blocker.query(
-      "INSERT INTO mutation_receipt (user_id, client_id, request_sha256, response) VALUES ($1, $2, sha256('x'), '')",
+      "INSERT INTO mutation_receipt (user_id, client_id, request_sha256, outcomes) VALUES ($1, $2, sha256('x'), '')",
       [caller.userId, firstId],
     );
     try {

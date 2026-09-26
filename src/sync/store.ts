@@ -170,13 +170,13 @@ export async function readReceipt(
   tx: SqlClient,
   userId: string,
   clientId: string,
-): Promise<{ requestSha256: Buffer; response: Buffer } | undefined> {
-  const { rows } = await tx.query<{ request_sha256: Buffer; response: Buffer }>(
-    'SELECT request_sha256, response FROM mutation_receipt WHERE user_id = $1 AND client_id = $2',
+): Promise<{ requestSha256: Buffer; outcomes: Buffer } | undefined> {
+  const { rows } = await tx.query<{ request_sha256: Buffer; outcomes: Buffer }>(
+    'SELECT request_sha256, outcomes FROM mutation_receipt WHERE user_id = $1 AND client_id = $2',
     [userId, clientId],
   );
   const row = rows[0];
-  return row === undefined ? undefined : { requestSha256: row.request_sha256, response: row.response };
+  return row === undefined ? undefined : { requestSha256: row.request_sha256, outcomes: row.outcomes };
 }
 
 export async function writeReceipt(
@@ -184,10 +184,10 @@ export async function writeReceipt(
   userId: string,
   clientId: string,
   requestSha256: Buffer,
-  response: Buffer,
+  outcomes: Buffer,
 ): Promise<void> {
   await tx.query(
-    'INSERT INTO mutation_receipt (user_id, client_id, request_sha256, response) VALUES ($1, $2, $3, $4)',
-    [userId, clientId, requestSha256, response],
+    'INSERT INTO mutation_receipt (user_id, client_id, request_sha256, outcomes) VALUES ($1, $2, $3, $4)',
+    [userId, clientId, requestSha256, outcomes],
   );
 }
