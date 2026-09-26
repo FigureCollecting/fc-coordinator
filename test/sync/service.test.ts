@@ -84,6 +84,12 @@ function mint(caller: SyncCaller, counter = 0, offsetMs = -60_000): string {
   return canonicalVersion({ instant: new Date(Date.now() + offsetMs), counter, deviceId: caller.deviceId });
 }
 
+/** Versions for `caller` on one instant, so only the counters order them. */
+function mintTogether(caller: SyncCaller, ...counters: number[]): string[] {
+  const instant = new Date(Date.now() - 60_000);
+  return counters.map((counter) => canonicalVersion({ instant, counter, deviceId: caller.deviceId }));
+}
+
 const upsert = (facetKey: string, version: string, payload: string) => ({
   facetKey,
   version,
@@ -280,8 +286,7 @@ describe('Push', () => {
   it('(4) STALE carries current with the server payload, and DUPLICATE carries it too', async () => {
     const caller = await SyncCaller.enrol(h);
     const key = userFacetKey(randomUUID(), 'note');
-    const newer = mint(caller, 5);
-    const older = mint(caller, 4);
+    const [newer, older] = mintTogether(caller, 5, 4) as [string, string];
     ok(await caller.push({ clientId: randomUUID(), events: [upsert(key, newer, note('server copy'))] }));
 
     for (const version of [older, newer]) {
@@ -414,10 +419,11 @@ describe('Push', () => {
   it('applies two events for one key in batch order', async () => {
     const caller = await SyncCaller.enrol(h);
     const key = userFacetKey(randomUUID(), 'status');
+    const [v1, v2, v0] = mintTogether(caller, 1, 2, 0) as [string, string, string];
     const res = ok(
       await caller.push({
         clientId: randomUUID(),
-        events: [upsert(key, mint(caller, 1), status('ordered')), upsert(key, mint(caller, 2), status('owned')), upsert(key, mint(caller, 0), status('wished'))],
+        events: [upsert(key, v1, status('ordered')), upsert(key, v2, status('owned')), upsert(key, v0, status('wished'))],
       }),
     );
     expect(res.results.map((r) => r.outcome)).toEqual([PushOutcome.APPLIED, PushOutcome.APPLIED, PushOutcome.STALE]);
