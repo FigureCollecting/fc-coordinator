@@ -20,10 +20,13 @@ import {
   initOpenFgaTransport,
   setEntitlementAuditSink,
 } from '../entitlements/index.js';
+import { createSyncRoutes, type SyncRoutesDeps } from '../sync/service.js';
 import { createCompareRoutes, type CompareRoutesDeps } from './compare.js';
 import {
+  decoratorDeviceResolver,
   decoratorIdentityResolver,
   identityContextValues,
+  type DeviceResolver,
   type IdentityResolver,
 } from './identity.js';
 import { traceparentServerInterceptor } from './interceptors.js';
@@ -35,6 +38,10 @@ export interface ConnectOptions extends CompareRoutesDeps {
    * ./identity.ts for why this is a seam and not a lookup.
    */
   resolveIdentity?: IdentityResolver;
+  /** How the caller's DPoP-bound device is established. Defaults to the edge's decorator. */
+  resolveDevice?: DeviceResolver;
+  /** Serve coordinator.v1 SyncService beside Compare, on the same guard and interceptors. */
+  sync?: SyncRoutesDeps;
   /**
    * Load the entitlement signing key at registration and log whether minting is
    * on, and name which OpenFGA credential path is configured. Default true: a
@@ -94,16 +101,22 @@ export function registerConnect(app: FastifyInstance, options: ConnectOptions): 
   }
 
   const resolveIdentity = options.resolveIdentity ?? decoratorIdentityResolver();
+  const resolveDevice = options.resolveDevice ?? decoratorDeviceResolver();
+  const compareRoutes = createCompareRoutes(options);
+  const syncRoutes = options.sync === undefined ? undefined : createSyncRoutes(options.sync);
 
   void app.register(fastifyConnectPlugin, {
     // `prefix` is read by Fastify's register, not by the plugin, which ignores
     // the extra key. An empty string means no prefix.
     prefix: options.routePrefix ?? '',
-    routes: createCompareRoutes(options),
+    routes: (router) => {
+      compareRoutes(router);
+      syncRoutes?.(router);
+    },
     // §A.5 rule 3, inbound half: continue the caller's trace and be a span in
     // it, so every log line the handler writes carries the trace tag and the
     // outbound hop names this service as its parent.
     interceptors: [traceparentServerInterceptor()],
-    contextValues: identityContextValues(resolveIdentity),
+    contextValues: identityContextValues(resolveIdentity, resolveDevice),
   });
 }

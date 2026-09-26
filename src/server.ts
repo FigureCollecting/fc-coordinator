@@ -77,7 +77,7 @@ const app = buildApp({
   // which is the whole point of the shared declaration in src/identity.ts. The
   // subject a caller is entitled AS is therefore the subject the DPoP proof was
   // verified for, and there is no path by which a client can name its own.
-  compare: { spineRead: createSpineReadClientFromEnv() },
+  compare: { spineRead: createSpineReadClientFromEnv(), sync: { db: pool } },
 });
 
 // /healthz no longer reports the database target: it is the one unauthenticated

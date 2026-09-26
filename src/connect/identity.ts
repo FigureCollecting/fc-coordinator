@@ -64,10 +64,26 @@ export function decoratorIdentityResolver(
     if (typeof decorated !== 'object' || decorated === null) return null;
     const sub = (decorated as { sub?: unknown }).sub;
     if (typeof sub !== 'string' || sub.trim() === '') return null;
-    // Only `sub`. The edge also hangs deviceId and jkt off the same property;
-    // they are its business, not the entitlement path's, and copying them here
-    // would be the start of a second identity model.
+    // Only `sub`: the entitlement path needs nothing else. The device travels
+    // separately (decoratorDeviceResolver) for SyncService; jkt stays the edge's.
     return { sub };
+  };
+}
+
+/** The caller's DPoP-bound device id (device.id), or null. SyncService keys cursors and versions on it. */
+export const kCallerDevice = createContextKey<string | null>(null, {
+  description: 'fc-coordinator: the DPoP-bound device id of the caller, or null',
+});
+
+export type DeviceResolver = (request: FastifyRequest) => string | null;
+
+/** Read the device the edge bound the proof to. Null inside the enrolment bootstrap. */
+export function decoratorDeviceResolver(property: string = CALLER_IDENTITY_DECORATOR): DeviceResolver {
+  return (request) => {
+    const decorated = (request as unknown as Record<string, unknown>)[property];
+    if (typeof decorated !== 'object' || decorated === null) return null;
+    const deviceId = (decorated as { deviceId?: unknown }).deviceId;
+    return typeof deviceId === 'string' && deviceId !== '' ? deviceId : null;
   };
 }
 
@@ -78,6 +94,10 @@ export function decoratorIdentityResolver(
  */
 export function identityContextValues(
   resolve: IdentityResolver,
+  resolveDevice: DeviceResolver = decoratorDeviceResolver(),
 ): (request: FastifyRequest) => ContextValues {
-  return (request) => createContextValues().set(kCallerSubject, resolve(request)?.sub ?? null);
+  return (request) =>
+    createContextValues()
+      .set(kCallerSubject, resolve(request)?.sub ?? null)
+      .set(kCallerDevice, resolveDevice(request));
 }
