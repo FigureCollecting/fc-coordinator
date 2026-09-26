@@ -1,4 +1,4 @@
-import { MAX_FUTURE_SKEW_MS, SyncOp, canonicalVersion, userFacetKey } from '@figurecollecting/fc-api-contract';
+import { MAX_FUTURE_SKEW_MS, MAX_PAYLOAD_BYTES, SyncOp, canonicalVersion, userFacetKey } from '@figurecollecting/fc-api-contract';
 import { describe, expect, it } from 'vitest';
 import { validateEvent } from './validate.js';
 
@@ -70,6 +70,45 @@ describe('validateEvent', () => {
     expect(ok('note', { note: 'x'.repeat(10_000) })).toBe(true);
     expect(ok('note', { note: 'x'.repeat(10_001) })).toBe(false);
     expect(ok('note', { status: 'owned' })).toBe(false);
+  });
+
+  it('takes a schema-valid payload of MAX_PAYLOAD_BYTES and refuses one byte more, counted as UTF-8', () => {
+    const noteKey = userFacetKey('5b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0', 'note');
+    const padded = (text: string, bytes: number) => {
+      const json = JSON.stringify({ note: text, ...DISPLAY });
+      return json + ' '.repeat(bytes - Buffer.byteLength(json, 'utf8'));
+    };
+    const at = (payload: string) => validateEvent(event({ facetKey: noteKey, payload }), ctx);
+    expect(MAX_PAYLOAD_BYTES).toBe(65_536);
+    expect(at(padded('x', MAX_PAYLOAD_BYTES))).toEqual({ ok: true });
+    const over = { ok: false, reason: 'payload_invalid: payload over 65536 bytes', userOwned: true };
+    expect(at(padded('x', MAX_PAYLOAD_BYTES + 1))).toEqual(over);
+    // 10,000 three-byte characters: fewer UTF-16 units than the cap, more UTF-8 bytes.
+    const wide = padded('\u20ac'.repeat(10_000), MAX_PAYLOAD_BYTES + 1);
+    expect(wide.length).toBeLessThan(MAX_PAYLOAD_BYTES);
+    expect(at(wide)).toEqual(over);
+    expect(validateEvent(event({ op: SyncOp.DELETE, payload: ' '.repeat(MAX_PAYLOAD_BYTES + 1) }), ctx)).toEqual(over);
+  });
+
+  // sync.proto: the REJECTED checks run in the listed order, so an event failing two gets the first.
+  it.each([
+    ['a malformed version on a server-owned key', { facetKey: 'identity/5b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0', version: 'x' }, 'version_malformed', false],
+    ['a past-bound version on a server-owned key', { facetKey: 'identity/5b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0', version: at(MAX_FUTURE_SKEW_MS + 1) }, 'version_future', false],
+    [
+      'a past-bound bare instant on a server-owned key',
+      { facetKey: 'identity/5b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0', version: at(MAX_FUTURE_SKEW_MS + 1).slice(0, 27) },
+      'version_future',
+      false,
+    ],
+    ['a past-bound version from another device', { version: at(MAX_FUTURE_SKEW_MS + 1, '9c1e3a5b-7d9f-1b3d-5f7a-9c1e3b5d7f9a') }, 'version_future', true],
+    ['a past-bound version with a bad payload', { version: at(MAX_FUTURE_SKEW_MS + 1), payload: '{' }, 'version_future', true],
+    ['a server-owned key with another device', { facetKey: 'identity/5b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0', version: at(-1000, '9c1e3a5b-7d9f-1b3d-5f7a-9c1e3b5d7f9a') }, 'facet_key_not_user_owned', false],
+    ['a bare instant on a server-owned key', { facetKey: 'identity/5b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0', version: at(-1000).slice(0, 27) }, 'facet_key_not_user_owned', false],
+    ['another device with a bad payload', { version: at(-1000, '9c1e3a5b-7d9f-1b3d-5f7a-9c1e3b5d7f9a'), payload: '{' }, 'device_mismatch', true],
+  ])('answers %s with the first listed reason', (_why, over, reason, userOwned) => {
+    const verdict = validateEvent(event(over), ctx);
+    expect(verdict).toMatchObject({ ok: false, userOwned });
+    expect(verdict.ok === false && verdict.reason.split(':')[0]).toBe(reason);
   });
 
   it('names the failing location without echoing the payload', () => {

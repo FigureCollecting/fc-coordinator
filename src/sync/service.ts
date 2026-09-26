@@ -55,7 +55,7 @@ export const MAX_BATCH = 200;
 const CLIENT_ID = /^[\x21-\x7e]{1,128}$/;
 /** A Push waits this long for its user's lock, then answers UNAVAILABLE rather than hold a connection. */
 export const PUSH_LOCK_TIMEOUT_MS = 5_000;
-/** Pushes one user may have running or waiting on one replica; one device sends one at a time. */
+/** Pushes one user may have running or waiting on one replica, then UNAVAILABLE; one device sends one at a time. */
 export const MAX_QUEUED_PUSHES = 8;
 /**
  * The largest request body read, before any handler runs. 200 notes of 10,000 U+0001, which
@@ -192,8 +192,9 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
       // The signal aborts when the client goes away, which drops this Push if it is still queued.
       return await writers.run(caller.userId, () => transaction(db, write), ctx.signal);
     } catch (err) {
+      // Retryable with the same client_id, like a lock timeout; RESOURCE_EXHAUSTED means split the batch.
       if (err instanceof QueueFull) {
-        throw new ConnectError(`at most ${MAX_QUEUED_PUSHES} Pushes per user may run or wait here: retry later`, Code.ResourceExhausted);
+        throw new ConnectError(`at most ${MAX_QUEUED_PUSHES} Pushes per user may run or wait here: retry later`, Code.Unavailable);
       }
       if ((err as { code?: unknown }).code === LOCK_NOT_AVAILABLE) {
         throw new ConnectError("this user's writes are held elsewhere: retry later", Code.Unavailable);

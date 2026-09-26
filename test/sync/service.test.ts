@@ -5,8 +5,10 @@ import type { AddressInfo } from 'node:net';
 import { create, fromBinary, toJsonString } from '@bufbuild/protobuf';
 import { createClient } from '@connectrpc/connect';
 import { createConnectTransport } from '@connectrpc/connect-node';
+import pg from 'pg';
 import {
   MAX_FUTURE_SKEW_MS,
+  MAX_PAYLOAD_BYTES,
   PushOutcome,
   PushRequestSchema,
   PushResponseSchema,
@@ -26,7 +28,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { makeProof, TEST_ORIGIN } from '../helpers/auth.js';
 import { KeyedSerialiser } from '../../src/sync/serialise.js';
 import { DISPLAY, ok, startSyncApp, SyncCaller, SYNC_SERVICE_PATH, type SyncApp } from '../helpers/syncClient.js';
-import { startSyncDatabase, type SyncDatabase } from '../helpers/syncDatabase.js';
+import { startSyncDatabase, type SyncDatabase, SYNC_DB } from '../helpers/syncDatabase.js';
 
 let db: SyncDatabase;
 let h: SyncApp;
@@ -386,6 +388,59 @@ describe('Push', () => {
     expect(res.current?.version).toBe(ahead);
   });
 
+  it('runs every REJECTED check in the listed order before STALE routing, on a key whose stored version is higher', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const other = await SyncCaller.sibling(h, caller);
+    const key = userFacetKey(randomUUID(), 'note');
+    const held = mint(caller, 0, -1_000);
+    ok(await caller.push({ clientId: randomUUID(), events: [upsert(key, held, note('held'))] }));
+    const older = (c: SyncCaller) => mint(c, 0, -120_000);
+    const past = (c: SyncCaller) => canonicalVersion({ instant: new Date(Date.now() + MAX_FUTURE_SKEW_MS + 60_000), counter: 0, deviceId: c.deviceId });
+    const oversized = note('x') + ' '.repeat(MAX_PAYLOAD_BYTES);
+    const res = ok(
+      await caller.push({
+        clientId: randomUUID(),
+        events: [
+          upsert(key, past(other), note('two checks')),
+          upsert(key, older(other), '{'),
+          upsert(key, older(caller), oversized),
+          upsert(key, older(caller), note('stale')),
+        ],
+      }),
+    );
+    expect(res.results.map((r) => [r.outcome, r.reason])).toEqual([
+      [PushOutcome.REJECTED, expect.stringMatching(/^version_future: /)],
+      [PushOutcome.REJECTED, expect.stringMatching(/^device_mismatch: /)],
+      [PushOutcome.REJECTED, 'payload_invalid: payload over 65536 bytes'],
+      [PushOutcome.STALE, ''],
+    ]);
+    for (const r of res.results) expect(r.current?.version).toBe(held);
+    expect(await feedCount(caller.userId)).toBe(1);
+  });
+
+  it('rejects a payload over MAX_PAYLOAD_BYTES and applies the rest of the batch', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const big = userFacetKey(randomUUID(), 'note');
+    const fits = userFacetKey(randomUUID(), 'note');
+    const padded = (bytes: number) => note('x').padEnd(bytes, ' ');
+    const [v1, v2] = mintTogether(caller, 1, 2);
+    const res = ok(
+      await caller.push({
+        clientId: randomUUID(),
+        events: [upsert(big, v1!, padded(MAX_PAYLOAD_BYTES + 1)), upsert(fits, v2!, padded(MAX_PAYLOAD_BYTES))],
+      }),
+    );
+    expect(res.results.map((r) => [r.outcome, r.reason])).toEqual([
+      [PushOutcome.REJECTED, 'payload_invalid: payload over 65536 bytes'],
+      [PushOutcome.APPLIED, ''],
+    ]);
+    const { rows } = await db.admin.query<{ facet_key: string; n: number }>(
+      'SELECT facet_key, octet_length(payload) AS n FROM facet_state WHERE user_id = $1',
+      [caller.userId],
+    );
+    expect(rows).toEqual([{ facet_key: fits, n: MAX_PAYLOAD_BYTES }]);
+  });
+
   it('accepts a version inside the future skew and rejects one past it', async () => {
     const caller = await SyncCaller.enrol(h);
     const key = userFacetKey(randomUUID(), 'score');
@@ -679,7 +734,7 @@ describe('(2) commit order: a Delta reader never skips a late-committing lower s
 });
 
 describe('a user whose Pushes queue behind its lock', () => {
-  it('holds one pooled connection on this replica, answers another user meanwhile, and refuses a ninth Push', async () => {
+  it('holds one pooled connection on this replica, answers another user meanwhile, and answers a ninth Push UNAVAILABLE', async () => {
     const a = await SyncCaller.enrol(h);
     const b = await SyncCaller.enrol(h);
     const scored = (caller: SyncCaller, i: number) => ({
@@ -707,7 +762,7 @@ describe('a user whose Pushes queue behind its lock', () => {
       await holder.query('ROLLBACK');
       holder.release();
     }
-    expect(refused).toMatchObject({ ok: false, status: 429, code: 'resource_exhausted' });
+    expect(refused).toMatchObject({ ok: false, status: 503, code: 'unavailable' });
     expect(statusB).not.toBe('timed out');
     expect(pushB).not.toBe('timed out');
     expect(ok(pushB as Awaited<ReturnType<SyncCaller['push']>>).results[0]!.outcome).toBe(PushOutcome.APPLIED);
@@ -718,6 +773,56 @@ describe('a user whose Pushes queue behind its lock', () => {
     expect(answers.filter((r) => !r.ok)).toHaveLength(1);
     expect(await feedCount(a.userId)).toBe(8);
     expect(ok(await a.push(scored(a, 9))).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+  });
+
+  it('reads a replay\'s current under the user lock: queued behind a sibling write, it answers with that write', async () => {
+    const a = await SyncCaller.enrol(h);
+    const b = (await SyncCaller.sibling(h, a)).via(h2);
+    const key = userFacetKey(randomUUID(), 'score');
+    const batch = { clientId: randomUUID(), events: [upsert(key, mint(a, 0, -300_000), score(1))] };
+    expect(ok(await a.push(batch)).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+
+    const holder = await db.admin.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT pg_advisory_xact_lock($1, hashtext($2))', [LOCK_NAMESPACE, a.userId]);
+    let sibling: ReturnType<SyncCaller['push']> | undefined;
+    let replayed: ReturnType<SyncCaller['push']> | undefined;
+    try {
+      sibling = b.push({ clientId: randomUUID(), events: [upsert(key, mint(b, 0, -100_000), score(9))] });
+      await until(async () => (await lockWaiters()) >= 1, 'the sibling write to wait on the lock');
+      replayed = a.push(batch);
+      let settled = false;
+      void replayed.then(() => (settled = true));
+      await until(async () => settled || (await lockWaiters()) >= 2, 'the replay to wait or answer');
+    } finally {
+      await holder.query('ROLLBACK');
+      holder.release();
+    }
+    expect(ok(await sibling!).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    const replay = ok(await replayed!).results[0]!;
+    expect(replay.outcome).toBe(PushOutcome.DUPLICATE);
+    expect(replay.current?.payload).toBe(score(9));
+  });
+
+  it('keeps lock_timeout to the Push transaction: a one-connection pool shows 0 after a Push', async () => {
+    const one = new pg.Pool({
+      host: db.container.getHost(),
+      port: db.container.getMappedPort(5432),
+      user: 'coordinator',
+      password: 'app-pw',
+      database: SYNC_DB,
+      max: 1,
+    });
+    const h1 = await startSyncApp(one, h.issuer);
+    try {
+      const a = (await SyncCaller.enrol(h)).via(h1);
+      ok(await a.push({ clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(a), score(2))] }));
+      const { rows } = await one.query<{ lock_timeout: string }>('SHOW lock_timeout');
+      expect(rows[0]!.lock_timeout).toBe('0');
+    } finally {
+      await h1.close();
+      await one.end();
+    }
   });
 
   it('gives up on a lock held elsewhere after 5 s with UNAVAILABLE, writes nothing, and serves the next Push', async () => {

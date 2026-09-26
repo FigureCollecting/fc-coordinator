@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { Ajv2020, type ValidateFunction } from 'ajv/dist/2020.js';
 import {
   MAX_FUTURE_SKEW_MS,
+  MAX_PAYLOAD_BYTES,
   SyncOp,
   USER_FACET_FIELDS,
   USER_FACET_PAYLOAD_SCHEMAS,
@@ -44,19 +45,26 @@ const reject = (code: PushRejectReason, detail: string, userOwned = true): Verdi
   userOwned,
 });
 
+// sync.proto: the REJECTED checks run in the listed order, all before STALE, REVIEW or APPLIED
+// routing, so a past-bound event is version_future whatever its key, device or stored version.
 export function validateEvent(event: Pick<SyncEvent, 'facetKey' | 'version' | 'op' | 'payload'>, ctx: EventContext): Verdict {
   const key = parseUserFacetKey(event.facetKey);
-  if (key === undefined) return reject('facet_key_not_user_owned', 'not one of the four user-owned key forms', false);
+  const userOwned = key !== undefined;
 
   const version = parseVersion(event.version);
-  if (version === undefined || version.counter === null) {
-    return reject('version_malformed', 'a user-owned facet needs <instant>#<counter>#<device>');
+  if (version === undefined || (userOwned && version.counter === null)) {
+    return reject('version_malformed', 'not the grammar; a user-owned facet needs <instant>#<counter>#<device>', userOwned);
   }
-  if (version.deviceId !== ctx.deviceHex) return reject('device_mismatch', 'the version names another device');
   if (version.micros > ctx.nowMicros + SKEW_MICROS) {
-    return reject('version_future', `later than server_now + ${MAX_FUTURE_SKEW_MS / 1000}s`);
+    return reject('version_future', `later than server_now + ${MAX_FUTURE_SKEW_MS / 1000}s`, userOwned);
   }
+  if (!userOwned) return reject('facet_key_not_user_owned', 'not one of the four user-owned key forms', false);
+  if (version.deviceId !== ctx.deviceHex) return reject('device_mismatch', 'the version names another device');
 
+  // Bounds what is parsed below; the cap is on UTF-8 bytes, not UTF-16 units.
+  if (Buffer.byteLength(event.payload, 'utf8') > MAX_PAYLOAD_BYTES) {
+    return reject('payload_invalid', `payload over ${MAX_PAYLOAD_BYTES} bytes`);
+  }
   if (event.op === SyncOp.DELETE) {
     return event.payload === '' ? { ok: true } : reject('payload_invalid', 'a DELETE carries no payload');
   }

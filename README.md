@@ -648,10 +648,9 @@ fc-api-contract's `compareVersion` in the handler, never by SQL `<`.
 `test/sync/` runs on a glibc `en_US` Postgres so a locale comparison would show.
 
 A replayed `client_id` repeats each event's first outcome and reason (APPLIED
-as DUPLICATE); `current` is read at the replay. Load bounds: a Push waits at
+as DUPLICATE); `current` is read at the replay. The REJECTED checks run in
+sync.proto's listed order, before any STALE or APPLIED routing, and a payload
+over 65,536 UTF-8 bytes is `payload_invalid`. Load bounds: a Push waits at
 most 5 s for its user's lock (then UNAVAILABLE), one user may have 8 Pushes
-running or queued per replica (then RESOURCE_EXHAUSTED), a queued Push whose
-client leaves is dropped, and a Connect request body is at most 16 MiB.
-
-Until fc-api-contract 0.2.0 is published, `package.json` installs it from
-`vendor/`, a pack of the contract's WK-02 branch.
+running or queued per replica (then UNAVAILABLE), a queued Push whose client
+leaves is dropped, and a Connect request body over 16 MiB is RESOURCE_EXHAUSTED.
