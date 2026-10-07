@@ -20,8 +20,19 @@ import {
   canonicalVersion,
   compareVersion,
   isCanonicalVersion,
+  USER_FACET_FAMILIES,
+  answerKey,
+  collNameKey,
+  importPrefKey,
+  occFacetKey,
+  occOriginKey,
+  occTagKey,
+  parseUserFacetKey,
   parseVersion,
-  userFacetKey,
+  tagNameKey,
+  ufFacetKey,
+  ufKindTagKey,
+  ufTagKey,
   type PushResult,
   type SyncEvent,
 } from '@figurecollecting/fc-api-contract';
@@ -168,7 +179,7 @@ describe('(7) the edge guards Delta, Push and Status', () => {
 describe('Push', () => {
   it('(3) replays a client_id as DUPLICATE and writes one feed_event', async () => {
     const caller = await SyncCaller.enrol(h);
-    const key = userFacetKey(randomUUID(), 'status');
+    const key = occFacetKey(randomUUID(), 'status');
     const batch = { clientId: randomUUID(), events: [upsert(key, mint(caller), status('owned'))] };
 
     const first = await caller.pushBinary(batch);
@@ -186,7 +197,7 @@ describe('Push', () => {
 
   it('replays APPLIED as DUPLICATE and each REJECTED with its first reason, from a receipt of outcomes and reasons', async () => {
     const caller = await SyncCaller.enrol(h);
-    const key = userFacetKey(randomUUID(), 'score');
+    const key = ufFacetKey(randomUUID(), 'score');
     const future = canonicalVersion({ instant: new Date(Date.now() + MAX_FUTURE_SKEW_MS + 60_000), counter: 1, deviceId: caller.deviceId });
     // A server-owned key the server holds a value for: REJECTED on it never carries `current`.
     const serverKey = `identity/${randomUUID()}`;
@@ -238,7 +249,7 @@ describe('Push', () => {
   ] as const)('answers a replayed %s, after a sibling %s the key, with its recorded outcome and the facet as held now', async (was, sibling, outcome) => {
     const a = await SyncCaller.enrol(h);
     const b = (await SyncCaller.sibling(h, a)).via(h2);
-    const key = userFacetKey(randomUUID(), 'score');
+    const key = ufFacetKey(randomUUID(), 'score');
     if (was === 'STALE') ok(await b.push({ clientId: randomUUID(), events: [upsert(key, mint(b, 0, -300_000), score(3))] }));
     const batch = { clientId: randomUUID(), events: [upsert(key, mint(a, 0, -400_000), score(5))] };
     const lost = ok(await a.push(batch)).results[0]!;
@@ -265,7 +276,7 @@ describe('Push', () => {
   ])('answers a replayed REJECTED event with the facet as held now, from %s', async (_why, seeded) => {
     const a = await SyncCaller.enrol(h);
     const b = await SyncCaller.sibling(h, a);
-    const key = userFacetKey(randomUUID(), 'score');
+    const key = ufFacetKey(randomUUID(), 'score');
     const v1 = mint(b, 0, -600_000);
     const v2 = mint(b, 0, -500_000);
     const vA = mint(a, 0, -300_000);
@@ -286,7 +297,7 @@ describe('Push', () => {
 
   it('refuses the same client_id with a different body as INVALID_ARGUMENT and writes nothing', async () => {
     const caller = await SyncCaller.enrol(h);
-    const key = userFacetKey(randomUUID(), 'status');
+    const key = occFacetKey(randomUUID(), 'status');
     const clientId = randomUUID();
     ok(await caller.push({ clientId, events: [upsert(key, mint(caller, 0), status('owned'))] }));
 
@@ -297,7 +308,7 @@ describe('Push', () => {
 
   it('(4) STALE carries current with the server payload, and DUPLICATE carries it too', async () => {
     const caller = await SyncCaller.enrol(h);
-    const key = userFacetKey(randomUUID(), 'note');
+    const key = ufFacetKey(randomUUID(), 'note');
     const [newer, older] = mintTogether(caller, 5, 4) as [string, string];
     ok(await caller.push({ clientId: randomUUID(), events: [upsert(key, newer, note('server copy'))] }));
 
@@ -324,8 +335,9 @@ describe('Push', () => {
     const caller = await SyncCaller.enrol(h);
     const other = await SyncCaller.sibling(h, caller);
     const head = randomUUID();
-    const statusKey = userFacetKey(head, 'status');
-    const countKey = userFacetKey(head, 'count');
+    const occ = randomUUID();
+    const statusKey = occFacetKey(occ, 'status');
+    const headKey = occFacetKey(occ, 'head');
     const first = mint(caller, 1);
     const future = canonicalVersion({
       instant: new Date(Date.now() + MAX_FUTURE_SKEW_MS + 60_000),
@@ -343,7 +355,9 @@ describe('Push', () => {
           upsert(statusKey, future, status('wished')),
           upsert(`identity/${head}`, mint(caller, 2), '{"title":"x"}'),
           upsert(statusKey, mint(other, 3), status('wished')),
-          upsert(countKey, mint(caller, 4), JSON.stringify({ count: 2, ...DISPLAY })),
+          upsert(headKey, mint(caller, 4), JSON.stringify({ head_id: head, ...DISPLAY })),
+          upsert(`holding/${head}/status`, mint(caller, 5), status('owned')),
+          upsert(occOriginKey(occ), mint(caller, 6), JSON.stringify({ site: 'mfc', native_id: '1144', ordinal: 1 })),
         ],
       }),
     );
@@ -355,25 +369,75 @@ describe('Push', () => {
       [PushOutcome.REJECTED, 'facet_key_not_user_owned'],
       [PushOutcome.REJECTED, 'device_mismatch'],
       [PushOutcome.APPLIED, ''],
+      [PushOutcome.REJECTED, 'facet_key_not_user_owned'],
+      [PushOutcome.REJECTED, 'facet_key_not_user_owned'],
     ]);
     // A user-owned key the server holds comes back with the server's copy; a server key does not.
     for (const i of [1, 2, 4]) expect(res.results[i]!.current?.version).toBe(first);
-    expect(res.results[3]!.current).toBeUndefined();
-    expect(res.results[3]!.version).toBe('');
+    for (const i of [3, 6, 7]) {
+      expect(res.results[i]!.current).toBeUndefined();
+      expect(res.results[i]!.version).toBe('');
+    }
 
     const feed = await drain(caller);
-    expect(feed.events.map((e) => e.facetKey)).toEqual([statusKey, countKey]);
+    expect(feed.events.map((e) => e.facetKey)).toEqual([statusKey, headKey]);
+  });
+
+  it('applies one edit of every 0.3.0 user-owned family, and Delta serves each byte for byte', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const [occ, head, tag, coll] = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+    const edits: [string, object][] = [
+      [occFacetKey(occ, 'head'), { head_id: head }],
+      [occFacetKey(occ, 'status'), { status: 'former' }],
+      [occFacetKey(occ, 'collection'), { collection: `former/${coll}` }],
+      [occFacetKey(occ, 'disposal'), { reason: 'traded', counterparty: 'a friend', price: { amount: '0.5', currency: 'USD' } }],
+      [occTagKey(occ, tag), {}],
+      [ufFacetKey(head, 'score'), { score: 9 }],
+      [ufFacetKey(head, 'note'), { note: 'boxed' }],
+      [ufFacetKey(head, 'wishability'), { wishability: 3 }],
+      [ufTagKey(head, tag), {}],
+      [ufKindTagKey(head, 'wished', tag), {}],
+      [collNameKey('former', coll), { name: 'Sold on' }],
+      [tagNameKey(tag), { name: 'Grail' }],
+      [answerKey('mfc', head), { item: 'change', rev: 'imp:7', choice: 'undo' }],
+      [importPrefKey('mfc'), { import_policy: 'ASK' }],
+    ];
+    expect(new Set(edits.map(([key]) => parseUserFacetKey(key)?.family))).toEqual(new Set(USER_FACET_FAMILIES));
+    const events = edits.map(([key, body], i) => upsert(key, mint(caller, i), JSON.stringify({ ...body, ...DISPLAY })));
+    const res = ok(await caller.push({ clientId: randomUUID(), events }));
+    expect(res.results.map((r) => [r.facetKey, r.outcome, r.reason])).toEqual(events.map((e) => [e.facetKey, PushOutcome.APPLIED, '']));
+
+    const feed = await drain(caller);
+    expect(feed.events.map((e) => [e.facetKey, e.version, e.payload])).toEqual(events.map((e) => [e.facetKey, e.version, e.payload]));
+  });
+
+  it('refuses a retired holding/* key with no current, and leaves a stored 0.2.x row inert', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const key = `holding/${randomUUID()}/status`;
+    const old = canonicalVersion({ instant: new Date(Date.now() - 3_600_000), counter: 0, deviceId: caller.deviceId });
+    await db.admin.query(
+      `WITH fed AS (INSERT INTO feed_event (user_id, facet_key, version, op, payload) VALUES ($1, $2, $3, 'upsert', $4) RETURNING seq)
+       INSERT INTO facet_state (user_id, facet_key, version, op, payload, seq) SELECT $1, $2, $3, 'upsert', $4, seq FROM fed`,
+      [caller.userId, key, old, status('owned')],
+    );
+    const res = ok(await caller.push({ clientId: randomUUID(), events: [upsert(key, mint(caller), status('wished')), { ...upsert(key, mint(caller, 1), ''), op: SyncOp.DELETE }] }));
+    for (const r of res.results) {
+      expect([r.outcome, r.reason.split(':')[0], r.current, r.version]).toEqual([PushOutcome.REJECTED, 'facet_key_not_user_owned', undefined, '']);
+    }
+    const stored = await db.admin.query('SELECT version, op, payload FROM facet_state WHERE user_id = $1', [caller.userId]);
+    expect(stored.rows).toEqual([{ version: old, op: 'upsert', payload: status('owned') }]);
+    expect(await feedCount(caller.userId)).toBe(1);
   });
 
   it.each([
-    ['a bare instant on a user-owned key', 'version_malformed', (c: SyncCaller) => upsert(userFacetKey(randomUUID(), 'score'), parseVersion(mint(c))!.instant, '{}')],
-    ['the reserved server device', 'device_mismatch', () => upsert(userFacetKey(randomUUID(), 'score'), canonicalVersion({ instant: new Date(Date.now() - 1000), counter: 0, deviceId: SERVER_DEVICE_ID }), JSON.stringify({ score: 7, ...DISPLAY }))],
-    ['a DELETE carrying a payload', 'payload_invalid', (c: SyncCaller) => ({ ...upsert(userFacetKey(randomUUID(), 'score'), mint(c), '{}'), op: SyncOp.DELETE })],
-    ['an UPSERT with no payload', 'payload_invalid', (c: SyncCaller) => upsert(userFacetKey(randomUUID(), 'score'), mint(c), '')],
-    ['an unspecified op', 'payload_invalid', (c: SyncCaller) => ({ ...upsert(userFacetKey(randomUUID(), 'score'), mint(c), '{}'), op: SyncOp.UNSPECIFIED })],
-    ['a payload that is not JSON', 'payload_invalid', (c: SyncCaller) => upsert(userFacetKey(randomUUID(), 'score'), mint(c), '{score: 7')],
-    ['a payload outside its schema', 'payload_invalid', (c: SyncCaller) => upsert(userFacetKey(randomUUID(), 'score'), mint(c), JSON.stringify({ score: 11, ...DISPLAY }))],
-    ['a payload that is not an object', 'payload_invalid', (c: SyncCaller) => upsert(userFacetKey(randomUUID(), 'note'), mint(c), '"just text"')],
+    ['a bare instant on a user-owned key', 'version_malformed', (c: SyncCaller) => upsert(ufFacetKey(randomUUID(), 'score'), parseVersion(mint(c))!.instant, '{}')],
+    ['the reserved server device', 'device_mismatch', () => upsert(ufFacetKey(randomUUID(), 'score'), canonicalVersion({ instant: new Date(Date.now() - 1000), counter: 0, deviceId: SERVER_DEVICE_ID }), JSON.stringify({ score: 7, ...DISPLAY }))],
+    ['a DELETE carrying a payload', 'payload_invalid', (c: SyncCaller) => ({ ...upsert(ufFacetKey(randomUUID(), 'score'), mint(c), '{}'), op: SyncOp.DELETE })],
+    ['an UPSERT with no payload', 'payload_invalid', (c: SyncCaller) => upsert(ufFacetKey(randomUUID(), 'score'), mint(c), '')],
+    ['an unspecified op', 'payload_invalid', (c: SyncCaller) => ({ ...upsert(ufFacetKey(randomUUID(), 'score'), mint(c), '{}'), op: SyncOp.UNSPECIFIED })],
+    ['a payload that is not JSON', 'payload_invalid', (c: SyncCaller) => upsert(ufFacetKey(randomUUID(), 'score'), mint(c), '{score: 7')],
+    ['a payload outside its schema', 'payload_invalid', (c: SyncCaller) => upsert(ufFacetKey(randomUUID(), 'score'), mint(c), JSON.stringify({ score: 11, ...DISPLAY }))],
+    ['a payload that is not an object', 'payload_invalid', (c: SyncCaller) => upsert(ufFacetKey(randomUUID(), 'note'), mint(c), '"just text"')],
   ])('rejects %s as %s', async (_why, reason, build) => {
     const caller = await SyncCaller.enrol(h);
     const result = ok(await caller.push({ clientId: randomUUID(), events: [build(caller)] })).results[0]!;
@@ -384,7 +448,7 @@ describe('Push', () => {
 
   it('rejects a past-bound version as version_future even where the stored version is higher', async () => {
     const caller = await SyncCaller.enrol(h);
-    const key = userFacetKey(randomUUID(), 'score');
+    const key = ufFacetKey(randomUUID(), 'score');
     const ahead = canonicalVersion({ instant: new Date(Date.now() + 3_600_000), counter: 0, deviceId: caller.deviceId });
     await storeFacet(caller, key, ahead, score(9));
     const past = canonicalVersion({ instant: new Date(Date.now() + MAX_FUTURE_SKEW_MS + 60_000), counter: 0, deviceId: caller.deviceId });
@@ -397,7 +461,7 @@ describe('Push', () => {
   it('runs every REJECTED check in the listed order before STALE routing, on a key whose stored version is higher', async () => {
     const caller = await SyncCaller.enrol(h);
     const other = await SyncCaller.sibling(h, caller);
-    const key = userFacetKey(randomUUID(), 'note');
+    const key = ufFacetKey(randomUUID(), 'note');
     // Above every event below, the past-bound one included, so skipping a check would route it STALE.
     const held = mint(caller, 0, 3_600_000);
     await storeFacet(caller, key, held, note('held'));
@@ -424,8 +488,8 @@ describe('Push', () => {
 
   it('rejects a payload over MAX_PAYLOAD_BYTES and applies the rest of the batch', async () => {
     const caller = await SyncCaller.enrol(h);
-    const big = userFacetKey(randomUUID(), 'note');
-    const fits = userFacetKey(randomUUID(), 'note');
+    const big = ufFacetKey(randomUUID(), 'note');
+    const fits = ufFacetKey(randomUUID(), 'note');
     const padded = (bytes: number) => note('x').padEnd(bytes, ' ');
     const [v1, v2] = mintTogether(caller, 1, 2);
     const res = ok(
@@ -447,14 +511,14 @@ describe('Push', () => {
 
   it('accepts a version inside the future skew and rejects one past it', async () => {
     const caller = await SyncCaller.enrol(h);
-    const key = userFacetKey(randomUUID(), 'score');
+    const key = ufFacetKey(randomUUID(), 'score');
     const at = (ms: number) => canonicalVersion({ instant: new Date(Date.now() + ms), counter: 0, deviceId: caller.deviceId });
     const res = ok(
       await caller.push({
         clientId: randomUUID(),
         events: [
           upsert(key, at(MAX_FUTURE_SKEW_MS - 60_000), JSON.stringify({ score: 8, ...DISPLAY })),
-          upsert(userFacetKey(randomUUID(), 'score'), at(MAX_FUTURE_SKEW_MS + 60_000), JSON.stringify({ score: 8, ...DISPLAY })),
+          upsert(ufFacetKey(randomUUID(), 'score'), at(MAX_FUTURE_SKEW_MS + 60_000), JSON.stringify({ score: 8, ...DISPLAY })),
         ],
       }),
     );
@@ -463,7 +527,7 @@ describe('Push', () => {
 
   it('applies a DELETE as a tombstone and keeps the payload bytes of an UPSERT exactly', async () => {
     const caller = await SyncCaller.enrol(h);
-    const key = userFacetKey(randomUUID(), 'note');
+    const key = ufFacetKey(randomUUID(), 'note');
     const exact = `{ "tz":"Asia/Tokyo",\n  "note" : "\\u7bb1\\u306b\\u50b7 café 🎎", "edited_at":"2026-09-26T08:00:00.1+09:00" }`;
     ok(await caller.push({ clientId: randomUUID(), events: [upsert(key, mint(caller, 1), exact)] }));
     ok(await caller.push({ clientId: randomUUID(), events: [{ facetKey: key, version: mint(caller, 2), op: SyncOp.DELETE, payload: '' }] }));
@@ -477,7 +541,7 @@ describe('Push', () => {
 
   it('applies two events for one key in batch order', async () => {
     const caller = await SyncCaller.enrol(h);
-    const key = userFacetKey(randomUUID(), 'status');
+    const key = occFacetKey(randomUUID(), 'status');
     const [v1, v2, v0] = mintTogether(caller, 1, 2, 0) as [string, string, string];
     const res = ok(
       await caller.push({
@@ -492,7 +556,7 @@ describe('Push', () => {
   it('takes 200 events in one batch and refuses 201 with INVALID_ARGUMENT', async () => {
     const caller = await SyncCaller.enrol(h);
     const events = (n: number) =>
-      Array.from({ length: n }, (_, i) => upsert(userFacetKey(randomUUID(), 'score'), mint(caller, i), JSON.stringify({ score: 1 + (i % 10), ...DISPLAY })));
+      Array.from({ length: n }, (_, i) => upsert(ufFacetKey(randomUUID(), 'score'), mint(caller, i), JSON.stringify({ score: 1 + (i % 10), ...DISPLAY })));
     const full = ok(await caller.push({ clientId: randomUUID(), events: events(200) }));
     expect(full.results.every((r) => r.outcome === PushOutcome.APPLIED)).toBe(true);
 
@@ -510,7 +574,7 @@ describe('Push', () => {
     ['a non-ASCII character', 'caf\u00e9'],
   ])('refuses %s with INVALID_ARGUMENT, never an internal error', async (_why, clientId) => {
     const caller = await SyncCaller.enrol(h);
-    const res = await caller.push({ clientId, events: [upsert(userFacetKey(randomUUID(), 'score'), mint(caller), score(3))] });
+    const res = await caller.push({ clientId, events: [upsert(ufFacetKey(randomUUID(), 'score'), mint(caller), score(3))] });
     expect(res).toMatchObject({ ok: false, status: 400, code: 'invalid_argument' });
     expect(await feedCount(caller.userId)).toBe(0);
   });
@@ -518,7 +582,7 @@ describe('Push', () => {
   it('takes a client_id of 128 printable ASCII characters', async () => {
     const caller = await SyncCaller.enrol(h);
     const clientId = `${'~!'.repeat(63)}Az`;
-    const res = ok(await caller.push({ clientId, events: [upsert(userFacetKey(randomUUID(), 'score'), mint(caller), score(3))] }));
+    const res = ok(await caller.push({ clientId, events: [upsert(ufFacetKey(randomUUID(), 'score'), mint(caller), score(3))] }));
     expect(clientId).toHaveLength(128);
     expect(res.results[0]!.outcome).toBe(PushOutcome.APPLIED);
   });
@@ -527,16 +591,16 @@ describe('Push', () => {
     const a = await SyncCaller.enrol(h);
     const b = await SyncCaller.enrol(h);
     const clientId = randomUUID();
-    ok(await a.push({ clientId, events: [upsert(userFacetKey(randomUUID(), 'score'), mint(a), JSON.stringify({ score: 3, ...DISPLAY }))] }));
-    const res = ok(await b.push({ clientId, events: [upsert(userFacetKey(randomUUID(), 'score'), mint(b), JSON.stringify({ score: 4, ...DISPLAY }))] }));
+    ok(await a.push({ clientId, events: [upsert(ufFacetKey(randomUUID(), 'score'), mint(a), JSON.stringify({ score: 3, ...DISPLAY }))] }));
+    const res = ok(await b.push({ clientId, events: [upsert(ufFacetKey(randomUUID(), 'score'), mint(b), JSON.stringify({ score: 4, ...DISPLAY }))] }));
     expect(res.results[0]!.outcome).toBe(PushOutcome.APPLIED);
   });
 
   it("never shows user B user A's facet through STALE, REJECTED or a replay of A's batch", async () => {
     const a = await SyncCaller.enrol(h);
     const b = await SyncCaller.enrol(h);
-    const k = userFacetKey(randomUUID(), 'note');
-    const k2 = userFacetKey(randomUUID(), 'note');
+    const k = ufFacetKey(randomUUID(), 'note');
+    const k2 = ufFacetKey(randomUUID(), 'note');
     const aBatch = { clientId: randomUUID(), events: [upsert(k, mint(a, 0, -1_000), note('A-SECRET-1')), upsert(k2, mint(a, 1, -1_000), note('A-SECRET-2'))] };
     ok(await a.push(aBatch));
 
@@ -557,8 +621,8 @@ describe('Delta', () => {
   it('(6) never shows user B the facets of user A, whatever cursor B presents', async () => {
     const a = await SyncCaller.enrol(h);
     const b = await SyncCaller.enrol(h);
-    const aKey = userFacetKey(randomUUID(), 'note');
-    const bKey = userFacetKey(randomUUID(), 'note');
+    const aKey = ufFacetKey(randomUUID(), 'note');
+    const bKey = ufFacetKey(randomUUID(), 'note');
     ok(await a.push({ clientId: randomUUID(), events: [upsert(aKey, mint(a), note('a private'))] }));
     ok(await b.push({ clientId: randomUUID(), events: [upsert(bKey, mint(b), note('b'))] }));
     ok(await a.push({ clientId: randomUUID(), events: [upsert(aKey, mint(a, 1), note('a private 2'))] }));
@@ -588,7 +652,7 @@ describe('Delta', () => {
     const caller = await SyncCaller.enrol(h);
     for (let batch = 0; batch < 6; batch += 1) {
       const events = Array.from({ length: 200 }, (_, i) =>
-        upsert(userFacetKey(randomUUID(), 'score'), mint(caller, batch * 200 + i), JSON.stringify({ score: 5, ...DISPLAY })),
+        upsert(ufFacetKey(randomUUID(), 'score'), mint(caller, batch * 200 + i), JSON.stringify({ score: 5, ...DISPLAY })),
       );
       ok(await caller.push({ clientId: randomUUID(), events }));
     }
@@ -615,7 +679,7 @@ describe('Delta', () => {
     const caller = await SyncCaller.enrol(h);
     const sibling = await SyncCaller.sibling(h, caller);
     for (let i = 0; i < 3; i += 1) {
-      ok(await caller.push({ clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(caller, i), JSON.stringify({ score: 2, ...DISPLAY }))] }));
+      ok(await caller.push({ clientId: randomUUID(), events: [upsert(ufFacetKey(randomUUID(), 'score'), mint(caller, i), JSON.stringify({ score: 2, ...DISPLAY }))] }));
     }
     const seqs = await db.admin.query<{ seq: string }>('SELECT seq FROM feed_event WHERE user_id = $1 ORDER BY seq', [caller.userId]);
     const page1 = ok(await caller.delta({ limit: 2 }));
@@ -637,11 +701,11 @@ describe('Status', () => {
   it('reports the head cursor, zero pending review, and the Postgres clock in canonical form', async () => {
     const caller = await SyncCaller.enrol(h);
     const other = await SyncCaller.enrol(h);
-    ok(await other.push({ clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(other), score(1))] }));
+    ok(await other.push({ clientId: randomUUID(), events: [upsert(ufFacetKey(randomUUID(), 'score'), mint(other), score(1))] }));
     const empty = ok(await caller.status());
     expect(empty.cursor).toBe(ok(await caller.delta({})).nextCursor);
 
-    ok(await caller.push({ clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(caller), JSON.stringify({ score: 9, ...DISPLAY }))] }));
+    ok(await caller.push({ clientId: randomUUID(), events: [upsert(ufFacetKey(randomUUID(), 'score'), mint(caller), JSON.stringify({ score: 9, ...DISPLAY }))] }));
     const before = await db.admin.query<{ t: string }>("SELECT to_json(clock_timestamp()) #>> '{}' AS t");
     const res = ok(await caller.status());
     const after = await db.admin.query<{ t: string }>("SELECT to_json(clock_timestamp()) #>> '{}' AS t");
@@ -663,8 +727,8 @@ describe('(2) commit order: a Delta reader never skips a late-committing lower s
     const caller = await SyncCaller.enrol(h);
     const sibling = (await SyncCaller.sibling(h, caller)).via(h2);
     const reader = await SyncCaller.sibling(h, caller);
-    const k1 = userFacetKey(randomUUID(), 'status');
-    const k2 = userFacetKey(randomUUID(), 'status');
+    const k1 = occFacetKey(randomUUID(), 'status');
+    const k2 = occFacetKey(randomUUID(), 'status');
     const firstId = randomUUID();
 
     // Park the first Push after it has taken its seq: its receipt INSERT waits on this row.
@@ -701,8 +765,8 @@ describe('(2) commit order: a Delta reader never skips a late-committing lower s
     const caller = await SyncCaller.enrol(h);
     const sibling = (await SyncCaller.sibling(h, caller)).via(h2);
     const reader = await SyncCaller.sibling(h, caller);
-    const k1 = userFacetKey(randomUUID(), 'score');
-    const k2 = userFacetKey(randomUUID(), 'score');
+    const k1 = ufFacetKey(randomUUID(), 'score');
+    const k2 = ufFacetKey(randomUUID(), 'score');
 
     // An uncommitted facet_state row for k1 parks the first Push at its upsert, after nextval.
     const blocker = await db.admin.connect();
@@ -743,7 +807,7 @@ describe('a user whose Pushes queue behind its lock', () => {
     const b = await SyncCaller.enrol(h);
     const scored = (caller: SyncCaller, i: number) => ({
       clientId: randomUUID(),
-      events: [upsert(userFacetKey(randomUUID(), 'score'), mint(caller, i), score(2))],
+      events: [upsert(ufFacetKey(randomUUID(), 'score'), mint(caller, i), score(2))],
     });
     // Another replica holds A's lock; the test pool has 12 connections.
     const holder = await db.admin.connect();
@@ -782,7 +846,7 @@ describe('a user whose Pushes queue behind its lock', () => {
   it('reads a replay\'s current under the user lock: queued behind a sibling write, it answers with that write', async () => {
     const a = await SyncCaller.enrol(h);
     const b = (await SyncCaller.sibling(h, a)).via(h2);
-    const key = userFacetKey(randomUUID(), 'score');
+    const key = ufFacetKey(randomUUID(), 'score');
     const batch = { clientId: randomUUID(), events: [upsert(key, mint(a, 0, -300_000), score(1))] };
     expect(ok(await a.push(batch)).results[0]!.outcome).toBe(PushOutcome.APPLIED);
 
@@ -820,7 +884,7 @@ describe('a user whose Pushes queue behind its lock', () => {
     const h1 = await startSyncApp(one, h.issuer);
     try {
       const a = (await SyncCaller.enrol(h)).via(h1);
-      ok(await a.push({ clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(a), score(2))] }));
+      ok(await a.push({ clientId: randomUUID(), events: [upsert(ufFacetKey(randomUUID(), 'score'), mint(a), score(2))] }));
       const { rows } = await one.query<{ lock_timeout: string }>('SHOW lock_timeout');
       expect(rows[0]!.lock_timeout).toBe('0');
     } finally {
@@ -838,7 +902,7 @@ describe('a user whose Pushes queue behind its lock', () => {
     let elapsed = -1;
     try {
       const started = performance.now();
-      answer = await within(a.push({ clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(a), score(4))] }), 9_000);
+      answer = await within(a.push({ clientId: randomUUID(), events: [upsert(ufFacetKey(randomUUID(), 'score'), mint(a), score(4))] }), 9_000);
       elapsed = performance.now() - started;
     } finally {
       await holder.query('ROLLBACK');
@@ -848,7 +912,7 @@ describe('a user whose Pushes queue behind its lock', () => {
     expect(elapsed).toBeGreaterThanOrEqual(4_950);
     expect(elapsed).toBeLessThan(8_000);
     expect(await feedCount(a.userId)).toBe(0);
-    expect(ok(await a.push({ clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(a, 1), score(5))] })).results[0]!.outcome).toBe(
+    expect(ok(await a.push({ clientId: randomUUID(), events: [upsert(ufFacetKey(randomUUID(), 'score'), mint(a, 1), score(5))] })).results[0]!.outcome).toBe(
       PushOutcome.APPLIED,
     );
   }, 30_000);
@@ -861,8 +925,8 @@ describe('a user whose Pushes queue behind its lock', () => {
       const baseUrl = await h3.app.listen({ port: 0, host: '127.0.0.1' });
       const a = (await SyncCaller.enrol(h)).via(h3);
       ok(await a.status());
-      const kept = userFacetKey(randomUUID(), 'score');
-      const dropped = userFacetKey(randomUUID(), 'score');
+      const kept = ufFacetKey(randomUUID(), 'score');
+      const dropped = ufFacetKey(randomUUID(), 'score');
 
       const holder = await db.admin.connect();
       await holder.query('BEGIN');
@@ -915,7 +979,7 @@ describe('the Connect read cap', () => {
     const payload = JSON.stringify({ note: '\u0001'.repeat(10_000), edited_at: '2026-09-26T09:15:00.123456789+18:00', tz: 'A'.repeat(64) });
     const at = new Date(Date.now() - 60_000);
     const events = Array.from({ length: 200 }, (_, i) =>
-      upsert(userFacetKey(randomUUID(), 'note'), canonicalVersion({ instant: at, counter: 9_999_999_999 - i, deviceId: caller.deviceId }), payload),
+      upsert(ufFacetKey(randomUUID(), 'note'), canonicalVersion({ instant: at, counter: 9_999_999_999 - i, deviceId: caller.deviceId }), payload),
     );
     const request = { clientId: '~'.repeat(128), events };
     const bytes = Buffer.byteLength(toJsonString(PushRequestSchema, create(PushRequestSchema, request)));
@@ -933,7 +997,7 @@ describe('the Connect read cap', () => {
     const caller = await SyncCaller.enrol(h);
     const body = toJsonString(
       PushRequestSchema,
-      create(PushRequestSchema, { clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(caller), score(3))] }),
+      create(PushRequestSchema, { clientId: randomUUID(), events: [upsert(ufFacetKey(randomUUID(), 'score'), mint(caller), score(3))] }),
     );
     const res = await caller.send('Push', body.padEnd(size, ' '));
     expect(res.statusCode).toBe(statusCode);
@@ -965,7 +1029,7 @@ describe('through a real Connect client over a socket', () => {
     const now = await client.status(create(StatusRequestSchema), { headers: await headers('Status'), onHeader });
     expect(isCanonicalVersion(now.serverNowIso)).toBe(true);
     const pushed = await client.push(
-      create(PushRequestSchema, { clientId: randomUUID(), events: [upsert(userFacetKey(randomUUID(), 'score'), mint(caller), JSON.stringify({ score: 6, ...DISPLAY }))] }),
+      create(PushRequestSchema, { clientId: randomUUID(), events: [upsert(ufFacetKey(randomUUID(), 'score'), mint(caller), JSON.stringify({ score: 6, ...DISPLAY }))] }),
       { headers: await headers('Push'), onHeader },
     );
     expect(pushed.results[0]!.outcome).toBe(PushOutcome.APPLIED);
