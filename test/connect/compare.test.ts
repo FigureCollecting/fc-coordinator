@@ -11,8 +11,8 @@
  * NOTHING IS STUBBED BETWEEN THE TWO ENDS. A real Connect client speaks to a
  * real Fastify server running the real plugin; the handler runs the real ported
  * entitlement module, which asks a real OpenFGA-shaped HTTP endpoint and signs
- * with a real Ed25519 key; the outbound hop is the real Connect client over
- * real HTTP/1.1. The only fakes are the two REMOTE SERVICES, and both behave
+ * with a real Ed25519 key; the outbound hop is the real gRPC client over real
+ * h2c (R4d). The only fakes are the two REMOTE SERVICES, and both behave
  * the way their contracts say.
  *
  * NO PRODUCTION ANYTHING. Every server binds 127.0.0.1 on an ephemeral port and

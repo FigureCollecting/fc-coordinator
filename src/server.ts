@@ -20,7 +20,9 @@
 //      Host (entitlements/idpEndpoint.ts). OIDC_ISSUER does NOT change with it,
 //      COORDINATOR_ROUTE_PREFIX (default /api — everything except /healthz is
 //      served under it, and the edge must NOT rewrite it away),
-//      SPINE_READ_URL (+ SPINE_READ_TIMEOUT_MS) for the mesh hop, OPENFGA_* for
+//      SPINE_READ_URL (+ SPINE_READ_TIMEOUT_MS) for the mesh hop — gRPC over
+//      h2c to ingest-server's READ_H2C_PORT (:50062), never the HTTP/1.1
+//      :50052 — MEDIA_PUBLIC_BASE_URL (unset = no images), OPENFGA_* for
 //      the entitlement Check and ENTITLEMENT_SIGNING_* for the mint — each of
 //      which, left unset, degrades to a redacted read rather than an outage.
 //

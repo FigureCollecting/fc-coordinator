@@ -81,6 +81,8 @@ interface HarnessOptions extends Omit<FakeSpineReadOptions, 'keys'> {
   mediaBaseUrl?: string | null;
   /** Point the coordinator at no spine at all. */
   noSpine?: boolean;
+  /** Identity the resolver hands the handler; `null` = no authenticated caller. */
+  subject?: string | null;
 }
 
 let harness: Harness | null = null;
@@ -105,7 +107,7 @@ async function start(options: HarnessOptions = {}): Promise<Harness> {
   process.env['OPENFGA_STORE_ID'] = '01KXA5NRJYR0GYKX4NWQ2ANDZS';
   process.env['OPENFGA_API_TOKEN'] = 'test-preshared-key-never-logged';
 
-  const { allow: _allow, mediaBaseUrl, noSpine, ...spineOptions } = options;
+  const { allow: _allow, mediaBaseUrl, noSpine, subject, ...spineOptions } = options;
   const spine = await startFakeSpineRead({ keys: kp.keys, ...spineOptions });
   const spineRead = noSpine === true ? null : new SpineReadClient(spine.baseUrl);
 
@@ -114,7 +116,7 @@ async function start(options: HarnessOptions = {}): Promise<Harness> {
     logLevel: 'silent',
     compare: {
       spineRead,
-      resolveIdentity: () => ({ sub: SUB }),
+      resolveIdentity: () => (subject === null ? null : { sub: subject ?? SUB }),
       catalog: { spineRead, mediaBaseUrl: mediaBaseUrl ?? null, now: () => NOW },
     },
   });
@@ -141,6 +143,13 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  // CLIENT BEFORE SERVER: drop the OpenFGA connection before its fake goes
+  // away. Closed the other way round, the fake's GOAWAY can be mid-flight when
+  // the reset aborts the session, and connect-node then emits the session's
+  // deferred error with no listener left (an uncaught "received GOAWAY without
+  // any open streams"). Which order wins was timing luck until the spine hop
+  // moved to h2c and shifted it.
+  resetEntitlementGrantsForTest();
   if (harness) {
     await harness.app.close();
     await harness.spine.close();
@@ -350,6 +359,18 @@ describe('(d) the assertion is minted for every GetProducts call', () => {
     expect(card.gtin14s).toEqual([GTIN]);
     // Inventory magnitude is entitlement-gated and is NOT card data (catalog.proto).
     expect(JSON.stringify(toJsonString(ProductCardSchema, card))).not.toContain('stockOnHand');
+  });
+
+  it('NO CALLER: nothing is minted and OpenFGA is never asked — a redacted read, not a rejection', async () => {
+    // Rejecting is the edge's job, upstream of here. This layer has no opinion
+    // about a caller it was not told about, so it spends no Check on one.
+    harness = await start({ subject: null });
+
+    const res = await harness.catalog.getProducts({ refs: [gtinRef()] });
+
+    expect(res.products[0]?.title?.value).toBe('Hatsune Miku Symphony 2025 Ver.');
+    expect(harness.fga.calls).toHaveLength(0);
+    expect(harness.spine.productCalls[0]?.entitlementOutcome).toBe('absent');
   });
 
   it('UNENTITLED: nothing is minted, the refusing spine says no, and the client sees UNAVAILABLE', async () => {

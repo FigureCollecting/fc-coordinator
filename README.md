@@ -47,8 +47,9 @@ npm start        # node dist/server.js
 | `PGSSLMODE` | unset | `disable` \| `require` \| `verify-full`; production uses `verify-full` |
 | `PGSSLROOTCERT` | unset | path to the CA PEM for `verify-full` (contents are read, not the path) |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | collector endpoint; falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` |
-| `SPINE_READ_URL` | unset | ingest-server Connect base URL; **unset means Compare answers `UNAVAILABLE`** and no transport is built |
+| `SPINE_READ_URL` | unset | ingest-server's **gRPC h2c** read listener, `READ_H2C_PORT` (e.g. `http://ingest-server.<ns>.svc.cluster.local:50062`); **unset means Compare and GetProducts answer `UNAVAILABLE`** and no transport is built. The HTTP/1.1 port `:50052` no longer works with this client |
 | `SPINE_READ_TIMEOUT_MS` | `10000` | per-call deadline on the mesh hop |
+| `MEDIA_PUBLIC_BASE_URL` | unset | public base of the derivative image path. **Unset means `GetProductImages` returns nothing** and asks no one; set, it must be `https` with no credentials, query or fragment, or the process refuses to start |
 | `OPENFGA_GRPC_URL` `OPENFGA_STORE_ID` | unset | the entitlement Check, which is **gRPC over h2c on port 8081** (e.g. `http://openfga-mc-fc-ha.authz.svc.cluster.local:8081`); **unset means every Check denies** |
 | `OPENFGA_API_URL` | must be unset | the retired HTTP endpoint. **Setting it stops the process at boot**, naming the rename — there is no HTTP path left, so a manifest that still carries it would otherwise redact every read while looking configured |
 | `OPENFGA_MODEL_ID` `OPENFGA_APP_OBJECT` `OPENFGA_TIMEOUT_MS` | unset / `app:figurecollecting` / `2000` | optional Check settings. `OPENFGA_TIMEOUT_MS` becomes the gRPC call deadline. A `0` is refused and falls back: a deadline of zero has already expired when the call starts and would deny every read instantly |
@@ -117,6 +118,31 @@ people learn to ignore; the hash is what makes the offline copy evidence.
 That test is not theoretical — the proof-of-concept this work was built on
 numbered `authorization_model_id` 5, which upstream gives to `bool trace`, and it
 passed because both ends of it used the same wrong slice.
+
+### The spine wire, and CatalogService
+
+`SpineRead` (Compare, GetProducts, GetProductImages) is **gRPC over cleartext
+h2c** to ingest-server's `READ_H2C_PORT` (:50062), with mesh mTLS added by the
+Linkerd proxy (R4d; the shape R4a proved on prod). The client
+(`src/spine/spineReadClient.ts`) uses `createGrpcTransport`, which has no
+HTTP/1.1 mode, so moving to it is a flag day for this port: the
+`SPINE_READ_URL` change to :50062 ships in the same deploy as this image.
+`test/helpers/fakeSpineRead.ts` serves gRPC over h2c and nothing else, and
+records the content type and HTTP version of every stream.
+
+`coordinator.v1.CatalogService` (`src/connect/catalog.ts`):
+
+- **GetProducts** rejects an empty batch, more than 200 refs, or a blank ref
+  with `INVALID_ARGUMENT` before any spine call, mints the entitlement assertion
+  as Compare does, and maps each spine record onto a `ProductCard` through
+  `CARD_TEXT_ALLOWLIST`. Image URLs, originals and unknown keys cannot reach a
+  card because nothing outside that table is read. Each field carries its
+  claim's `as_of` as a canonical UTC instant, or an empty `as_of` when the value
+  came from a materialized column. Pages pass through one to one.
+- **GetProductImages** returns nothing while `MEDIA_PUBLIC_BASE_URL` is unset.
+  When it is set, a row is kept only when its URL is exactly
+  `<base>/<derivative sha-256>`.
+- **SearchProducts** answers `UNIMPLEMENTED` until WK-17.
 
 ### OpenFGA's own status numbers
 
