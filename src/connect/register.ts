@@ -5,7 +5,7 @@
 // Connect protocol over ordinary HTTP, so fc-mobile needs no gRPC-Web proxy and
 // the coordinator needs no second listener — the same Fastify instance that
 // serves /healthz serves coordinator.v1. The MESH hop is the other half and
-// lives in src/spine/spineReadClient.ts, pinned to HTTP/1.1.
+// lives in src/spine/spineReadClient.ts: gRPC over h2c, mTLS from Linkerd.
 //
 // ONE FILE SO app.ts STAYS SMALL. Everything the Connect surface needs —
 // the plugin, the routes, the server-side traceparent interceptor and the
@@ -23,6 +23,7 @@ import {
 import { createSpineReadClientFromEnv } from '../spine/spineReadClient.js';
 import { createSyncRoutes, MAX_REQUEST_BYTES, type SyncRoutesDeps } from '../sync/service.js';
 import type { SyncPool } from '../sync/store.js';
+import { createCatalogRoutes, resolveMediaBaseUrl, type CatalogRoutesDeps } from './catalog.js';
 import { createCompareRoutes, type CompareRoutesDeps } from './compare.js';
 import {
   decoratorDeviceResolver,
@@ -44,6 +45,8 @@ export interface ConnectOptions extends CompareRoutesDeps {
   resolveDevice?: DeviceResolver;
   /** Serve coordinator.v1 SyncService beside Compare, on the same guard and interceptors. */
   sync?: SyncRoutesDeps;
+  /** Serve coordinator.v1 CatalogService beside Compare, on the same guard and interceptors. */
+  catalog?: CatalogRoutesDeps;
   /**
    * Load the entitlement signing key at registration and log whether minting is
    * on, and name which OpenFGA credential path is configured. Default true: a
@@ -77,11 +80,18 @@ export interface ConnectOptions extends CompareRoutesDeps {
 }
 
 /**
- * The surface the process serves: Compare on the env's spine (null = degraded), Sync on the pool.
- * Here rather than in server.ts, which is outside coverage, so dropping a service fails a test.
+ * The surface the process serves: Compare and Catalog on the env's spine (null = degraded),
+ * Sync on the pool. ONE spine client for both, so both ride one HTTP/2 connection through
+ * the mesh. Here rather than in server.ts, which is outside coverage, so dropping a service
+ * fails a test.
  */
 export function productionConnectOptions(pool: SyncPool, env: NodeJS.ProcessEnv = process.env): ConnectOptions {
-  return { spineRead: createSpineReadClientFromEnv(env), sync: { db: pool } };
+  const spineRead = createSpineReadClientFromEnv(env);
+  return {
+    spineRead,
+    sync: { db: pool },
+    catalog: { spineRead, mediaBaseUrl: resolveMediaBaseUrl(env) },
+  };
 }
 
 export function registerConnect(app: FastifyInstance, options: ConnectOptions): void {
@@ -114,6 +124,7 @@ export function registerConnect(app: FastifyInstance, options: ConnectOptions): 
   const resolveDevice = options.resolveDevice ?? decoratorDeviceResolver();
   const compareRoutes = createCompareRoutes(options);
   const syncRoutes = options.sync === undefined ? undefined : createSyncRoutes(options.sync);
+  const catalogRoutes = options.catalog === undefined ? undefined : createCatalogRoutes(options.catalog);
 
   void app.register(fastifyConnectPlugin, {
     // `prefix` is read by Fastify's register, not by the plugin, which ignores
@@ -122,6 +133,7 @@ export function registerConnect(app: FastifyInstance, options: ConnectOptions): 
     routes: (router) => {
       compareRoutes(router);
       syncRoutes?.(router);
+      catalogRoutes?.(router);
     },
     // §A.5 rule 3, inbound half: continue the caller's trace and be a span in
     // it, so every log line the handler writes carries the trace tag and the
