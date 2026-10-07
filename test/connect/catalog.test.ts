@@ -271,6 +271,27 @@ describe('(b) GetProducts maps through the display-key allowlist', () => {
     expect(card.title?.value).toBe('Curated English Title');
     expect(card.title?.asOf).toBe('');
   });
+
+  it('gives an R18 statue with no level claim the content level unknown, not none', async () => {
+    // gkloot and solaris record adult content as attr_key r18, never contentLevel.
+    const record = cannedProductRecord([{ gtin14: GTIN }], true);
+    const attrs = record['attrs'] as Record<string, unknown>;
+    delete attrs['contentLevel'];
+    attrs['r18'] = { kind: 'text', value: 'true', site: 'gkloot', asOf: '2026-09-02 11:00:00+00' };
+    harness = await start({
+      respondProducts: () =>
+        create(WireProductsResponseSchema, {
+          productsJson: productsJson({ products: [record], unresolved: [], coverage: {} }),
+        }),
+    });
+
+    const card = (await harness.catalog.getProducts({ refs: [gtinRef()] })).products[0]!;
+    expect(card.title?.value).toBe('Hatsune Miku Symphony 2025 Ver.');
+    expect(card.contentLevel).toMatchObject({ value: 'unknown', asOf: '2026-09-02T11:00:00.000000Z' });
+    expect(harness.spine.wire).toHaveLength(1);
+    expect(harness.spine.wire[0]?.contentType).toMatch(GRPC_CONTENT_TYPE);
+    expect(harness.spine.wire[0]?.httpVersion).toBe('2.0');
+  });
 });
 
 // ===========================================================================

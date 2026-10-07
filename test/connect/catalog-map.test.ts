@@ -113,6 +113,29 @@ describe('toProductCard — values', () => {
     expect(card?.scale).toMatchObject({ value: uuid, asOf: '2026-09-01T10:00:00.000000Z' });
   });
 
+  // Each display-backed field is guarded on its own: origin_series and scale
+  // are term axes too, and the projection falls back to the uuid for both.
+  it.each([
+    ['series', 'origin_series', 'originSeries'],
+    ['scale', 'scale', 'scale'],
+  ] as const)('drops %s when it is the bare uuid of a label-less term', (field, claim, shown) => {
+    const uuid = '0d6f6e1a-1111-4222-8333-444455556666';
+    const card = toProductCard(record({ [claim]: facet({ kind: 'term', value: uuid }) }, { [shown]: uuid }));
+    expect(card?.[field]).toBeUndefined();
+  });
+
+  // Only a TERM falls back to its uuid. A number or a date that the display
+  // shows verbatim is the value itself, and is kept and dated by its claim.
+  it.each([
+    ['a number', facet({ kind: 'num', value: '7' }), '7'],
+    ['a date', facet({ kind: 'date', value: '2026-03-01' }), '2026-03-01'],
+  ])('keeps a display value supplied verbatim by %s claim', (_label, f, shown) => {
+    expect(toProductCard(record({ scale: f }, { scale: shown }))?.scale).toMatchObject({
+      value: shown,
+      asOf: '2026-09-01T10:00:00.000000Z',
+    });
+  });
+
   it('keeps a display value that differs from a label-less term (a materialized column)', () => {
     const card = toProductCard(
       record(
@@ -129,7 +152,7 @@ describe('toProductCard — values', () => {
     expect(card?.manufacturer).toBeUndefined();
   });
 
-  it('treats a missing display or attrs object as empty rather than failing the card', () => {
+  it('reads a missing display or attrs object as no display fields rather than failing the card', () => {
     const card = toProductCard({ productId: CANNED_HEAD_ID, display: 'x', attrs: null });
     expect(card?.headId).toBe(CANNED_HEAD_ID);
     expect(card?.title).toBeUndefined();
@@ -172,7 +195,7 @@ describe('toProductCard — content_level', () => {
     expect(toProductCard(record({ contentLevel: facet({ value: level }) }))?.contentLevel?.value).toBe(level);
   });
 
-  it.each([['R18'], ['General'], ['sfw']])(
+  it.each([['R18'], ['General'], ['sfw'], [' general'], ['general '], ['nsfw\n']])(
     'reads an unrecognised level %s as unknown, the most restrictive, keeping its time',
     (level) => {
       const card = toProductCard(record({ contentLevel: facet({ value: level }) }));
@@ -205,6 +228,89 @@ describe('toProductCard — content_level', () => {
     ['null', null],
   ])('reads a level claim that is %s as unknown, with no time to give', (_label, f) => {
     expect(toProductCard(record({ contentLevel: f }))?.contentLevel).toMatchObject({ value: 'unknown', asOf: '' });
+  });
+
+  // When the claims cannot be read at all, nothing says the record has no
+  // level claim, so absent (the permissive reading) is not available.
+  it.each([
+    ['missing', undefined],
+    ['null', null],
+    ['a list', [{ key: 'contentLevel', kind: 'text', value: 'nsfw' }]],
+    ['a string', 'contentLevel=nsfw'],
+  ])('reads the level as unknown when attrs is %s', (_label, attrs) => {
+    const raw = { productId: CANNED_HEAD_ID, display: { name: 'X' }, ...(attrs === undefined ? {} : { attrs }) };
+    const card = toProductCard(raw);
+    expect(card?.title?.value).toBe('X');
+    expect(card?.contentLevel).toMatchObject({ value: 'unknown', asOf: '' });
+  });
+});
+
+// gkloot and solaris record their adult flag as attr_key `r18` (the lifter
+// turns the boolean into the text 'true' or 'false'), never as contentLevel.
+describe('toProductCard — content_level from the r18 adult flag', () => {
+  const R18_AS_OF = '2026-09-02 11:00:00+00';
+  const R18_AS_OF_UTC = '2026-09-02T11:00:00.000000Z';
+  const r18 = (over: Record<string, unknown> = {}): Record<string, unknown> =>
+    facet({ value: 'true', asOf: R18_AS_OF, ...over });
+
+  it('reads an R18 product with no level claim as unknown, dated by the r18 claim', () => {
+    expect(toProductCard(record({ r18: r18() }))?.contentLevel).toMatchObject({
+      value: 'unknown',
+      asOf: R18_AS_OF_UTC,
+    });
+  });
+
+  it('leaves the level absent when the r18 claim reads false and there is no level claim', () => {
+    // r18=false -> absent is the pre-existing reading, held until Ross rules
+    // whether it should mean general.
+    expect(toProductCard(record({ r18: r18({ value: 'false' }) }))?.contentLevel).toBeUndefined();
+  });
+
+  // FAIL CLOSED on the flag too: only a literal 'false' clears it.
+  it.each([
+    ['upper case', r18({ value: 'TRUE' })],
+    ['padded false', r18({ value: ' false' })],
+    ['capitalised false', r18({ value: 'False' })],
+    ['a number', r18({ kind: 'num', value: '0' })],
+    ['an empty value', r18({ value: '' })],
+    ['a json value', r18({ kind: 'json', value: null, json: false })],
+    ['a term with no label', r18({ kind: 'term', value: '0d6f6e1a-1111-4222-8333-444455556666' })],
+    ['a kind nobody has defined', r18({ kind: 'blob', value: 'false' })],
+  ])('reads an r18 claim it cannot read as false (%s) as unknown', (_label, f) => {
+    expect(toProductCard(record({ r18: f }))?.contentLevel).toMatchObject({ value: 'unknown', asOf: R18_AS_OF_UTC });
+  });
+
+  it.each([
+    ['not an object', 'true'],
+    ['null', null],
+  ])('reads an r18 claim that is %s as unknown, with no time to give', (_label, f) => {
+    expect(toProductCard(record({ r18: f }))?.contentLevel).toMatchObject({ value: 'unknown', asOf: '' });
+  });
+
+  // A level that says less than adult, contradicted by an adult flag: the
+  // stricter statement wins, as the contract's most restrictive value.
+  it.each([['general'], ['intermediate']])('overrides a %s level claim with unknown when r18 is true', (level) => {
+    expect(toProductCard(record({ contentLevel: facet({ value: level }), r18: r18() }))?.contentLevel).toMatchObject({
+      value: 'unknown',
+      asOf: R18_AS_OF_UTC,
+    });
+  });
+
+  // A level that already says adult (or unknown) agrees with the flag and keeps its own time.
+  it.each([['explicit'], ['controversial'], ['nsfw'], ['nsfw+'], ['unknown']])(
+    'keeps a %s level claim when r18 is true',
+    (level) => {
+      expect(toProductCard(record({ contentLevel: facet({ value: level }), r18: r18() }))?.contentLevel).toMatchObject({
+        value: level,
+        asOf: '2026-09-01T10:00:00.000000Z',
+      });
+    },
+  );
+
+  it('keeps a general level claim when r18 reads false', () => {
+    expect(
+      toProductCard(record({ contentLevel: facet({ value: 'general' }), r18: r18({ value: 'false' }) }))?.contentLevel,
+    ).toMatchObject({ value: 'general', asOf: '2026-09-01T10:00:00.000000Z' });
   });
 });
 
@@ -385,7 +491,39 @@ describe('resolveMediaBaseUrl', () => {
     ['surrounding whitespace', ' https://images.figurecollecting.com/d '],
     ['a trailing newline', 'https://images.figurecollecting.com/d/\n'],
     ['a spelling the parser rewrites (an upper-case host)', 'https://IMAGES.figurecollecting.com/d'],
+    // Canonical by the URL standard, but a CDN that decodes them could resolve
+    // the path somewhere else.
+    ['an encoded slash', 'https://images.figurecollecting.com/d%2F..'],
+    ['an encoded slash in lower case', 'https://images.figurecollecting.com/d%2f'],
+    ['an encoded backslash', 'https://images.figurecollecting.com/d%5C'],
+    ['an encoded backslash in lower case', 'https://images.figurecollecting.com/d%5c'],
   ])('refuses %s at boot, rather than shipping it to every phone', (_label, raw) => {
     expect(() => resolveMediaBaseUrl({ MEDIA_PUBLIC_BASE_URL: raw })).toThrow(/MEDIA_PUBLIC_BASE_URL/);
+  });
+
+  it.each([
+    ['an upper-case host', 'https://IMAGES.figurecollecting.com/d'],
+    ['the default port', 'https://images.figurecollecting.com:443/d'],
+    ['a backslash', 'https://images.figurecollecting.com/d\\x'],
+    ['a dot segment', 'https://images.figurecollecting.com/d/..'],
+  ])('names canonical URL form, not only whitespace and dot segments, when refusing %s', (_label, raw) => {
+    expect(() => resolveMediaBaseUrl({ MEDIA_PUBLIC_BASE_URL: raw })).toThrow(/canonical URL form/);
+  });
+
+  // A boot error lands in the pod log: it must never carry the value it refuses.
+  it.each([
+    ['credentials', 'https://svc:s3cr3t@images.figurecollecting.com/d'],
+    ['an unparseable value', 's3cr3t images.figurecollecting.com/d'],
+    ['a non-canonical value', 'https://images.figurecollecting.com/s3cr3t/../d'],
+    ['an encoded slash', 'https://images.figurecollecting.com/s3cr3t%2Fd'],
+  ])('never echoes the refused value for %s', (_label, raw) => {
+    let message = '';
+    try {
+      resolveMediaBaseUrl({ MEDIA_PUBLIC_BASE_URL: raw });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toMatch(/^MEDIA_PUBLIC_BASE_URL /);
+    expect(message).not.toContain('s3cr3t');
   });
 });
