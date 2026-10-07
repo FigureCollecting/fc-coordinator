@@ -89,6 +89,7 @@ export const CARD_TEXT_ALLOWLIST = {
  * The content-level vocabulary catalog.proto names. Anything else reads as
  * `unknown`, which the contract tells every client to treat as the most
  * restrictive — an unrecognised level must never render as a permissive one.
+ * See contentLevelOf for what counts as "anything else".
  */
 export const CONTENT_LEVELS = [
   'general',
@@ -133,27 +134,41 @@ export interface CatalogRoutesDeps {
 
 /**
  * Read MEDIA_PUBLIC_BASE_URL. Unset or blank -> null (images off, the default).
- * Set, it must be an absolute https URL with no credentials, query or fragment,
- * or the process refuses to start: this string is prefixed onto URLs that every
- * phone caches forever, so a typo is better found at boot than in the field.
+ * Set, it must be an absolute https URL with no credentials, no `?` or `#` (not
+ * even an empty query or fragment), no surrounding whitespace, and already in
+ * the form a URL parser writes it (so no dot segments), or the process refuses
+ * to start: this string is prefixed onto URLs that every phone caches forever,
+ * so a typo is better found at boot than in the field.
  *
- * NORMALISED THE WAY THE SPINE NORMALISES ITS OWN COPY (trailing slashes
- * trimmed, nothing else), so the exact-match filter below compares like with
- * like when both read the same value.
+ * The spine builds each row's URL from ITS copy of the same value by trimming
+ * trailing slashes and nothing else, and this module does exactly the same, so
+ * the exact-match filter below compares like with like. Anything the spine
+ * would NOT normalise the same way (whitespace) or that a phone would resolve
+ * to another path (dot segments) is refused here rather than quietly dropping
+ * every image or fetching from somewhere else.
  */
 export function resolveMediaBaseUrl(env: NodeJS.ProcessEnv = process.env): string | null {
-  const raw = env['MEDIA_PUBLIC_BASE_URL']?.trim() ?? '';
-  if (raw === '') return null;
+  const raw = env['MEDIA_PUBLIC_BASE_URL'] ?? '';
+  if (raw.trim() === '') return null;
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
     throw new Error('MEDIA_PUBLIC_BASE_URL must be an absolute https URL');
   }
-  if (url.protocol !== 'https:' || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '') {
+  if (url.protocol !== 'https:' || url.username !== '' || url.password !== '' || /[?#]/.test(raw)) {
     throw new Error('MEDIA_PUBLIC_BASE_URL must be https, with no credentials, query or fragment');
   }
-  return raw.replace(/\/+$/, '');
+  // One comparison covers whitespace (the parser strips it, the spine does
+  // not), dot segments (the parser resolves them away) and every other
+  // non-canonical spelling: what is compared is then what a phone fetches.
+  const base = raw.replace(/\/+$/, '');
+  if (url.href.replace(/\/+$/, '') !== base) {
+    throw new Error(
+      'MEDIA_PUBLIC_BASE_URL must be written exactly as a URL parser writes it: no surrounding whitespace, no dot segments',
+    );
+  }
+  return base;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,18 +213,49 @@ function claimText(facet: unknown): { value: string; asOf: string } | null {
   return value === null ? null : { value, asOf: canonicalAsOf(f['asOf']) };
 }
 
+/**
+ * True when a display value is the bare uuid of a term the spine could not
+ * label: its projection falls back `label ?? value`, so a label-less term
+ * reaches a display-backed field as its uuid.
+ */
+function isUnlabelledTermId(facet: unknown, shown: string): boolean {
+  const f = asObject(facet);
+  return f !== null && f['kind'] === 'term' && nonEmpty(f['label']) === null && f['value'] === shown;
+}
+
 function cardText(
   display: Json,
   attrs: Json,
   spec: { display: string | null; claim: string | null },
 ): CardText | undefined {
-  const claim = spec.claim === null ? null : claimText(attrs[spec.claim]);
+  const facet = spec.claim === null ? undefined : attrs[spec.claim];
+  const claim = claimText(facet);
   if (spec.display !== null) {
     const shown = nonEmpty(display[spec.display]);
-    if (shown === null) return undefined;
+    if (shown === null || isUnlabelledTermId(facet, shown)) return undefined;
     return create(CardTextSchema, { value: shown, asOf: claim !== null && claim.value === shown ? claim.asOf : '' });
   }
   return claim === null ? undefined : create(CardTextSchema, claim);
+}
+
+/**
+ * The card's content level — FAIL CLOSED. Absent ONLY when the record carries
+ * no level claim at all, which catalog.proto defines as "the source has no
+ * level concept". A level claim that IS there but that this build cannot read
+ * (a label-less term, a json value, an empty or non-string value, a kind it has
+ * never heard of, not an object at all) reads as `unknown`, exactly as a level
+ * outside CONTENT_LEVELS does: absent would render permissively, and this is
+ * the content-safety field. Dated by the claim whenever it carries a time.
+ */
+function contentLevelOf(attrs: Json): CardText | undefined {
+  const facet = attrs[CARD_TEXT_ALLOWLIST.contentLevel.claim];
+  if (facet === undefined) return undefined;
+  const read = claimText(facet);
+  const known = read !== null && (CONTENT_LEVELS as readonly string[]).includes(read.value);
+  return create(CardTextSchema, {
+    value: known ? read.value : 'unknown',
+    asOf: canonicalAsOf(asObject(facet)?.['asOf']),
+  });
 }
 
 /** A read.v1 ref, as the spine echoes it, in coordinator.v1 spelling; null for anything else. */
@@ -245,11 +291,6 @@ export function toProductCard(record: unknown): ProductCard | null {
   const text = (field: keyof typeof CARD_TEXT_ALLOWLIST): CardText | undefined =>
     cardText(display, attrs, CARD_TEXT_ALLOWLIST[field]);
 
-  const contentLevel = text('contentLevel');
-  if (contentLevel !== undefined && !(CONTENT_LEVELS as readonly string[]).includes(contentLevel.value)) {
-    contentLevel.value = 'unknown';
-  }
-
   const gtin14s: string[] = [];
   for (const id of Array.isArray(r['identifiers']) ? r['identifiers'] : []) {
     const gtin = asObject(id)?.['gtin14'];
@@ -266,7 +307,7 @@ export function toProductCard(record: unknown): ProductCard | null {
     scale: text('scale'),
     releaseYm: text('releaseYm'),
     gtin14s,
-    contentLevel,
+    contentLevel: contentLevelOf(attrs),
     // The spine's display record carries no derivative; GetProductImages does.
     derivativeIds: [],
   });

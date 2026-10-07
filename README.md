@@ -49,7 +49,7 @@ npm start        # node dist/server.js
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | collector endpoint; falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` |
 | `SPINE_READ_URL` | unset | ingest-server's **gRPC h2c** read listener, `READ_H2C_PORT` (e.g. `http://ingest-server.<ns>.svc.cluster.local:50062`); **unset means Compare and GetProducts answer `UNAVAILABLE`** and no transport is built. The HTTP/1.1 port `:50052` no longer works with this client |
 | `SPINE_READ_TIMEOUT_MS` | `10000` | per-call deadline on the mesh hop |
-| `MEDIA_PUBLIC_BASE_URL` | unset | public base of the derivative image path. **Unset means `GetProductImages` returns nothing** and asks no one; set, it must be `https` with no credentials, query or fragment, or the process refuses to start |
+| `MEDIA_PUBLIC_BASE_URL` | unset | public base of the derivative image path. **Unset means `GetProductImages` returns nothing** and asks no one; set, it must be `https` with no credentials and no `?` or `#`, written exactly as a URL parser writes it (no surrounding whitespace, no dot segments), or the process refuses to start. Trailing slashes are trimmed, as the spine trims its copy |
 | `OPENFGA_GRPC_URL` `OPENFGA_STORE_ID` | unset | the entitlement Check, which is **gRPC over h2c on port 8081** (e.g. `http://openfga-mc-fc-ha.authz.svc.cluster.local:8081`); **unset means every Check denies** |
 | `OPENFGA_API_URL` | must be unset | the retired HTTP endpoint. **Setting it stops the process at boot**, naming the rename — there is no HTTP path left, so a manifest that still carries it would otherwise redact every read while looking configured |
 | `OPENFGA_MODEL_ID` `OPENFGA_APP_OBJECT` `OPENFGA_TIMEOUT_MS` | unset / `app:figurecollecting` / `2000` | optional Check settings. `OPENFGA_TIMEOUT_MS` becomes the gRPC call deadline. A `0` is refused and falls back: a deadline of zero has already expired when the call starts and would deny every read instantly |
@@ -138,7 +138,11 @@ records the content type and HTTP version of every stream.
   `CARD_TEXT_ALLOWLIST`. Image URLs, originals and unknown keys cannot reach a
   card because nothing outside that table is read. Each field carries its
   claim's `as_of` as a canonical UTC instant, or an empty `as_of` when the value
-  came from a materialized column. Pages pass through one to one.
+  came from a materialized column. A term the spine could not label never
+  shows as its bare uuid. `content_level` fails closed: it is absent only when
+  the record has no level claim; a level claim it cannot read, or a level
+  outside the contract's seven, reads as `unknown`. Pages pass through one to
+  one.
 - **GetProductImages** returns nothing while `MEDIA_PUBLIC_BASE_URL` is unset.
   When it is set, a row is kept only when its URL is exactly
   `<base>/<derivative sha-256>`.

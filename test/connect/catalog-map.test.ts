@@ -98,13 +98,15 @@ describe('toProductCard — values', () => {
       record(
         {
           manufacturer: facet({ kind: 'term', value: uuid }),
+          name: facet({ kind: 'term', value: uuid, label: '' }),
           origin_series: facet({ kind: 'term', value: uuid, label: 'Vocaloid' }),
           scale: facet({ kind: 'text', value: uuid }),
         },
-        { manufacturer: uuid, originSeries: uuid, scale: uuid },
+        { manufacturer: uuid, name: uuid, originSeries: uuid, scale: uuid },
       ),
     );
     expect(card?.manufacturer).toBeUndefined();
+    expect(card?.title).toBeUndefined();
     // Not a bare uuid: the display value names a label that came from elsewhere,
     // or a text claim that simply is that string.
     expect(card?.series).toMatchObject({ value: uuid, asOf: '' });
@@ -368,6 +370,8 @@ describe('resolveMediaBaseUrl', () => {
     ['a query string', 'https://images.figurecollecting.com/d?sig=1'],
     ['a fragment', 'https://images.figurecollecting.com/d#x'],
     ['credentials', 'https://user:pass@images.figurecollecting.com/d'],
+    ['a user name alone', 'https://user@images.figurecollecting.com/d'],
+    ['a password alone', 'https://:pass@images.figurecollecting.com/d'],
     // URL.search and URL.hash are '' for an EMPTY query or fragment.
     ['an empty query', 'https://images.figurecollecting.com/d?'],
     ['an empty fragment', 'https://images.figurecollecting.com/d#'],
@@ -380,6 +384,7 @@ describe('resolveMediaBaseUrl', () => {
     // sides would build different URLs and every image would be dropped.
     ['surrounding whitespace', ' https://images.figurecollecting.com/d '],
     ['a trailing newline', 'https://images.figurecollecting.com/d/\n'],
+    ['a spelling the parser rewrites (an upper-case host)', 'https://IMAGES.figurecollecting.com/d'],
   ])('refuses %s at boot, rather than shipping it to every phone', (_label, raw) => {
     expect(() => resolveMediaBaseUrl({ MEDIA_PUBLIC_BASE_URL: raw })).toThrow(/MEDIA_PUBLIC_BASE_URL/);
   });
