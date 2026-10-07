@@ -425,6 +425,20 @@ describe('B6: a nonce from the previous bucket, same epoch', () => {
     expect(await caseB6(h.ctx, { periodMs: PERIOD_MS })).toMatchObject({ verdict: 'FAIL' });
   });
 
+  it('is inconclusive when this clock is more than a bucket ahead of the nonce', async () => {
+    const h = await harness({ overrides: { noncePeriodSeconds: PERIOD_S } });
+    const ahead: CaseContext = { ...h.ctx, now: () => Date.now() + 2 * PERIOD_MS + 50, sleep: async () => {} };
+    expect(await caseB6(ahead, { periodMs: PERIOD_MS })).toMatchObject({ verdict: 'INCONCLUSIVE', detail: expect.stringMatching(/is not this clock's/) });
+  });
+
+  it("absorbs a client clock a little ahead of the coordinator's: the margin past the boundary", async () => {
+    const h = await harness({ overrides: { noncePeriodSeconds: 1 } });
+    // 100 ms ahead: at the bare boundary the coordinator would still be in the captured bucket.
+    const ahead: CaseContext = { ...h.ctx, now: () => Date.now() + 100 };
+    expect(await caseB6(ahead, { periodMs: 1_000 })).toMatchObject({ verdict: 'PASS' });
+    expect(h.transport.log.filter((e) => e.request.label === 'B6')).toHaveLength(1);
+  });
+
   it('is inconclusive when the server is already two buckets on', async () => {
     const h = await harness({ overrides: { noncePeriodSeconds: PERIOD_S } });
     const slow: CaseContext = { ...h.ctx, sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms + PERIOD_MS)) };
