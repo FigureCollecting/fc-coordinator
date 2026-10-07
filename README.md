@@ -696,9 +696,14 @@ fourteen user-owned families (`occ/*`, `uf/*`, `coll/*/*/name`, `tag/*/name`,
 schema. A server-owned key (`occ/{occ}/origin`, `imp/*`) and a retired 0.2.x
 `holding/*` key are REJECTED `facet_key_not_user_owned`; `holding/*` rows
 already stored stay inert. `scripts/holding-audit.sql` counts them in one
-read-only transaction (`psql -X -A -f scripts/holding-audit.sql`). Not served
-yet: `SyncEvent.basis` (and `basis_missing`), `commit_cursor` on Delta and the
-HELD outcome, which belong to the server-decided import.
+read-only transaction (`psql -X -A -f scripts/holding-audit.sql`).
+
+This is not yet a conformant 0.3.0 server. Delta does not set `commit_cursor`
+(sync.proto rule 7) on any event, a plain Push included, and a 0.3.0 client
+applies a server transaction only once it holds the event carrying it, so a
+0.3.0 client can apply nothing from this coordinator: do not serve one until
+rule 7 lands. Also outstanding: a pushed event with no `SyncEvent.basis` is
+APPLIED rather than REJECTED `basis_missing`, and there is no HELD outcome.
 
 ## Phase-2 client (`scripts/phase2-client`)
 

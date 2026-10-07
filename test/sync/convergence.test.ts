@@ -3,7 +3,7 @@
 // concurrently. Each device follows the contract's client rules, so the property is: both end on
 // the same facet map, equal to a replay from an empty cursor and to the server's facet_state.
 // The edits span every 0.3.0 user-owned family (sync.proto rule 6), plus keys a client must never
-// push (a retired holding/* key, a copy's server-owned origin), which are always REJECTED.
+// push (a retired holding/* key, every server-owned family), which are always REJECTED.
 import { randomUUID } from 'node:crypto';
 import fc from 'fast-check';
 import {
@@ -19,6 +19,8 @@ import {
   collNameKey,
   collectionRef,
   compareVersion,
+  importItemKey,
+  importMarkerKey,
   importPrefKey,
   occFacetKey,
   occOriginKey,
@@ -153,8 +155,8 @@ const OCCS = [randomUUID(), randomUUID(), randomUUID()];
 const HEADS = [randomUUID(), randomUUID(), randomUUID()];
 const TAGS = [randomUUID(), randomUUID()];
 const COLLS = [randomUUID(), randomUUID()];
-/** Keys a client never pushes: the retired 0.2.x grain and a copy's server-owned origin. */
-const FOREIGN = ['holding/status', 'occ/origin'] as const;
+/** Keys a client never pushes: the retired 0.2.x grain and every server-owned family. */
+const FOREIGN = [...RETIRED, ...SERVER_FACET_FAMILIES] as const;
 const FAMILIES = [...USER_FACET_FAMILIES, ...FOREIGN];
 type Family = (typeof FAMILIES)[number];
 
@@ -188,9 +190,17 @@ function keyFor(family: Family, i: number): string {
     case 'pref/import':
       return importPrefKey('mfc');
     case 'holding/status':
-      return `holding/${pick(HEADS, i)}/status`;
+    case 'holding/count':
+      return `holding/${pick(HEADS, i)}/${family.slice(8)}`;
     case 'occ/origin':
       return occOriginKey(pick(OCCS, i));
+    case 'imp/figure':
+    case 'imp/held':
+    case 'imp/change':
+    case 'imp/align':
+      return importItemKey('mfc', family.slice(4) as 'figure', pick(HEADS, i));
+    case 'imp/import':
+      return importMarkerKey('mfc');
   }
 }
 
@@ -226,12 +236,21 @@ function payloadFor(family: Family, n: number): string {
         return { import_policy: pick(['ASK', 'FAVOR_APP', 'FAVOR_MFC'], n) };
       case 'holding/status':
         return { status: 'owned' };
+      case 'holding/count':
+        return { count: 1 + (n % 3) };
       case 'occ/origin':
         return { site: 'mfc', native_id: String(n + 1), ordinal: 1 };
+      case 'imp/figure':
+      case 'imp/held':
+      case 'imp/change':
+      case 'imp/align':
+      case 'imp/import':
+        // Refused on the key before any payload is read, so a bare rev stands in for each schema.
+        return { rev: `r${n}` };
     }
   })();
-  // occ/origin is server-owned and carries no display time; every client-written payload does.
-  return JSON.stringify(family === 'occ/origin' ? body : { ...body, ...DISPLAY });
+  // A server-owned payload carries no display time; every client-written payload does.
+  return JSON.stringify((SERVER_FACET_FAMILIES as readonly string[]).includes(family) ? body : { ...body, ...DISPLAY });
 }
 
 const device = fc.constantFrom(0 as const, 1 as const);
