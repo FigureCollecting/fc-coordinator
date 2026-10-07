@@ -184,10 +184,12 @@ describe('(a) a 0.3.0 client', () => {
     expect([b.local.size, b.staged.length]).toEqual([3, 0]);
     expect(b.basis).not.toBe('');
 
-    // Nothing is fetched or applied again: the commit_cursor is where the client stands.
+    // Nothing is fetched or applied again: the commit_cursor is where the client stands, and it is
+    // the head Status reports, so a caught-up client is not shown as behind.
     await b.pullAll(1);
     expect(b.processed).toEqual(events.map((e) => `${e.facetKey}@${e.version}`));
     expect(b.commits).toHaveLength(1);
+    expect(ok(await b.caller.status()).cursor).toBe(b.basis);
   });
 
   it('after a restart mid-transaction fetches the staged events again and still applies each once', async () => {
@@ -378,6 +380,9 @@ describe('(d) HELD', () => {
     expect(res.results[1]!.current).toBeUndefined();
     expect(shown).toEqual([[expect.objectContaining({ index: 1 })]]);
     expect(await feedCount(a.userId)).toBe(0);
+    // Kept under its place in the Push.
+    const kept = await db.admin.query('SELECT ordinal, basis_seq FROM held_edit WHERE user_id = $1', [a.userId]);
+    expect(kept.rows).toEqual([{ ordinal: 1, basis_seq: '0' }]);
     frame = undefined;
   });
 
