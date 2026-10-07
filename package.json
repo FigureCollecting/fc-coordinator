@@ -17,7 +17,8 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "migrate": "sh scripts/migrate.sh",
-    "proto:generate": "buf generate"
+    "proto:generate": "buf generate",
+    "phase2": "tsx scripts/phase2-client/cli.ts"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.15.0",
