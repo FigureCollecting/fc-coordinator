@@ -192,6 +192,39 @@ describe('(a) a 0.3.0 client', () => {
     expect(ok(await b.caller.status()).cursor).toBe(b.basis);
   });
 
+  it('is caught up on an empty feed: Status and next_cursor are the empty cursor it stands on, whatever its Pushes were answered', async () => {
+    const a = await SyncCaller.enrol(held);
+    const b = new Replica(a);
+    await b.pullAll();
+    const caughtUp = async () => {
+      expect([ok(await a.delta({})).nextCursor, ok(await a.status()).cursor]).toEqual([b.basis, b.basis]);
+    };
+    expect(b.basis).toBe('');
+    await caughtUp();
+
+    // A Push that writes nothing to the feed leaves it empty: every edit REJECTED, or every edit HELD.
+    const key = occFacetKey(randomUUID(), 'status');
+    const rejected = ok(await a.push({ clientId: randomUUID(), events: [edit(key, mint(a, 0), status('owned'), null)] }));
+    expect(outcomes(rejected.results)).toEqual([[PushOutcome.REJECTED, 'basis_missing']]);
+    frame = { userId: a.userId, seq: 1n << 40n, keys: new Set([key]) };
+    try {
+      const kept = ok(await a.push({ clientId: randomUUID(), events: [edit(key, mint(a, 1), status('owned'), b.basis)] }));
+      expect(outcomes(kept.results)).toEqual([[PushOutcome.HELD, '']]);
+    } finally {
+      frame = undefined;
+    }
+    expect(await feedCount(a.userId)).toBe(0);
+    expect(await b.pull()).toBe(false);
+    expect([b.basis, b.processed]).toEqual(['', []]);
+    await caughtUp();
+
+    // Its first transaction moves both to that transaction's commit_cursor.
+    ok(await a.push({ clientId: randomUUID(), events: copy(a, b.basis) }));
+    await b.pullAll();
+    expect(b.basis).not.toBe('');
+    await caughtUp();
+  });
+
   it('after a restart mid-transaction fetches the staged events again and still applies each once', async () => {
     const a = await SyncCaller.enrol(h);
     const b = new Replica(await SyncCaller.sibling(h, a));
@@ -245,6 +278,14 @@ describe('(b) SyncEvent.basis on Push', () => {
     const res = ok(await a.push({ clientId: randomUUID(), events: unreadable.map((basis, i) => edit(key, mint(a, i), score(2), basis)) }));
     expect(res.results.map((r) => r.reason)).toEqual(unreadable.map(() => 'basis_missing: the basis is not a cursor'));
     expect(await feedCount(a.userId)).toBe(0);
+  });
+
+  it("refuses the start of the feed spelled as a seq: the server issues it only as ''", async () => {
+    const a = await SyncCaller.enrol(h);
+    const zero = Buffer.from('v1:0').toString('base64url');
+    const [res] = ok(await a.push({ clientId: randomUUID(), events: [edit(ufFacetKey(randomUUID(), 'score'), mint(a), score(5), zero)] })).results;
+    expect([res!.outcome, res!.reason]).toEqual([PushOutcome.REJECTED, 'basis_missing: the basis is not a cursor']);
+    expect(await a.delta({ cursor: zero })).toMatchObject({ ok: false, status: 400, code: 'invalid_argument' });
   });
 
   it('places an edit on a stale basis by LWW while no import frame exists: STALE when older, APPLIED when newer', async () => {

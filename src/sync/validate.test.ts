@@ -59,7 +59,11 @@ describe('validateEvent', () => {
     expect(validateEvent(event({ basis: undefined, op: SyncOp.DELETE, payload: '' }), ctx)).toEqual(missing);
   });
 
-  it.each(['x', 'djE6MDA', Buffer.from('v1:-1').toString('base64url'), `${encodeCursor(1n)}=`])(
+  it('reads the empty basis, the start of the feed, as seq 0', () => {
+    expect(validateEvent(event({ basis: encodeCursor(0n) }), ctx)).toEqual(OK);
+  });
+
+  it.each(['x', 'djE6MDA', Buffer.from('v1:0').toString('base64url'), Buffer.from('v1:-1').toString('base64url'), `${encodeCursor(1n)}=`])(
     'refuses a basis that is not a cursor (%s) as basis_missing',
     (basis) => {
       expect(validateEvent(event({ basis }), ctx)).toEqual({ ok: false, reason: 'basis_missing: the basis is not a cursor', userOwned: true });
