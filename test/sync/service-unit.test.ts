@@ -135,8 +135,33 @@ describe('the Connect options the process serves', () => {
     expect(app.hasRoute({ method: 'POST', url: '/coordinator.v1.CompareService/Compare' })).toBe(true);
   });
 
+  it('mount CatalogService beside them', async () => {
+    app = buildApp({ db: stubDb, logLevel: 'silent', compare: { ...productionConnectOptions(neverPool, {}), initSigning: false } });
+    await app.ready();
+    for (const method of ['GetProducts', 'GetProductImages', 'SearchProducts']) {
+      expect(app.hasRoute({ method: 'POST', url: `/coordinator.v1.CatalogService/${method}` })).toBe(true);
+    }
+  });
+
   it('take the spine from SPINE_READ_URL and run degraded without it', () => {
     expect(productionConnectOptions(neverPool, {}).spineRead).toBeNull();
     expect(productionConnectOptions(neverPool, { SPINE_READ_URL: 'http://spine.test.invalid' }).spineRead).toBeInstanceOf(SpineReadClient);
+  });
+
+  it('give Catalog the SAME spine client as Compare, and the media base from MEDIA_PUBLIC_BASE_URL', () => {
+    const off = productionConnectOptions(neverPool, { SPINE_READ_URL: 'http://spine.test.invalid' });
+    expect(off.catalog?.spineRead).toBe(off.spineRead);
+    // Unset by default: zero derivatives exist, so images stay off until configured.
+    expect(off.catalog?.mediaBaseUrl).toBeNull();
+
+    const on = productionConnectOptions(neverPool, { MEDIA_PUBLIC_BASE_URL: 'https://images.figurecollecting.com/d/' });
+    expect(on.catalog?.spineRead).toBeNull();
+    expect(on.catalog?.mediaBaseUrl).toBe('https://images.figurecollecting.com/d');
+  });
+
+  it('refuse to start on a media base that is not https', () => {
+    expect(() => productionConnectOptions(neverPool, { MEDIA_PUBLIC_BASE_URL: 'http://images.test/d' })).toThrow(
+      /MEDIA_PUBLIC_BASE_URL/,
+    );
   });
 });

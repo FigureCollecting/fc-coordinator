@@ -1,20 +1,29 @@
 /**
  * SpineReadClient tests, ported from fc-backend tests/services/
  * spineReadClient.test.ts and extended with the traceparent interceptor
- * (§A.5 rule 3), which is what slice 1b adds to the ported file.
+ * (§A.5 rule 3), then moved onto gRPC by R4d.
  *
- * Driven against an IN-PROCESS SpineRead fake: a plain node:http (HTTP/1.1)
- * server + connectNodeAdapter, the same cleartext h1 shape the production
- * spine serves. This ALSO regression-pins the transport choice: if
- * createConnectTransport were ever swapped for createGrpcTransport (which
- * needs h2), every call here would fail — a plain node:http server cannot
- * serve an h2/h2c client, it has no ALPN and no h2c upgrade handling.
+ * Driven against an IN-PROCESS SpineRead fake that serves gRPC over cleartext
+ * h2c and nothing else (test/helpers/fakeSpineRead.ts) — the shape
+ * ingest-server's READ_H2C_PORT (:50062) serves inside the pod, before the
+ * Linkerd proxy wraps it in mTLS. That pins the transport from both sides: the
+ * fake refuses HTTP/1.1 and refuses the Connect protocol, and the WIRE it
+ * records says what actually arrived on the socket.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { context, trace } from '@opentelemetry/api';
 import { startTelemetry, type Telemetry } from '../../src/platform/telemetry.js';
+import * as http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { createClient, type ConnectRouter } from '@connectrpc/connect';
+import { connectNodeAdapter, createConnectTransport } from '@connectrpc/connect-node';
 import { create } from '@bufbuild/protobuf';
-import { CompareResponseSchema } from '@figurecollecting/ingest-contract/read';
+import {
+  CompareResponseSchema,
+  GetProductImagesResponseSchema,
+  GetProductsResponseSchema,
+  SpineRead,
+} from '@figurecollecting/ingest-contract/read';
 import { ENTITLEMENTS_HEADER } from '@figurecollecting/ingest-contract/entitlement';
 import {
   SpineReadClient,
@@ -25,6 +34,7 @@ import { generateTestSigningKey } from '../helpers/entitlementVerifier.js';
 import { startFakeSpineRead, type FakeSpineRead } from '../helpers/fakeSpineRead.js';
 
 const NOW_ISO = '2026-09-14T12:00:00.000Z';
+const HEAD = '5f0c2a9e-4b7d-4e21-9c3a-8d1e6f2b7a40';
 const NO_KEYS = new Map();
 
 let spine: FakeSpineRead | null = null;
@@ -60,16 +70,101 @@ afterEach(async () => {
   }
 });
 
-describe('SpineReadClient — the request it makes', () => {
-  it('speaks Connect over HTTP/1.1 to a plain node:http server', async () => {
-    // The whole assertion is that this call SUCCEEDS. An h2-only transport
-    // cannot complete it, so a swap to createGrpcTransport turns this red.
+/** gRPC's content types: binary protobuf, never Connect's application/proto or JSON. */
+const GRPC_CONTENT_TYPE = /^application\/grpc(\+proto)?$/;
+
+/**
+ * The OLD shape of the hop: Connect over a plain HTTP/1.1 server, which is what
+ * ingest-server still serves on :50052. Kept here only to prove the client no
+ * longer reaches it.
+ */
+async function startHttp1ConnectSpine(): Promise<{ baseUrl: string; hits: number[]; close: () => Promise<void> }> {
+  const hits: number[] = [];
+  const routes = (router: ConnectRouter): void => {
+    router.service(SpineRead, {
+      compare: async () => {
+        hits.push(1);
+        return create(CompareResponseSchema, { resultJson: '{"heads":[]}' });
+      },
+    });
+  };
+  const server = http.createServer(connectNodeAdapter({ routes }));
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const port = (server.address() as AddressInfo).port;
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    hits,
+    close: async () => {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+describe('SpineReadClient — the wire (R4d: gRPC over h2c, Linkerd supplies mTLS)', () => {
+  it('Compare arrives as gRPC on an HTTP/2 stream', async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS });
+    const res = await new SpineReadClient(spine.baseUrl).compare({ gtin14: '04573102591234' }, NOW_ISO);
+
+    expect(res.resultJson).toContain('"heads"');
+    expect(spine.wire).toHaveLength(1);
+    expect(spine.wire[0]?.path).toBe('/read.v1.SpineRead/Compare');
+    expect(spine.wire[0]?.httpVersion).toBe('2.0');
+    expect(spine.wire[0]?.contentType).toMatch(GRPC_CONTENT_TYPE);
+  });
+
+  it('GetProducts and GetProductImages arrive as gRPC on HTTP/2 streams too', async () => {
     spine = await startFakeSpineRead({ keys: NO_KEYS });
     const client = new SpineReadClient(spine.baseUrl);
 
-    const res = await client.compare({ gtin14: '04573102591234' }, NOW_ISO);
-    expect(res.resultJson).toContain('"heads"');
+    await client.getProducts([{ gtin14: '04573102591234' }], NOW_ISO, null, { pageSize: 0, pageToken: '' });
+    await client.getProductImages([HEAD], NOW_ISO, null, { pageSize: 0, pageToken: '' });
+
+    expect(spine.wire.map((w) => w.path)).toEqual([
+      '/read.v1.SpineRead/GetProducts',
+      '/read.v1.SpineRead/GetProductImages',
+    ]);
+    for (const w of spine.wire) {
+      expect(w.httpVersion).toBe('2.0');
+      expect(w.contentType).toMatch(GRPC_CONTENT_TYPE);
+    }
   });
+
+  it('cannot reach the retired HTTP/1.1 Connect shape: no silent fallback', async () => {
+    const old = await startHttp1ConnectSpine();
+    try {
+      await expect(
+        new SpineReadClient(old.baseUrl, 2_000).compare({ gtin14: '04573102591234' }, NOW_ISO),
+      ).rejects.toThrow();
+      expect(old.hits).toHaveLength(0);
+    } finally {
+      await old.close();
+    }
+  });
+
+  it('the fake is not permissive: a Connect client over HTTP/1.1 is refused by it', async () => {
+    // Anti-vacuity for every test above. If the fake answered Connect/h1, the
+    // gRPC assertions would prove nothing about which client we built.
+    spine = await startFakeSpineRead({ keys: NO_KEYS });
+    const h1 = createClient(SpineRead, createConnectTransport({ baseUrl: spine.baseUrl, httpVersion: '1.1' }));
+
+    await expect(h1.compare({ seed: { case: 'gtin14', value: '04573102591234' }, nowIso: NOW_ISO })).rejects.toThrow();
+    expect(spine.calls).toHaveLength(0);
+  });
+
+  it('the fake is not permissive: Connect over HTTP/2 is refused as well', async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS });
+    const h2 = createClient(SpineRead, createConnectTransport({ baseUrl: spine.baseUrl, httpVersion: '2' }));
+
+    await expect(h2.compare({ seed: { case: 'gtin14', value: '04573102591234' }, nowIso: NOW_ISO })).rejects.toThrow();
+    expect(spine.calls).toHaveLength(0);
+    // It reached the socket as HTTP/2 and was refused for its PROTOCOL.
+    expect(spine.wire[0]?.httpVersion).toBe('2.0');
+    expect(spine.wire[0]?.contentType).not.toMatch(GRPC_CONTENT_TYPE);
+  });
+});
+
+describe('SpineReadClient — the request it makes', () => {
 
   it.each([
     ['gtin14', { gtin14: '04573102591234' }, { case: 'gtin14', value: '04573102591234' }],
@@ -230,5 +325,120 @@ describe('SpineReadClient — the response is passed through', () => {
       NOW_ISO,
     );
     expect(res.resultJson).toBe(odd);
+  });
+});
+
+describe('SpineReadClient.getProducts — the request it makes', () => {
+  it('sends each ref as the matching read.v1 oneof case, in order', async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS });
+    await new SpineReadClient(spine.baseUrl).getProducts(
+      [{ productId: HEAD }, { gtin14: '04573102591234' }, { sourceItem: { site: 'mfc', nativeId: '1144' } }],
+      NOW_ISO,
+      null,
+      { pageSize: 0, pageToken: '' },
+    );
+
+    expect(spine.productCalls[0]?.request.refs.map((r) => r.ref)).toEqual([
+      { case: 'productId', value: HEAD },
+      { case: 'gtin14', value: '04573102591234' },
+      { case: 'sourceItem', value: expect.objectContaining({ site: 'mfc', nativeId: '1144' }) },
+    ]);
+  });
+
+  it('forwards now_iso, page_size and page_token verbatim', async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS });
+    await new SpineReadClient(spine.baseUrl).getProducts([{ gtin14: '04573102591234' }], NOW_ISO, null, {
+      pageSize: 75,
+      pageToken: 'opaque-token-1',
+    });
+
+    const req = spine.productCalls[0]?.request;
+    expect(req?.nowIso).toBe(NOW_ISO);
+    expect(req?.pageSize).toBe(75);
+    expect(req?.pageToken).toBe('opaque-token-1');
+  });
+
+  it('attaches the assertion as METADATA, and sends no header without one', async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS });
+    const client = new SpineReadClient(spine.baseUrl);
+    const token = 'eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJ4In0.c2ln';
+
+    await client.getProducts([{ gtin14: '04573102591234' }], NOW_ISO, token, { pageSize: 0, pageToken: '' });
+    await client.getProducts([{ gtin14: '04573102591234' }], NOW_ISO, null, { pageSize: 0, pageToken: '' });
+
+    expect(spine.productCalls[0]?.headers.get(ENTITLEMENTS_HEADER)).toBe(token);
+    expect(JSON.stringify(spine.productCalls[0]?.request)).not.toContain(token);
+    expect(spine.productCalls[1]?.headers.get(ENTITLEMENTS_HEADER)).toBeNull();
+  });
+
+  it('is traced like Compare', async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS });
+    await new SpineReadClient(spine.baseUrl).getProducts([{ gtin14: '04573102591234' }], NOW_ISO, null, {
+      pageSize: 0,
+      pageToken: '',
+    });
+    expect(spine.productCalls[0]?.headers.get('traceparent')).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$/);
+  });
+
+  it('returns products_json and next_page_token unedited', async () => {
+    const odd = '{ "products" : [] , "unresolved" : [] , "coverage" : {} }';
+    spine = await startFakeSpineRead({
+      keys: NO_KEYS,
+      respondProducts: () => create(GetProductsResponseSchema, { productsJson: odd, nextPageToken: 'next-1' }),
+    });
+    const res = await new SpineReadClient(spine.baseUrl).getProducts([{ gtin14: '04573102591234' }], NOW_ISO, null, {
+      pageSize: 0,
+      pageToken: '',
+    });
+    expect(res.productsJson).toBe(odd);
+    expect(res.nextPageToken).toBe('next-1');
+  });
+
+  it('times out rather than hanging', async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS, respondProducts: () => new Promise<never>(() => {}) });
+    await expect(
+      new SpineReadClient(spine.baseUrl, 150).getProducts([{ gtin14: '04573102591234' }], NOW_ISO, null, {
+        pageSize: 0,
+        pageToken: '',
+      }),
+    ).rejects.toThrow();
+  });
+});
+
+describe('SpineReadClient.getProductImages — the request it makes', () => {
+  it('forwards product ids, now_iso and paging verbatim, with the assertion as metadata', async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS });
+    const token = 'eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJ4In0.c2ln';
+    await new SpineReadClient(spine.baseUrl).getProductImages([HEAD, 'merged-id'], NOW_ISO, token, {
+      pageSize: 20,
+      pageToken: 'img-token',
+    });
+
+    const call = spine.imageCalls[0];
+    expect(call?.request.productIds).toEqual([HEAD, 'merged-id']);
+    expect(call?.request.nowIso).toBe(NOW_ISO);
+    expect(call?.request.pageSize).toBe(20);
+    expect(call?.request.pageToken).toBe('img-token');
+    expect(call?.headers.get(ENTITLEMENTS_HEADER)).toBe(token);
+  });
+
+  it('sends no header when there is no assertion', async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS });
+    await new SpineReadClient(spine.baseUrl).getProductImages([HEAD], NOW_ISO, '', { pageSize: 0, pageToken: '' });
+    expect(spine.imageCalls[0]?.headers.get(ENTITLEMENTS_HEADER)).toBeNull();
+  });
+
+  it('returns images_json and next_page_token unedited', async () => {
+    const body = '{"products":[],"coverage":{}}';
+    spine = await startFakeSpineRead({
+      keys: NO_KEYS,
+      respondImages: () => create(GetProductImagesResponseSchema, { imagesJson: body, nextPageToken: 'img-2' }),
+    });
+    const res = await new SpineReadClient(spine.baseUrl).getProductImages([HEAD], NOW_ISO, null, {
+      pageSize: 0,
+      pageToken: '',
+    });
+    expect(res.imagesJson).toBe(body);
+    expect(res.nextPageToken).toBe('img-2');
   });
 });
