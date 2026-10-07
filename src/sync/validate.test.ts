@@ -20,6 +20,7 @@ import {
   type UserFacetFamily,
 } from '@figurecollecting/fc-api-contract';
 import { describe, expect, it } from 'vitest';
+import { encodeCursor } from './cursor.js';
 import { validateEvent } from './validate.js';
 
 const DEVICE = '0f3a5c7e-9b1d-2f4a-6c8e-0b2d4f6a8c0e';
@@ -36,26 +37,63 @@ const SERVER_OWNED = occOriginKey(OCC);
 
 const at = (ms: number, deviceId = DEVICE) =>
   canonicalVersion({ instant: new Date(NOW.getTime() + ms), counter: 3, deviceId });
-const event = (over: Partial<{ facetKey: string; version: string; op: SyncOp; payload: string }> = {}) => ({
+const event = (over: Partial<{ facetKey: string; version: string; op: SyncOp; payload: string; basis: string | undefined }> = {}) => ({
   facetKey: KEY,
   version: at(-1000),
   op: SyncOp.UPSERT,
   payload: JSON.stringify({ status: 'owned', ...DISPLAY }),
+  basis: '',
   ...over,
 });
+/** Accepted, minted before the client had applied any transaction (basis ''). */
+const OK = { ok: true, basisSeq: 0n };
 
 describe('validateEvent', () => {
+  it('reads the basis as the seq its cursor names', () => {
+    expect(validateEvent(event({ basis: encodeCursor(42n) }), ctx)).toEqual({ ok: true, basisSeq: 42n });
+  });
+
+  it('refuses an event with no basis, an UPSERT or a DELETE, as basis_missing', () => {
+    const missing = { ok: false, reason: 'basis_missing: the event carries no basis', userOwned: true };
+    expect(validateEvent(event({ basis: undefined }), ctx)).toEqual(missing);
+    expect(validateEvent(event({ basis: undefined, op: SyncOp.DELETE, payload: '' }), ctx)).toEqual(missing);
+  });
+
+  it('reads the empty basis, the start of the feed, as seq 0', () => {
+    expect(validateEvent(event({ basis: encodeCursor(0n) }), ctx)).toEqual(OK);
+  });
+
+  it.each(['x', 'djE6MDA', Buffer.from('v1:0').toString('base64url'), Buffer.from('v1:-1').toString('base64url'), `${encodeCursor(1n)}=`])(
+    'refuses a basis that is not a cursor (%s) as basis_missing',
+    (basis) => {
+      expect(validateEvent(event({ basis }), ctx)).toEqual({ ok: false, reason: 'basis_missing: the basis is not a cursor', userOwned: true });
+    },
+  );
+
+  it('checks the basis last: every other REJECTED check wins over a missing one', () => {
+    const code = (over: Parameters<typeof event>[0]) => {
+      const verdict = validateEvent(event({ basis: undefined, ...over }), ctx);
+      return verdict.ok ? 'ok' : verdict.reason.split(':')[0];
+    };
+    expect(code({ payload: '{}' })).toBe('payload_invalid');
+    expect(code({ op: SyncOp.DELETE, payload: 'x' })).toBe('payload_invalid');
+    expect(code({ version: at(-1000, '9c1e3a5b-7d9f-1b3d-5f7a-9c1e3b5d7f9a') })).toBe('device_mismatch');
+    expect(code({ facetKey: SERVER_OWNED })).toBe('facet_key_not_user_owned');
+    expect(code({ version: at(MAX_FUTURE_SKEW_MS + 1000) })).toBe('version_future');
+    expect(code({ version: 'x' })).toBe('version_malformed');
+  });
+
   it('accepts a user-owned UPSERT from the calling device', () => {
-    expect(validateEvent(event(), ctx)).toEqual({ ok: true });
+    expect(validateEvent(event(), ctx)).toEqual(OK);
   });
 
   it('accepts a DELETE with an empty payload', () => {
-    expect(validateEvent(event({ op: SyncOp.DELETE, payload: '' }), ctx)).toEqual({ ok: true });
+    expect(validateEvent(event({ op: SyncOp.DELETE, payload: '' }), ctx)).toEqual(OK);
   });
 
   it('accepts a version exactly at the skew bound and refuses one microsecond past it', () => {
     const bound = canonicalVersion({ instant: new Date(NOW.getTime() + MAX_FUTURE_SKEW_MS), counter: 0, deviceId: DEVICE });
-    expect(validateEvent(event({ version: bound }), ctx)).toEqual({ ok: true });
+    expect(validateEvent(event({ version: bound }), ctx)).toEqual(OK);
     expect(validateEvent(event({ version: bound }), { ...ctx, nowMicros: NOW_MICROS - 1n })).toMatchObject({
       ok: false,
       reason: expect.stringMatching(/^version_future: /),
@@ -120,8 +158,8 @@ describe('validateEvent', () => {
 
   it.each(USER_FACET_FAMILIES.map((family) => [family]))('accepts %s with a payload its schema allows, and a DELETE', (family) => {
     const { key, valid } = FAMILIES[family];
-    expect(check(key, valid)).toEqual({ ok: true });
-    expect(validateEvent(event({ facetKey: key, op: SyncOp.DELETE, payload: '' }), ctx)).toEqual({ ok: true });
+    expect(check(key, valid)).toEqual(OK);
+    expect(validateEvent(event({ facetKey: key, op: SyncOp.DELETE, payload: '' }), ctx)).toEqual(OK);
   });
 
   it.each(USER_FACET_FAMILIES.map((family) => [family]))('refuses %s with a payload its schema does not allow', (family) => {
@@ -165,7 +203,7 @@ describe('validateEvent', () => {
   });
 
   it.each(userVectors.map((v) => [v.key, v.parsed.family as UserFacetFamily]))('accepts the golden user-owned key %s', (key, family) => {
-    expect(check(key, FAMILIES[family].valid)).toEqual({ ok: true });
+    expect(check(key, FAMILIES[family].valid)).toEqual(OK);
   });
 
   it.each(refused.map((v) => [v.key]))('refuses the golden key %s as not user-owned', (key) => {
@@ -180,7 +218,7 @@ describe('validateEvent', () => {
     };
     const at = (payload: string) => validateEvent(event({ facetKey: noteKey, payload }), ctx);
     expect(MAX_PAYLOAD_BYTES).toBe(65_536);
-    expect(at(padded('x', MAX_PAYLOAD_BYTES))).toEqual({ ok: true });
+    expect(at(padded('x', MAX_PAYLOAD_BYTES))).toEqual(OK);
     const over = { ok: false, reason: 'payload_invalid: payload over 65536 bytes', userOwned: true };
     expect(at(padded('x', MAX_PAYLOAD_BYTES + 1))).toEqual(over);
     // 10,000 three-byte characters: fewer UTF-16 units than the cap, more UTF-8 bytes.

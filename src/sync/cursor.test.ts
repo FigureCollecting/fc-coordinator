@@ -7,6 +7,11 @@ describe('the Delta cursor', () => {
     expect(decodeCursor('')).toBe(0n);
   });
 
+  it("spells the start of the feed only as '': the cursor a client holds before it applies anything", () => {
+    expect(encodeCursor(0n)).toBe('');
+    expect(decodeCursor(Buffer.from('v1:0').toString('base64url'))).toBeUndefined();
+  });
+
   it('round-trips every seq a bigint column can hold', () => {
     fc.assert(
       fc.property(fc.bigInt({ min: 0n, max: MAX_SEQ }), (seq) => {

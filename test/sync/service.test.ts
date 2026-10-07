@@ -39,6 +39,7 @@ import {
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { makeProof, TEST_ORIGIN } from '../helpers/auth.js';
 import { KeyedSerialiser } from '../../src/sync/serialise.js';
+import { MAX_SEQ, encodeCursor } from '../../src/sync/cursor.js';
 import { DISPLAY, ok, startSyncApp, SyncCaller, SYNC_SERVICE_PATH, type SyncApp } from '../helpers/syncClient.js';
 import { startSyncDatabase, type SyncDatabase, SYNC_DB } from '../helpers/syncDatabase.js';
 
@@ -113,11 +114,13 @@ async function storeFacet(caller: SyncCaller, facetKey: string, version: string,
   );
 }
 
+/** An UPSERT minted before the client had applied any transaction (basis ''). */
 const upsert = (facetKey: string, version: string, payload: string) => ({
   facetKey,
   version,
   op: SyncOp.UPSERT,
   payload,
+  basis: '',
 });
 
 async function feedCount(userId: string): Promise<number> {
@@ -256,7 +259,7 @@ describe('Push', () => {
     expect(PushOutcome[lost.outcome]).toBe(was);
 
     const later = mint(b, 1, -200_000);
-    const write = sibling === 'upserts' ? upsert(key, later, score(8)) : { facetKey: key, version: later, op: SyncOp.DELETE, payload: '' };
+    const write = sibling === 'upserts' ? upsert(key, later, score(8)) : { facetKey: key, version: later, op: SyncOp.DELETE, payload: '', basis: '' };
     ok(await b.push({ clientId: randomUUID(), events: [write] }));
     const written = await feedCount(a.userId);
 
@@ -530,7 +533,7 @@ describe('Push', () => {
     const key = ufFacetKey(randomUUID(), 'note');
     const exact = `{ "tz":"Asia/Tokyo",\n  "note" : "\\u7bb1\\u306b\\u50b7 café 🎎", "edited_at":"2026-09-26T08:00:00.1+09:00" }`;
     ok(await caller.push({ clientId: randomUUID(), events: [upsert(key, mint(caller, 1), exact)] }));
-    ok(await caller.push({ clientId: randomUUID(), events: [{ facetKey: key, version: mint(caller, 2), op: SyncOp.DELETE, payload: '' }] }));
+    ok(await caller.push({ clientId: randomUUID(), events: [{ facetKey: key, version: mint(caller, 2), op: SyncOp.DELETE, payload: '', basis: '' }] }));
 
     const feed = await drain(caller);
     expect(feed.events.map((e) => [e.op, e.payload])).toEqual([
@@ -970,7 +973,8 @@ describe('a user whose Pushes queue behind its lock', () => {
 });
 
 // 200 events of the largest payload JSON.stringify writes for a valid facet: a 10,000 code point
-// note of U+0001 is \u0001 each, 7 bytes once the JSON envelope escapes the backslash.
+// note of U+0001 is \u0001 each, 7 bytes once the JSON envelope escapes the backslash. Each
+// carries the longest basis there is, the cursor of the largest seq.
 describe('the Connect read cap', () => {
   const CAP = 16 * 1024 * 1024;
 
@@ -979,11 +983,14 @@ describe('the Connect read cap', () => {
     const payload = JSON.stringify({ note: '\u0001'.repeat(10_000), edited_at: '2026-09-26T09:15:00.123456789+18:00', tz: 'A'.repeat(64) });
     const at = new Date(Date.now() - 60_000);
     const events = Array.from({ length: 200 }, (_, i) =>
-      upsert(ufFacetKey(randomUUID(), 'note'), canonicalVersion({ instant: at, counter: 9_999_999_999 - i, deviceId: caller.deviceId }), payload),
+      ({
+        ...upsert(ufFacetKey(randomUUID(), 'note'), canonicalVersion({ instant: at, counter: 9_999_999_999 - i, deviceId: caller.deviceId }), payload),
+        basis: encodeCursor(MAX_SEQ),
+      }),
     );
     const request = { clientId: '~'.repeat(128), events };
     const bytes = Buffer.byteLength(toJsonString(PushRequestSchema, create(PushRequestSchema, request)));
-    expect(bytes).toBe(14_064_954);
+    expect(bytes).toBe(14_073_154);
     expect(bytes).toBeLessThan(CAP);
 
     const res = ok(await caller.push(request));

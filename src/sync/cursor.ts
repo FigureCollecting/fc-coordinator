@@ -1,6 +1,7 @@
 // The Delta cursor: base64url of `v1:<seq>`. Opaque to clients; the prefix lets the paging
 // basis change without a wire break. Only the canonical spelling decodes, so one position has
-// exactly one cursor and a client can compare cursors (StatusResponse.cursor).
+// exactly one cursor and a client can compare cursors (StatusResponse.cursor). The start of the
+// feed is '': the cursor a client holds before it has applied any transaction (rule 7).
 
 const PREFIX = 'v1:';
 const BODY = /^v1:(0|[1-9][0-9]{0,18})$/;
@@ -11,6 +12,7 @@ export const MAX_SEQ = 2n ** 63n - 1n;
 
 export function encodeCursor(seq: bigint): string {
   if (seq < 0n || seq > MAX_SEQ) throw new RangeError(`seq out of range: ${seq}`);
+  if (seq === 0n) return '';
   return Buffer.from(`${PREFIX}${seq}`, 'latin1').toString('base64url');
 }
 
