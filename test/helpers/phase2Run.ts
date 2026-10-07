@@ -7,6 +7,8 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { create } from '@bufbuild/protobuf';
+import { CompareResponseSchema, type CompareResponse } from '@figurecollecting/ingest-contract/read';
 import type { FastifyInstance } from 'fastify';
 import { calculateJwkThumbprint, exportJWK, generateKeyPair, type JWK } from 'jose';
 import { createDeviceStore } from '../../src/auth/plugin.js';
@@ -16,11 +18,17 @@ import { main } from '../../scripts/phase2-client/main.js';
 import { createFetchTransport } from '../../scripts/phase2-client/transport.js';
 import { makeIssuer, type TestIssuer } from './auth.js';
 import { startFakeOidcProvider, signInLikeABrowser, type FakeOidcProvider } from './fakeOidcProvider.js';
-import { startFakeSpineRead, type FakeSpineRead } from './fakeSpineRead.js';
+import { REDACTED_RESULT_JSON, startFakeSpineRead, type FakeSpineRead, type SpineCall } from './fakeSpineRead.js';
 import { CLIENT_ID, buildCoordinator, freePort, recording, type Exchanged } from './phase2Harness.js';
 import { startSyncDatabase, type SyncDatabase } from './syncDatabase.js';
 
 export const B1_REQUEST = '{"gtin14":"04573102591234","nowIso":"2026-09-14T12:00:00.000Z"}';
+
+/** The redacted canned result, led by what this call asked for. */
+export function answeringWhatWasAsked(call: SpineCall): CompareResponse {
+  const asked = JSON.stringify({ [String(call.request.seed.case)]: call.request.seed.value, nowIso: call.request.nowIso });
+  return create(CompareResponseSchema, { resultJson: `{"asked":${asked},${REDACTED_RESULT_JSON.slice(1)}` });
+}
 
 export interface FullRun {
   exit: number;
@@ -45,12 +53,15 @@ export interface RunEnv {
 
 export async function startRunEnv(): Promise<RunEnv> {
   const db = await startSyncDatabase();
-  const spine: FakeSpineRead = await startFakeSpineRead({ keys: new Map() });
+  // The spine's answer names the seed and clock it was asked for, so B1 is byte-identical to the
+  // direct call below only if the client really sent the --b1-request.
+  const spine: FakeSpineRead = await startFakeSpineRead({ keys: new Map(), respond: answeringWhatWasAsked });
   const userId = randomUUID();
   let issuer: TestIssuer | undefined;
   const provider: FakeOidcProvider = await startFakeOidcProvider({
     clientId: CLIENT_ID,
     mintAccessToken: () => issuer!.mint({ sub: userId }),
+    mintIdToken: () => issuer!.mint({ sub: userId, preferred_username: 'phase2-test' }),
   });
   issuer = await makeIssuer({ issuer: provider.issuer, audience: CLIENT_ID });
 

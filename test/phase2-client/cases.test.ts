@@ -108,6 +108,13 @@ async function harness(
 const onLabel = (label: string, change: (res: HttpResponse) => HttpResponse) => (req: HttpRequest, res: HttpResponse) =>
   req.label === label ? change(res) : res;
 
+/** The same answer without its DPoP-Nonce: an edge that strips the header. */
+const stripNonce = (res: HttpResponse): HttpResponse => {
+  const headers = new Headers(res.headers);
+  headers.delete('dpop-nonce');
+  return { ...res, headers };
+};
+
 /** The same status, but the DPoP challenge names another error: a rejection for the wrong reason. */
 const challenging = (error: string) => (res: HttpResponse): HttpResponse => {
   const headers = new Headers(res.headers);
@@ -159,6 +166,13 @@ describe('B5b: retry with the returned nonce and a fresh jti', () => {
     expect(await caseB5b(h.ctx)).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/not 401 use_dpop_nonce/) });
   });
 
+  it('fails when the edge strips DPoP-Nonce from the use_dpop_nonce 401, and sends no retry', async () => {
+    // A retry would fall back to the nonce of an earlier answer and get 200: the edge question B5a exists for.
+    const h = await harness({ rewrite: onLabel('B5b:no-nonce', stripNonce) });
+    expect(await caseB5b(h.ctx)).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/not 401 use_dpop_nonce with a DPoP-Nonce/) });
+    expect(h.transport.log.some((e) => e.request.label === 'B5b:retry')).toBe(false);
+  });
+
   it('fails when the retry is not accepted', async () => {
     const h = await harness({ rewrite: onLabel('B5b:retry', (res) => withStatus(res, 500)) });
     expect((await caseB5b(h.ctx)).detail).toMatch(/retry/);
@@ -173,9 +187,16 @@ describe('B1: Compare, byte-identical to a direct call', () => {
 
   it('passes when result_json matches the direct call byte for byte', async () => {
     const h = await harness();
-    const result = await caseB1(h.ctx, { request: B1_REQUEST, reference: await direct() });
+    const reference = await direct();
+    const asked = spine.calls.length;
+    const result = await caseB1(h.ctx, { request: B1_REQUEST, reference });
     expect(result).toMatchObject({ id: 'B1', verdict: 'PASS' });
     expect(result.detail).toMatch(/byte-identical/);
+    // This spine answers every request alike, so only its log shows the --b1-request was the one sent.
+    const calls = spine.calls.slice(asked);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.request.seed).toMatchObject({ case: 'gtin14', value: '04573102591234' });
+    expect(calls[0]!.request.nowIso).toBe('2026-09-14T12:00:00.000Z');
   });
 
   it('fails on a single differing byte', async () => {
@@ -183,6 +204,14 @@ describe('B1: Compare, byte-identical to a direct call', () => {
     const reference = await direct();
     reference[10] = reference[10]! ^ 1;
     expect((await caseB1(h.ctx, { request: B1_REQUEST, reference })).detail).toMatch(/differs from the reference .* at byte 10/);
+  });
+
+  it('fails when the answer is a prefix of a longer reference: a truncated result_json', async () => {
+    const h = await harness();
+    const full = await direct();
+    const reference = new Uint8Array([...full, 0x20]);
+    const result = await caseB1(h.ctx, { request: B1_REQUEST, reference });
+    expect(result).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(new RegExp(`\\(${full.byteLength + 1} bytes, .* at byte ${full.byteLength}$`)) });
   });
 
   it('fails on a shorter reference, naming where they part', async () => {
@@ -307,6 +336,15 @@ describe('B8: a revoked device, beside a live one', () => {
     expect(await caseB8(h.ctx)).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/^the other device stopped working/) });
   });
 
+  it('fails when the second device is answered as another device before its revocation', async () => {
+    let primaryId = '';
+    const h = await harness({
+      rewrite: (req, res) => (req.label === 'B8:second-before' ? withStatus(res, 200, JSON.stringify({ deviceId: primaryId })) : res),
+    });
+    primaryId = h.ctx.primaryDeviceId;
+    expect(await caseB8(h.ctx)).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/^the second device did not work before its revocation: 200/) });
+  });
+
   it('fails when the second device cannot be set up or revoked', async () => {
     let h = await harness({ rewrite: onLabel('B8:enrol-second', (res) => withStatus(res, 403)) });
     expect(await caseB8(h.ctx)).toMatchObject({ verdict: 'FAIL' });
@@ -322,11 +360,6 @@ describe('B8: a revoked device, beside a live one', () => {
 describe('B6: a nonce from the previous bucket, same epoch', () => {
   const PERIOD_S = 0.4;
   const PERIOD_MS = PERIOD_S * 1000;
-  const stripNonce = (res: HttpResponse): HttpResponse => {
-    const headers = new Headers(res.headers);
-    headers.delete('dpop-nonce');
-    return { ...res, headers };
-  };
 
   it('passes: the nonce it captured is accepted once the bucket has rolled by one', async () => {
     const h = await harness({ overrides: { noncePeriodSeconds: PERIOD_S } });
@@ -432,6 +465,28 @@ describe('B7: a nonce across a restart', () => {
     };
     expect(await caseB7({ ...h.ctx, session }, { ...quick, awaitRestart: restart })).toMatchObject({ verdict: 'PASS' });
     expect(calls).toBeGreaterThanOrEqual(3);
+  });
+
+  it('passes when the operator restarts late: every 200 while polling refreshes the jti it replays', async () => {
+    const h = await harness();
+    let offset = 0;
+    let sleeps = 0;
+    const late: CaseContext = {
+      ...h.ctx,
+      now: () => Date.now() + offset,
+      sleep: async (ms) => {
+        offset += ms;
+        sleeps += 1;
+        // 50 s after the prompt: the jti accepted before it is past the 36 s window by now.
+        if (sleeps === 10) {
+          await app.close();
+          app = await coordinator();
+        }
+      },
+    };
+    const result = await caseB7(late, { timeoutMs: 300_000, pollMs: 5_000, jtiWindowMs: 36_000, awaitRestart: async () => {} });
+    expect(result, result.detail).toMatchObject({ verdict: 'PASS', detail: expect.stringMatching(/accepted 5 s earlier got 200/) });
+    expect(offset).toBe(50_000);
   });
 
   it('fails when the new process accepts an old-epoch nonce', async () => {

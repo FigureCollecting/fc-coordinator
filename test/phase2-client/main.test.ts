@@ -11,7 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { generateClientKey } from '../../scripts/phase2-client/dpop.js';
+import { generateClientKey, type ClientKey } from '../../scripts/phase2-client/dpop.js';
 import { liveDeps, main, type MainDeps } from '../../scripts/phase2-client/main.js';
 import { createFetchTransport, type HttpRequest, type Transport } from '../../scripts/phase2-client/transport.js';
 import { makeIssuer } from '../helpers/auth.js';
@@ -54,6 +54,10 @@ function capture(transport: Transport, overrides: Partial<MainDeps> = {}): Captu
 afterEach(() => {
   vi.restoreAllMocks();
 });
+
+/** The secrets, or JWT segments of them, that appear in the output. */
+const printed = (output: string, secrets: string[]): string[] =>
+  secrets.flatMap((s) => [s, ...s.split('.').filter((part) => part.length >= 16)]).filter((needle) => output.includes(needle));
 
 describe('acceptance (b): --plan sends zero requests', () => {
   it('is the default, prints every step and case, and its transport counts zero', async () => {
@@ -171,10 +175,10 @@ describe('a live run that must stop early', () => {
   const routed = async (rewrite?: (req: HttpRequest) => boolean, noncePeriodSeconds = 300): Promise<Transport & { labels: string[] }> => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const userId = randomUUID();
-    let mint: () => Promise<string> = async () => '';
-    provider = await startFakeOidcProvider({ clientId: CLIENT_ID, mintAccessToken: () => mint() });
+    let mint: (claims?: Record<string, unknown>) => Promise<string> = async () => '';
+    provider = await startFakeOidcProvider({ clientId: CLIENT_ID, mintAccessToken: () => mint(), mintIdToken: () => mint({ preferred_username: 'phase2-test' }) });
     const issuer = await makeIssuer({ issuer: provider.issuer, audience: CLIENT_ID });
-    mint = () => issuer.mint({ sub: userId });
+    mint = (claims = {}) => issuer.mint({ ...claims, sub: userId });
     app = buildCoordinator({ issuer, origin: ORIGIN, devices: memoryDevices(), logLines: [], noncePeriodSeconds });
     await app.ready();
     const coordinator = injectTransport(() => app!);
@@ -236,9 +240,60 @@ describe('a live run that must stop early', () => {
     };
     const c = capture(failing, { openBrowser: signInLikeABrowser });
     expect(await main([...live, '--issuer', provider!.issuer], c.deps)).toBe(2);
-    expect(c.stderr()).toMatch(/^aborted: connect ECONNRESET/m);
-    expect(c.stderr()).toContain('[redacted]');
-    expect(c.stderr()).not.toContain(provider!.grants[0]!.accessToken);
+    expect(c.stderr()).toMatch(/^aborted: connect ECONNRESET DPoP \[redacted\]$/m);
+    expect(printed(c.stdout() + c.stderr(), provider!.secrets())).toEqual([]);
+  });
+
+  it('scrubs every kind of secret out of a Connect error body and out of a network error', async () => {
+    const transport = await routed();
+    const keys: ClientKey[] = [];
+    let proof = '';
+    let nonce = '';
+    // One of each kind the run holds, each named, so a test can say which one got through.
+    const everySecret = (): [string, string][] => {
+      const grant = provider!.grants[0]!;
+      const key = keys[0]!;
+      return [
+        ['access', grant.accessToken],
+        ['id', grant.idToken],
+        ['refresh', grant.refreshToken],
+        ['code', grant.code],
+        ['verifier', grant.verifier],
+        ['proof', proof],
+        ['nonce', nonce],
+        ['x', key.publicJwk.x!],
+        ['y', key.publicJwk.y!],
+        ['jkt', key.jkt],
+      ];
+    };
+    const embedded = (): string => everySecret().map(([kind, value]) => `${kind}=${value}`).join(' ');
+    const hostile: Transport = {
+      get count() {
+        return transport.count;
+      },
+      request: async (req) => {
+        if (req.label === 'B2') throw new Error(`connect ECONNRESET ${embedded()}`);
+        proof = req.headers['dpop'] ?? proof;
+        const res = await transport.request(req);
+        nonce = res.headers.get('dpop-nonce') ?? nonce;
+        return req.label === 'B1' ? withStatus(res, 500, JSON.stringify({ code: embedded() })) : res;
+      },
+    };
+    const c = capture(hostile, {
+      openBrowser: signInLikeABrowser,
+      generateKey: async () => {
+        const key = await generateClientKey();
+        keys.push(key);
+        return key;
+      },
+    });
+    expect(await main([...live, '--issuer', provider!.issuer, '--b1-request', '{"gtin14":"04573102591234","nowIso":"2026-09-14T12:00:00.000Z"}'], c.deps)).toBe(2);
+    // Anti-vacuous: ten distinct secrets, the id token not a copy of the access token.
+    expect(new Set(everySecret().map(([, value]) => value)).size).toBe(10);
+    const scrubbed = everySecret().map(([kind]) => `${kind}=[redacted]`).join(' ');
+    expect(c.stdout()).toContain(`\nB1        FAIL Compare answered 500 ${scrubbed}\n`);
+    expect(c.stderr()).toContain(`\naborted: connect ECONNRESET ${scrubbed}\n`);
+    expect(printed(c.stdout() + c.stderr(), everySecret().map(([, value]) => value))).toEqual([]);
   });
 
   it('runs to the end on its own, and fails the run when the cleanup revoke is refused', async () => {

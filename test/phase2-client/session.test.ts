@@ -21,6 +21,11 @@ describe('Session', () => {
     await expect(session(answering(201, '{}')).enrol(await generateClientKey(), 'enrol')).rejects.toThrow(/without a deviceId/);
   });
 
+  it('takes 200 as well as 201: a key enrolled already is answered with its device', async () => {
+    expect(await session(answering(200, '{"deviceId":"d-1"}')).enrol(await generateClientKey(), 'enrol')).toBe('d-1');
+    await expect(session(answering(204, '{"deviceId":"d-1"}')).enrol(await generateClientKey(), 'enrol')).rejects.toThrow(/enrolment answered 204/);
+  });
+
   it('reads the bound device id only when there is one', () => {
     expect(Session.deviceOf(exchange('{"deviceId":"d-1"}'))).toBe('d-1');
     expect(Session.deviceOf(exchange('{"deviceId":5}'))).toBeUndefined();

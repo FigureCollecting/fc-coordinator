@@ -27,7 +27,7 @@ afterEach(async () => {
 });
 
 const start = async (discovery?: (base: string) => Record<string, unknown>) => {
-  provider = await startFakeOidcProvider({ clientId: CLIENT_ID, mintAccessToken: async () => `at-${Math.random().toString(36).slice(2)}-padding`, ...(discovery ? { discovery } : {}) });
+  provider = await startFakeOidcProvider({ clientId: CLIENT_ID, mintAccessToken: async () => `at-${Math.random().toString(36).slice(2)}-padding`, mintIdToken: async () => `id-${Math.random().toString(36).slice(2)}-padding`, ...(discovery ? { discovery } : {}) });
   return provider;
 };
 
@@ -175,6 +175,8 @@ describe('the loopback listener and the code exchange', () => {
     const base = new URL(listener.redirectUri);
     expect((await fetch(`${base.origin}/callback?code=c1&state=forged-state-value`)).status).toBe(400);
     expect((await fetch(`${base.origin}/elsewhere?code=c1&state=expected-state-value`)).status).toBe(404);
+    // A browser's redirect is a GET; anything else on the callback path is not ours to read.
+    expect((await fetch(`${base.origin}/callback?code=c1&state=expected-state-value`, { method: 'POST' })).status).toBe(404);
     expect((await fetch(`${base.origin}/callback?state=expected-state-value`)).status).toBe(400);
     expect((await fetch(`${base.origin}/callback?code=c1`)).status).toBe(400);
     expect((await fetch(`${base.origin}/callback?code=the-code&state=expected-state-value`)).status).toBe(200);

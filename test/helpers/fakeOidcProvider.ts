@@ -32,6 +32,11 @@ export interface FakeOidcOptions {
   clientId: string;
   /** Mints the access token, so the coordinator under test can verify it. */
   mintAccessToken: () => Promise<string>;
+  /**
+   * Mints the id token. Same signer as the access token but other claims, as Authentik's are: an
+   * id token byte-identical to the access token would let one secret's scrubbing hide another's.
+   */
+  mintIdToken: () => Promise<string>;
   /** Override what discovery says, to test the client's refusals. */
   discovery?: (base: string) => Record<string, unknown>;
 }
@@ -107,7 +112,7 @@ export async function startFakeOidcProvider(options: FakeOidcOptions): Promise<F
             code,
             verifier,
             accessToken: await options.mintAccessToken(),
-            idToken: await options.mintAccessToken(),
+            idToken: await options.mintIdToken(),
             refreshToken: randomBytes(32).toString('base64url'),
           };
           grants.push(issued);

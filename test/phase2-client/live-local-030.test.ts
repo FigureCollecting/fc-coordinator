@@ -13,6 +13,7 @@ import {
   SyncEventSchema,
   SyncOp,
   parseVersion,
+  type SyncEvent,
 } from '@figurecollecting/fc-api-contract';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -23,7 +24,7 @@ import { createSafeOutput } from '../../scripts/phase2-client/output.js';
 import { Session } from '../../scripts/phase2-client/session.js';
 import type { HttpRequest, HttpResponse } from '../../scripts/phase2-client/transport.js';
 import { makeIssuer } from '../helpers/auth.js';
-import { CLIENT_ID, buildCoordinator, injectTransport, recording, withStatus } from '../helpers/phase2Harness.js';
+import { CLIENT_ID, buildCoordinator, injectTransport, recording, withStatus, type Exchanged } from '../helpers/phase2Harness.js';
 import { leaks, startRunEnv, type FullRun, type RunEnv } from '../helpers/phase2Run.js';
 
 vi.mock('../../src/sync/validate.js', async (importOriginal) => {
@@ -93,13 +94,17 @@ describe('a whole run against a coordinator that takes the 0.3.0 occ keys', () =
 
 describe('the smoke, when the coordinator misbehaves', () => {
   let app: FastifyInstance;
+  /** The last smoke's user and every exchange it made. */
+  let last: { userId: string; log: Exchanged[] };
 
   const smokeAgainst = async (rewrite: (req: HttpRequest, res: HttpResponse) => HttpResponse) => {
     const issuer = await makeIssuer({ audience: CLIENT_ID });
     app = buildCoordinator({ issuer, origin: 'https://api.test.invalid', devices: createDeviceStore(env.db.app), sync: env.db.app, logLines: [] });
     await app.ready();
     const transport = recording(injectTransport(() => app), [], rewrite);
-    const session = new Session(transport, { origin: 'https://api.test.invalid', prefix: '/api' }, await issuer.mint({ sub: randomUUID() }), createSafeOutput({ write: () => true }, { write: () => true }));
+    const userId = randomUUID();
+    last = { userId, log: transport.log };
+    const session = new Session(transport, { origin: 'https://api.test.invalid', prefix: '/api' }, await issuer.mint({ sub: userId }), createSafeOutput({ write: () => true }, { write: () => true }));
     const primary = await generateClientKey();
     const deviceId = await session.enrol(primary, 'enrol');
     try {
@@ -121,11 +126,25 @@ describe('the smoke, when the coordinator misbehaves', () => {
     expect((await smokeAgainst(on('smoke:push', (res) => withStatus(res, 503, '{"code":"unavailable"}')))).detail).toMatch(/Push answered 503 unavailable/);
   });
 
-  it('fails when Delta does not show what was pushed', async () => {
+  it('fails when Delta does not show what was pushed, and stops at the last page', async () => {
     // An empty DeltaResponse: no events, no more pages.
     const result = await smokeAgainst(on('smoke:delta', (res) => ({ ...res, body: new Uint8Array() })));
     expect(result).toMatchObject({ id: 'smoke', verdict: 'FAIL' });
     expect(result.detail).toMatch(/Delta from the Status cursor did not show/);
+    expect(last.log.filter((e) => e.request.label === 'smoke:delta')).toHaveLength(1);
+  });
+
+  it('fails when Delta shows the keys and bytes that were pushed, but another version or op', async () => {
+    const rewriteEvents = (change: (event: SyncEvent) => void) =>
+      on('smoke:delta', (res) => {
+        const page = fromBinary(DeltaResponseSchema, res.body);
+        for (const event of page.events) change(event);
+        return { ...res, body: toBinary(DeltaResponseSchema, page) };
+      });
+    const otherVersion = await smokeAgainst(rewriteEvents((e) => (e.version = e.version.replace(/^\d{4}/, '2000'))));
+    expect(otherVersion).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/did not show .*head, .*status as pushed/) });
+    const otherOp = await smokeAgainst(rewriteEvents((e) => (e.op = SyncOp.DELETE)));
+    expect(otherOp).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/did not show .*head, .*status as pushed/) });
   });
 
   it('fails when Delta shows the keys and versions but not the bytes that were pushed', async () => {
