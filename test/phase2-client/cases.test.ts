@@ -19,9 +19,11 @@ import {
   caseB8,
   caseB9b,
   preflight,
+  SESSION_PATH,
+  TOKEN_MARGIN_MS,
   type CaseContext,
 } from '../../scripts/phase2-client/cases.js';
-import { generateClientKey } from '../../scripts/phase2-client/dpop.js';
+import { generateClientKey, type ClientKey } from '../../scripts/phase2-client/dpop.js';
 import { createSafeOutput } from '../../scripts/phase2-client/output.js';
 import { Session } from '../../scripts/phase2-client/session.js';
 import type { HttpRequest, HttpResponse, Transport } from '../../scripts/phase2-client/transport.js';
@@ -345,6 +347,23 @@ describe('B8: a revoked device, beside a live one', () => {
     expect(await caseB8(h.ctx)).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/^the second device did not work before its revocation: 200/) });
   });
 
+  it('revokes the second device when B8 fails after enrolling it, and says when it cannot', async () => {
+    const keys: ClientKey[] = [];
+    const keeping = async (): Promise<ClientKey> => {
+      const key = await generateClientKey();
+      keys.push(key);
+      return key;
+    };
+    let h = await harness({ rewrite: onLabel('B8:second-before', (res) => withStatus(res, 401)) });
+    expect(await caseB8({ ...h.ctx, generateKey: keeping })).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/before its revocation: 401; it was revoked$/) });
+    const probe = await h.ctx.session.call({ label: 'probe', path: SESSION_PATH, key: keys[0] });
+    expect(probe).toMatchObject({ status: 401, error: 'invalid_dpop_proof' });
+    expect(reasonsFor(h.transport.log, 'probe')).toEqual(['key_not_bound']);
+    await app.close();
+    h = await harness({ rewrite: (req, res) => (req.label === 'B8:second-before' || req.label === 'B8:cleanup' ? withStatus(res, 404) : res) });
+    expect(await caseB8(h.ctx)).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/before its revocation: 404; revoking it answered 404, so it may still be enrolled$/) });
+  });
+
   it('fails when the second device cannot be set up or revoked', async () => {
     let h = await harness({ rewrite: onLabel('B8:enrol-second', (res) => withStatus(res, 403)) });
     expect(await caseB8(h.ctx)).toMatchObject({ verdict: 'FAIL' });
@@ -487,6 +506,26 @@ describe('B7: a nonce across a restart', () => {
     const result = await caseB7(late, { timeoutMs: 300_000, pollMs: 5_000, jtiWindowMs: 36_000, awaitRestart: async () => {} });
     expect(result, result.detail).toMatchObject({ verdict: 'PASS', detail: expect.stringMatching(/accepted 5 s earlier got 200/) });
     expect(offset).toBe(50_000);
+  });
+
+  it('stops polling at the token deadline, leaving the margin for the cleanup revoke', async () => {
+    const h = await harness({ tokenLifetimeMs: 22_000 });
+    // A clock that moves only when the case sleeps, so the deadline is exact.
+    const base = Date.now();
+    let offset = 0;
+    const ctx: CaseContext = { ...h.ctx, now: () => base + offset, sleep: async (ms) => void (offset += ms) };
+    const result = await caseB7(ctx, { timeoutMs: 300_000, pollMs: 5_000, jtiWindowMs: 36_000, awaitRestart: async () => {} });
+    expect(result).toMatchObject({ verdict: 'INCONCLUSIVE', detail: expect.stringMatching(/within 17 s$/) });
+    expect(ctx.now()).toBeLessThanOrEqual(h.ctx.tokenExpiresAt - TOKEN_MARGIN_MS);
+    expect(h.transport.log.filter((e) => e.request.label === 'B7:poll')).toHaveLength(4);
+  });
+
+  it('is inconclusive at once, polling nothing, when the token is inside its margin already', async () => {
+    const h = await harness({ tokenLifetimeMs: TOKEN_MARGIN_MS - 1_000 });
+    const base = Date.now();
+    const ctx: CaseContext = { ...h.ctx, now: () => base, sleep: async () => {} };
+    expect(await caseB7(ctx, { ...quick, awaitRestart: async () => {} })).toMatchObject({ verdict: 'INCONCLUSIVE', detail: expect.stringMatching(/^too little of the access token is left/) });
+    expect(h.transport.log.some((e) => e.request.label === 'B7:poll')).toBe(false);
   });
 
   it('fails when the new process accepts an old-epoch nonce', async () => {

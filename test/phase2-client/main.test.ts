@@ -74,6 +74,7 @@ describe('acceptance (b): --plan sends zero requests', () => {
     expect(text).toContain('occ/<new occurrence uuid>/status');
     expect(text).toContain('occ/<new occurrence uuid>/head');
     expect(text).not.toContain('holding/');
+    expect(text).toContain('a live run revokes both of its devices and tombstones the status whenever its Push applied, unless it is cut off (exit 2)');
     expect(text).toContain(`--confirm fc-api-canary.mindsignals1.com`);
     expect(text).toMatch(/^requests sent: 0$/m);
     expect(c.stderr()).toBe('');
@@ -127,7 +128,8 @@ describe('liveDeps', () => {
     expect(deps.stderr).toBe(process.stderr);
     expect(deps.transport.count).toBe(0);
     expect(deps.now).toBe(Date.now);
-    expect(deps.pollMs).toBe(5_000);
+    // B7 polls each second: the replayed jti's age is the restart's downtime plus at most this.
+    expect(deps.pollMs).toBe(1_000);
     expect(deps.generateKey).toBe(generateClientKey);
     await expect(deps.openBrowser('https://example.invalid/')).resolves.toBeUndefined();
     await expect(deps.awaitRestart()).resolves.toBeUndefined();

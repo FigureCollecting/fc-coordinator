@@ -117,6 +117,11 @@ describe('the smoke, when the coordinator misbehaves', () => {
   };
   const on = (label: string, change: (res: HttpResponse) => HttpResponse) => (req: HttpRequest, res: HttpResponse) =>
     req.label === label ? change(res) : res;
+  /** The op the coordinator holds for this user's occ/{occ}/status. */
+  const statusOp = async (userId: string): Promise<string | undefined> => {
+    const { rows } = await env.db.admin.query<{ op: string }>("SELECT op FROM facet_state WHERE user_id = $1 AND facet_key LIKE 'occ/%/status'", [userId]);
+    return rows[0]?.op;
+  };
 
   it('fails when Status does not answer', async () => {
     expect((await smokeAgainst(on('smoke:status', (res) => withStatus(res, 503, '{"code":"unavailable"}')))).detail).toMatch(/Status answered 503/);
@@ -182,6 +187,29 @@ describe('the smoke, when the coordinator misbehaves', () => {
     const result = await smokeAgainst(on('smoke:push', pushAnswer([{ outcome: PushOutcome.REJECTED, reason: 'device_mismatch: the version names another device' }, { outcome: PushOutcome.APPLIED }])));
     expect(result.detail).toMatch(/REJECTED device_mismatch/);
     expect(result.detail).not.toMatch(/WK-05b/);
+    // The status was APPLIED, so a copy is live although the head was refused: it is tombstoned.
+    expect(result.detail).toMatch(/; cleanup: the copy's status tombstoned$/);
+  });
+
+  it('tombstones the copy when Delta fails or misses it after an APPLIED Push', async () => {
+    const failed = await smokeAgainst(on('smoke:delta', (res) => withStatus(res, 400, '{"code":"invalid_argument"}')));
+    expect(failed).toMatchObject({ verdict: 'FAIL', detail: "Delta answered 400 invalid_argument; cleanup: the copy's status tombstoned" });
+    expect(await statusOp(last.userId)).toBe('delete');
+    const missed = await smokeAgainst(on('smoke:delta', (res) => ({ ...res, body: new Uint8Array() })));
+    expect(missed).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/^Delta from the Status cursor did not show .* as pushed; cleanup: the copy's status tombstoned$/) });
+    expect(await statusOp(last.userId)).toBe('delete');
+  });
+
+  it('says a copy is left live when that cleanup is refused too', async () => {
+    const result = await smokeAgainst((req, res) =>
+      req.label === 'smoke:delta' ? withStatus(res, 400, '{"code":"invalid_argument"}') : req.label === 'smoke:push-cleanup' ? withStatus(res, 503, '{"code":"unavailable"}') : res,
+    );
+    expect(result.detail).toMatch(/^Delta answered 400 invalid_argument; and the cleanup tombstone of occ\/[0-9a-f-]{36}\/status was not applied \(503 unavailable\): a wished copy is left live$/);
+  });
+
+  it('tombstones nothing when the Push did not apply the status', async () => {
+    await smokeAgainst(on('smoke:push', pushAnswer([{ outcome: PushOutcome.APPLIED }, { outcome: PushOutcome.REJECTED, reason: 'payload_invalid: x' }])));
+    expect(last.log.some((e) => e.request.label === 'smoke:push-cleanup')).toBe(false);
   });
 
   it('fails when the Push answers for fewer events than it sent', async () => {

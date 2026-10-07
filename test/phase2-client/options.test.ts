@@ -81,6 +81,15 @@ describe('parseOptions', () => {
     expect(() => parseOptions(['--issuer', 'not a url'])).toThrow(/absolute URL/);
   });
 
+  it('names the form it wants when a target or a redirect carries a default port', () => {
+    expect(() => parseOptions(['--target', `${CANARY}:443`])).toThrow(
+      `--target must be the bare origin '${CANARY}' (no path, no trailing slash, no default port), got '${CANARY}:443'`,
+    );
+    expect(() => parseOptions(['--redirect-uri', 'http://localhost:80/callback'])).toThrow(
+      "--redirect-uri must name its port, and not http's default 80, which a URL drops: got 'http://localhost:80/callback'",
+    );
+  });
+
   it('accepts only a loopback http redirect, because the listener is local', () => {
     expect(() => parseOptions(['--redirect-uri', 'https://figurecollecting.com/callback'])).toThrow(/loopback/);
     expect(() => parseOptions(['--redirect-uri', 'http://192.168.1.5:5173/callback'])).toThrow(/loopback/);
