@@ -3,6 +3,8 @@
 // every connection a real `npm run phase2` process makes. Then the live run's refusals: a target
 // that is not the coordinator stops the run before anyone is asked to sign in.
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:net';
 import path from 'node:path';
@@ -10,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import type { FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { generateClientKey } from '../../scripts/phase2-client/dpop.js';
-import { main, type MainDeps } from '../../scripts/phase2-client/main.js';
+import { liveDeps, main, type MainDeps } from '../../scripts/phase2-client/main.js';
 import { createFetchTransport, type HttpRequest, type Transport } from '../../scripts/phase2-client/transport.js';
 import { makeIssuer } from '../helpers/auth.js';
 import { signInLikeABrowser, startFakeOidcProvider, type FakeOidcProvider } from '../helpers/fakeOidcProvider.js';
@@ -81,6 +83,15 @@ describe('acceptance (b): --plan sends zero requests', () => {
     expect(transport.count).toBe(0);
   });
 
+  it('shows the B1 inputs it was given and a root prefix', async () => {
+    const c = capture(createFetchTransport());
+    const args = ['--target', CANARY, '--prefix', '', '--b1-request', '{"gtin14":"04573102591234","nowIso":"2026-09-14T12:00:00.000Z"}', '--b1-reference', '/evidence/a7.json'];
+    expect(await main(args, c.deps)).toBe(0);
+    expect(c.stdout()).toContain('prefix    (root)');
+    expect(c.stdout()).toContain('Compare (the --b1-request): 200, result_json byte-identical to /evidence/a7.json');
+    expect(c.stdout()).toContain('GET /auth/session with no credentials');
+  });
+
   it('opens no socket at all: a real process, watched by a listener that counts connections', async () => {
     let connections = 0;
     const watcher: Server = createServer((socket) => {
@@ -102,6 +113,26 @@ describe('acceptance (b): --plan sends zero requests', () => {
     } finally {
       await new Promise<void>((resolve) => watcher.close(() => resolve()));
     }
+  });
+});
+
+describe('liveDeps', () => {
+  it('is the real process: its streams, a fresh counted transport, the clock, and a file reader', async () => {
+    const deps = liveDeps();
+    expect(deps.stdout).toBe(process.stdout);
+    expect(deps.stderr).toBe(process.stderr);
+    expect(deps.transport.count).toBe(0);
+    expect(deps.now).toBe(Date.now);
+    expect(deps.pollMs).toBe(5_000);
+    expect(deps.generateKey).toBe(generateClientKey);
+    await expect(deps.openBrowser('https://example.invalid/')).resolves.toBeUndefined();
+    await expect(deps.awaitRestart()).resolves.toBeUndefined();
+    const started = Date.now();
+    await deps.sleep(20);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(15);
+    const file = path.join(mkdtempSync(path.join(tmpdir(), 'fc-phase2-deps-')), 'ref.json');
+    writeFileSync(file, 'abc');
+    expect(Array.from(await deps.readFile(file))).toEqual([97, 98, 99]);
   });
 });
 
@@ -137,14 +168,14 @@ describe('a live run that must stop early', () => {
   const live = ['--target', ORIGIN, '--confirm', '127.0.0.1:5999', '--redirect-uri', 'http://127.0.0.1:0/callback'];
 
   /** The coordinator over inject, the provider over a real socket: one transport for both. */
-  const routed = async (rewrite?: (req: HttpRequest) => boolean): Promise<Transport & { labels: string[] }> => {
+  const routed = async (rewrite?: (req: HttpRequest) => boolean, noncePeriodSeconds = 300): Promise<Transport & { labels: string[] }> => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const userId = randomUUID();
     let mint: () => Promise<string> = async () => '';
     provider = await startFakeOidcProvider({ clientId: CLIENT_ID, mintAccessToken: () => mint() });
     const issuer = await makeIssuer({ issuer: provider.issuer, audience: CLIENT_ID });
     mint = () => issuer.mint({ sub: userId });
-    app = buildCoordinator({ issuer, origin: ORIGIN, devices: memoryDevices(), logLines: [] });
+    app = buildCoordinator({ issuer, origin: ORIGIN, devices: memoryDevices(), logLines: [], noncePeriodSeconds });
     await app.ready();
     const coordinator = injectTransport(() => app!);
     const network = createFetchTransport();
@@ -209,6 +240,26 @@ describe('a live run that must stop early', () => {
     expect(c.stderr()).toContain('[redacted]');
     expect(c.stderr()).not.toContain(provider!.grants[0]!.accessToken);
   });
+
+  it('runs to the end on its own, and fails the run when the cleanup revoke is refused', async () => {
+    const transport = await routed(undefined, 0.3);
+    const refusing: Transport = {
+      get count() {
+        return transport.count;
+      },
+      request: async (req) => {
+        const res = await transport.request(req);
+        return req.label === 'cleanup' ? withStatus(res, 404, '{"error":"device_not_found"}') : res;
+      },
+    };
+    const c = capture(refusing, { openBrowser: signInLikeABrowser, sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)) });
+    // A short nonce period so B6 is quick, and no time for B7, which has no restart here.
+    const exit = await main([...live, '--issuer', provider!.issuer, '--nonce-period-seconds', '0.3', '--restart-timeout-seconds', '0.05'], c.deps);
+    expect(exit).toBe(1);
+    expect(c.stdout()).toMatch(/^cleanup +FAIL revoking the run's first device .* answered 404$/m);
+    expect(c.stdout()).toMatch(/^B7 +INCONCLUSIVE no restart observed/m);
+    expect(c.stdout()).toMatch(/^requests sent: \d+$/m);
+  }, 30_000);
 
   it('fails the sign-in when the enrolment is refused', async () => {
     const transport = await routed();

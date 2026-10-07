@@ -4,7 +4,16 @@
 // the real Fastify app, the real Push transaction, the real feed and the real Delta do the rest.
 // Every other key still goes through develop's validateEvent unchanged.
 import { randomUUID } from 'node:crypto';
-import { SyncOp, parseVersion } from '@figurecollecting/fc-api-contract';
+import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
+import {
+  DeltaRequestSchema,
+  DeltaResponseSchema,
+  PushOutcome,
+  PushResponseSchema,
+  SyncEventSchema,
+  SyncOp,
+  parseVersion,
+} from '@figurecollecting/fc-api-contract';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createDeviceStore } from '../../src/auth/plugin.js';
@@ -119,8 +128,54 @@ describe('the smoke, when the coordinator misbehaves', () => {
     expect(result.detail).toMatch(/Delta from the Status cursor did not show/);
   });
 
+  it('fails when Delta shows the keys and versions but not the bytes that were pushed', async () => {
+    const result = await smokeAgainst(on('smoke:delta', (res) => {
+      const page = fromBinary(DeltaResponseSchema, res.body);
+      for (const event of page.events) if (event.payload !== '') event.payload = event.payload.replace('"tz":"', '"tz":"X');
+      return { ...res, body: toBinary(DeltaResponseSchema, page) };
+    }));
+    expect(result).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/did not show .*head, .*status as pushed/) });
+  });
+
   it('fails when Delta itself fails', async () => {
     expect((await smokeAgainst(on('smoke:delta', (res) => withStatus(res, 400, '{"code":"invalid_argument"}')))).detail).toMatch(/Delta answered 400/);
+  });
+
+  const pushAnswer = (results: { facetKey?: string; outcome: number; reason?: string }[]) => (res: HttpResponse): HttpResponse => ({
+    ...res,
+    status: 200,
+    body: toBinary(PushResponseSchema, create(PushResponseSchema, { results: results.map((r) => ({ facetKey: r.facetKey ?? 'k', outcome: r.outcome as PushOutcome, reason: r.reason ?? '' })) })),
+  });
+
+  it('reads past a page of someone else\'s events to find its own', async () => {
+    let first = true;
+    const result = await smokeAgainst((req, res) => {
+      if (req.label !== 'smoke:delta' || !first) return res;
+      first = false;
+      const asked = fromBinary(DeltaRequestSchema, req.body as Uint8Array);
+      const foreign = create(SyncEventSchema, { facetKey: 'uf/5b0c7c7e-2f1d-4c1e-9a1b-3c4d5e6f7a8b/note', version: '2026-10-07T00:00:00.000000Z#0000000000#00000000000000000000000000000001', op: SyncOp.UPSERT, payload: '{}' });
+      return { ...res, body: toBinary(DeltaResponseSchema, create(DeltaResponseSchema, { events: [foreign], hasMore: true, nextCursor: asked.cursor })) };
+    });
+    expect(result).toMatchObject({ verdict: 'PASS' });
+  });
+
+  it('names a rejection that is not the 0.2.x key refusal without blaming WK-05b', async () => {
+    const result = await smokeAgainst(on('smoke:push', pushAnswer([{ outcome: PushOutcome.REJECTED, reason: 'device_mismatch: the version names another device' }, { outcome: PushOutcome.APPLIED }])));
+    expect(result.detail).toMatch(/REJECTED device_mismatch/);
+    expect(result.detail).not.toMatch(/WK-05b/);
+  });
+
+  it('fails when the Push answers for fewer events than it sent', async () => {
+    expect((await smokeAgainst(on('smoke:push', pushAnswer([])))).detail).toMatch(/0 results for 2 events/);
+  });
+
+  it('names an outcome this client has no name for by its number', async () => {
+    expect((await smokeAgainst(on('smoke:push', pushAnswer([{ outcome: 9 }, { outcome: 9 }])))).detail).toMatch(/outcome 9/);
+  });
+
+  it('fails when the cleanup tombstone is answered but not applied', async () => {
+    expect((await smokeAgainst(on('smoke:push-cleanup', pushAnswer([{ outcome: PushOutcome.STALE }])))).detail).toMatch(/not applied \(STALE\)/);
+    expect((await smokeAgainst(on('smoke:push-cleanup', pushAnswer([])))).detail).toMatch(/not applied \(no result\)/);
   });
 
   it('fails, after a passing smoke, when the cleanup tombstone is not applied', async () => {

@@ -94,6 +94,18 @@ describe('discover', () => {
     await expect(discover(createFetchTransport(), p.issuer)).rejects.toThrow(/S256/);
   });
 
+  it('refuses an endpoint that is not a URL', async () => {
+    const p = await start((base) => ({ issuer: `${base}/application/o/fc-coordinator/`, authorization_endpoint: 'not a url', token_endpoint: `${base}/t` }));
+    await expect(discover(createFetchTransport(), p.issuer)).rejects.toThrow(/authorization_endpoint is not a URL/);
+  });
+
+  it('asks the issuer as configured, so one without its trailing slash is a different issuer', async () => {
+    const p = await start();
+    const t = createFetchTransport();
+    await expect(discover(t, p.issuer.replace(/\/$/, ''))).rejects.toThrow(/issuer/);
+    expect(t.count).toBe(1);
+  });
+
   it('refuses a provider that does not answer with a document', async () => {
     const p = await start();
     await expect(discover(createFetchTransport(), p.issuer.replace('fc-coordinator', 'missing'))).rejects.toThrow(/discovery/);
@@ -133,6 +145,21 @@ describe('the loopback listener and the code exchange', () => {
     expect((err as Error).message).not.toMatch(/never-issued-code/);
   });
 
+  it('keeps an OAuth error code only when it looks like one', async () => {
+    const d = { issuer: 'https://idp.example/', authorizationEndpoint: 'https://idp.example/a', tokenEndpoint: 'https://idp.example/t' };
+    const t = { count: 0, request: async () => ({ status: 400, headers: new Headers(), body: new TextEncoder().encode('{"error":"<b>code c-123</b>"}') }) };
+    const err = (await exchangeCode(t, d, { code: 'c-123', verifier: 'v', redirectUri: 'r', clientId: CLIENT_ID, now: Date.now }).catch((e: unknown) => e)) as Error;
+    expect(err.message).toBe('the token endpoint answered 400 (no OAuth error code)');
+  });
+
+  it('carries no id or refresh token it was not given', async () => {
+    const d = { issuer: 'https://idp.example/', authorizationEndpoint: 'https://idp.example/a', tokenEndpoint: 'https://idp.example/t' };
+    const t = { count: 0, request: async () => ({ status: 200, headers: new Headers(), body: new TextEncoder().encode('{"access_token":"abcdefghijk","expires_in":60}') }) };
+    expect(await exchangeCode(t, d, { code: 'c', verifier: 'v', redirectUri: 'r', clientId: CLIENT_ID, now: () => 0 })).toEqual({ accessToken: 'abcdefghijk', expiresAt: 60_000, secrets: [] });
+    const zero = { count: 0, request: async () => ({ status: 200, headers: new Headers(), body: new TextEncoder().encode('{"access_token":"abcdefghijk","expires_in":0}') }) };
+    await expect(exchangeCode(zero, d, { code: 'c', verifier: 'v', redirectUri: 'r', clientId: CLIENT_ID, now: () => 0 })).rejects.toThrow(/expires_in/);
+  });
+
   it('refuses a token response without an access token or a lifetime', async () => {
     const t = { count: 0, request: async () => ({ status: 200, headers: new Headers(), body: new TextEncoder().encode('{"token_type":"Bearer","expires_in":600}') }) };
     const d = { issuer: 'https://idp.example/', authorizationEndpoint: 'https://idp.example/a', tokenEndpoint: 'https://idp.example/t' };
@@ -149,6 +176,7 @@ describe('the loopback listener and the code exchange', () => {
     expect((await fetch(`${base.origin}/callback?code=c1&state=forged-state-value`)).status).toBe(400);
     expect((await fetch(`${base.origin}/elsewhere?code=c1&state=expected-state-value`)).status).toBe(404);
     expect((await fetch(`${base.origin}/callback?state=expected-state-value`)).status).toBe(400);
+    expect((await fetch(`${base.origin}/callback?code=c1`)).status).toBe(400);
     expect((await fetch(`${base.origin}/callback?code=the-code&state=expected-state-value`)).status).toBe(200);
     expect(await listener.code).toBe('the-code');
   });
@@ -163,9 +191,22 @@ describe('the loopback listener and the code exchange', () => {
     expect((err as Error).message).toBe('the authorization server refused the sign-in: access_denied');
   });
 
+  it('names an unrecognisable authorization error as such, echoing nothing', async () => {
+    listener = await listenForCallback({ redirectUri: new URL('http://127.0.0.1:0/callback'), state: 'expected-state-value', timeoutMs: 5_000 });
+    const pending = listener.code.catch((e: unknown) => e);
+    await fetch(`${new URL(listener.redirectUri).origin}/callback?error=%3Cscript%3E&state=expected-state-value`);
+    expect(((await pending) as Error).message).toBe('the authorization server refused the sign-in: unrecognised error');
+  });
+
   it('gives up after its timeout', async () => {
     listener = await listenForCallback({ redirectUri: new URL('http://127.0.0.1:0/callback'), state: 'expected-state-value', timeoutMs: 50 });
     await expect(listener.code).rejects.toThrow(/no sign-in within/);
+  });
+
+  it('says so when the redirect port is already held', async () => {
+    listener = await listenForCallback({ redirectUri: new URL('http://127.0.0.1:0/callback'), state: 's', timeoutMs: 5_000 });
+    const held = new URL(listener.redirectUri);
+    await expect(listenForCallback({ redirectUri: held, state: 's', timeoutMs: 50 })).rejects.toThrow(/cannot listen on 127.0.0.1:\d+ .*EADDRINUSE/);
   });
 
   it('refuses to listen anywhere but loopback', async () => {

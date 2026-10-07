@@ -106,5 +106,7 @@ describe('challengeError', () => {
     expect(challengeError('DPoP error="invalid_dpop_proof", error_description="x"')).toBe('invalid_dpop_proof');
     expect(challengeError(null)).toBeUndefined();
     expect(challengeError('Bearer realm="x"')).toBeUndefined();
+    // An error inside a non-DPoP challenge is not a DPoP verdict.
+    expect(challengeError('Bearer error="invalid_token"')).toBeUndefined();
   });
 });

@@ -108,6 +108,13 @@ async function harness(
 const onLabel = (label: string, change: (res: HttpResponse) => HttpResponse) => (req: HttpRequest, res: HttpResponse) =>
   req.label === label ? change(res) : res;
 
+/** The same status, but the DPoP challenge names another error: a rejection for the wrong reason. */
+const challenging = (error: string) => (res: HttpResponse): HttpResponse => {
+  const headers = new Headers(res.headers);
+  headers.set('www-authenticate', `DPoP error="${error}", error_description="x"`);
+  return { ...res, headers };
+};
+
 describe('preflight', () => {
   it('passes against a coordinator: 401, a DPoP challenge and a DPoP-Nonce, with no credentials sent', async () => {
     app = await coordinator();
@@ -127,7 +134,9 @@ describe('preflight', () => {
       headers.delete('dpop-nonce');
       return { ...res, headers };
     });
-    expect((await preflight(noNonce, { origin: ORIGIN, prefix: PREFIX })).detail).toMatch(/DPoP-Nonce/);
+    expect(await preflight(noNonce, { origin: ORIGIN, prefix: PREFIX })).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/carries no DPoP-Nonce/) });
+    const bare: Transport = { count: 0, request: async () => ({ status: 401, headers: new Headers(), body: new Uint8Array() }) };
+    expect((await preflight(bare, { origin: ORIGIN, prefix: PREFIX })).detail).toMatch(/not the coordinator's 401 DPoP challenge/);
   });
 });
 
@@ -143,6 +152,11 @@ describe('B5b: retry with the returned nonce and a fresh jti', () => {
   it('fails when the coordinator does not ask for a nonce', async () => {
     const h = await harness({ overrides: { requireNonce: false } });
     expect(await caseB5b(h.ctx)).toMatchObject({ verdict: 'FAIL' });
+  });
+
+  it('fails when the first answer is a 401 for another reason', async () => {
+    const h = await harness({ rewrite: onLabel('B5b:no-nonce', challenging('invalid_token')) });
+    expect(await caseB5b(h.ctx)).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/not 401 use_dpop_nonce/) });
   });
 
   it('fails when the retry is not accepted', async () => {
@@ -203,6 +217,11 @@ describe('B2: a valid token with no proof', () => {
     const h = await harness({ rewrite: onLabel('B2', (res) => withStatus(res, 200)) });
     expect(await caseB2(h.ctx)).toMatchObject({ verdict: 'FAIL' });
   });
+
+  it('fails on a 401 that refuses the token rather than the missing proof', async () => {
+    const h = await harness({ rewrite: onLabel('B2', challenging('invalid_token')) });
+    expect(await caseB2(h.ctx)).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/got 401 invalid_token/) });
+  });
 });
 
 describe('B3: a reused jti', () => {
@@ -230,7 +249,7 @@ describe('B4: a proof signed by another key', () => {
 
   it('fails when the control is refused, and when the stray key is accepted', async () => {
     let h = await harness({ rewrite: onLabel('B4:control', (res) => withStatus(res, 401)) });
-    expect((await caseB4(h.ctx)).detail).toMatch(/enrolled key/);
+    expect(await caseB4(h.ctx)).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/^the control from the enrolled key got 401/) });
     await app.close();
     h = await harness({ rewrite: onLabel('B4:stray', (res) => withStatus(res, 200)) });
     expect(await caseB4(h.ctx)).toMatchObject({ verdict: 'FAIL' });
@@ -245,6 +264,17 @@ describe('B9b: an htu naming the www host', () => {
     const proof = h.transport.log.find((e) => e.request.label === 'B9b:www')!.request.headers['dpop']!;
     const htu = JSON.parse(Buffer.from(proof.split('.')[1]!, 'base64url').toString('utf8')).htu as string;
     expect(htu).toBe('https://www.api.test.invalid/api/auth/session');
+  });
+
+  it('refuses to run against an IP-literal origin, which has no www. form to name', async () => {
+    app = await coordinator({ origin: 'http://127.0.0.1:5999' });
+    const t = recording(injectTransport(() => app), logLines);
+    const session = new Session(t, { origin: 'http://127.0.0.1:5999', prefix: PREFIX }, await issuer.mint({ sub: randomUUID() }), createSafeOutput({ write: () => true }, { write: () => true }));
+    const primary = await generateClientKey();
+    await session.enrol(primary, 'enrol');
+    const ctx: CaseContext = { session, primary, primaryDeviceId: '', generateKey: generateClientKey, now: Date.now, sleep: async () => {}, tokenExpiresAt: Date.now() + 600_000 };
+    expect(await caseB9b(ctx)).toMatchObject({ verdict: 'INCONCLUSIVE' });
+    expect(t.log.some((e) => e.request.label === 'B9b:www')).toBe(false);
   });
 
   it('fails when the control is refused, and when the www proof is accepted', async () => {
@@ -270,7 +300,11 @@ describe('B8: a revoked device, beside a live one', () => {
     expect((await caseB8(h.ctx)).detail).toMatch(/revoked/);
     await app.close();
     h = await harness({ rewrite: onLabel('B8:primary-after', (res) => withStatus(res, 401)) });
-    expect((await caseB8(h.ctx)).detail).toMatch(/other device/);
+    expect(await caseB8(h.ctx)).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/^the other device stopped working/) });
+    await app.close();
+    // 200, but bound as some other device: the half that must hold is THIS user's other device.
+    h = await harness({ rewrite: onLabel('B8:primary-after', (res) => withStatus(res, 200, '{"deviceId":"someone-else"}')) });
+    expect(await caseB8(h.ctx)).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/^the other device stopped working/) });
   });
 
   it('fails when the second device cannot be set up or revoked', async () => {
@@ -407,11 +441,18 @@ describe('B7: a nonce across a restart', () => {
     expect((await caseB7({ ...h.ctx, session }, { ...quick, awaitRestart: restart })).detail).toMatch(/not 401 use_dpop_nonce/);
   });
 
+  it('fails when the new process refuses the old-epoch nonce for another reason', async () => {
+    const { h, restart } = await restartable();
+    const lying = recording(h.transport, logLines, onLabel('B7:poll', (res) => (res.status === 401 ? challenging('invalid_dpop_proof')(res) : res)));
+    const session = new Session(lying, { origin: ORIGIN, prefix: PREFIX }, h.ctx.session.accessToken, createSafeOutput({ write: () => true }, { write: () => true }));
+    expect(await caseB7({ ...h.ctx, session }, { ...quick, awaitRestart: restart })).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/with 401 invalid_dpop_proof, not 401 use_dpop_nonce/) });
+  });
+
   it('fails when the replayed jti is refused after the restart', async () => {
     const { h, restart } = await restartable();
     const lying = recording(h.transport, logLines, onLabel('B7:replayed-jti', (res) => withStatus(res, 401)));
     const session = new Session(lying, { origin: ORIGIN, prefix: PREFIX }, h.ctx.session.accessToken, createSafeOutput({ write: () => true }, { write: () => true }));
-    expect((await caseB7({ ...h.ctx, session }, { ...quick, awaitRestart: restart })).detail).toMatch(/replay cache/);
+    expect(await caseB7({ ...h.ctx, session }, { ...quick, awaitRestart: restart })).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/the replay cache did not start empty/) });
   });
 
   it('fails when the request before the restart is refused', async () => {

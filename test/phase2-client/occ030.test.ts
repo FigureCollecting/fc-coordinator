@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   CONTRACT_030_PIN,
+  assertOccPayload,
   OCC_SMOKE_KEY,
   isOccSmokeKey,
   occKey,
@@ -51,7 +52,7 @@ describe('the smoke key grammar', () => {
     for (const v of vectors.invalid) expect(isOccSmokeKey(v.key), v.key).toBe(false);
     expect(isOccSmokeKey('holding/6f1c2b3a-4d5e-4f60-8a71-92b3c4d5e6f7/status')).toBe(false);
     expect(isOccSmokeKey('holding/6f1c2b3a-4d5e-4f60-8a71-92b3c4d5e6f7/count')).toBe(false);
-    expect(OCC_SMOKE_KEY.source.startsWith('^occ/')).toBe(true);
+    expect(OCC_SMOKE_KEY.exec('occ/6f1c2b3a-4d5e-4f60-8a71-92b3c4d5e6f7/status')?.groups).toEqual({ occ: '6f1c2b3a-4d5e-4f60-8a71-92b3c4d5e6f7', field: 'status' });
   });
 
   it('builds keys the way the golden build vectors do, folding case, and refuses what they refuse', () => {
@@ -85,5 +86,6 @@ describe('the smoke payloads', () => {
     expect(() => occPayload({ field: 'status', status: 'held' as 'wished', ...display })).toThrow(/occ\/status payload/);
     expect(() => occPayload({ field: 'head', headId: 'NOT-A-UUID', ...display })).toThrow(/occ\/head payload/);
     expect(() => occPayload({ field: 'status', status: 'owned', editedAt: '2026-10-07', tz: 'UTC' })).toThrow(/edited_at/);
+    expect(() => assertOccPayload('status', '{"status":"owned"}')).toThrow("occ/status payload: / must have required property 'edited_at'");
   });
 });

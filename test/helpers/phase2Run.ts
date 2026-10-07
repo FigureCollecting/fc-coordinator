@@ -55,7 +55,9 @@ export async function startRunEnv(): Promise<RunEnv> {
   issuer = await makeIssuer({ issuer: provider.issuer, audience: CLIENT_ID });
 
   const port = await freePort();
-  const origin = `http://127.0.0.1:${port}`;
+  // localhost, not 127.0.0.1: B9b needs a host with a www. form, and an IP literal has none.
+  // Fastify binds every address localhost resolves to, so the client reaches it either way.
+  const origin = `http://localhost:${port}`;
   const logLines: string[] = [];
   let generations = 0;
   let app: FastifyInstance | undefined;
@@ -70,7 +72,7 @@ export async function startRunEnv(): Promise<RunEnv> {
       spineUrl: spine.baseUrl,
       logLines,
     });
-    await app.listen({ port, host: '127.0.0.1' });
+    await app.listen({ port, host: 'localhost' });
     generations += 1;
   };
   await boot();
@@ -93,7 +95,7 @@ export async function startRunEnv(): Promise<RunEnv> {
       const exit = await main(
         [
           '--target', origin,
-          '--confirm', `127.0.0.1:${port}`,
+          '--confirm', `localhost:${port}`,
           '--issuer', provider.issuer,
           '--redirect-uri', 'http://127.0.0.1:0/callback',
           '--b1-request', B1_REQUEST,

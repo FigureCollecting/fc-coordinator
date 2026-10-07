@@ -54,6 +54,14 @@ describe('createSafeOutput', () => {
     expect(o.redactions).toBe(0);
   });
 
+  it('scrubs a secret of exactly the minimum length', () => {
+    const out = sink();
+    const o = createSafeOutput(out, sink());
+    o.secret('y'.repeat(MIN_SECRET_LENGTH));
+    o.out(`[${'y'.repeat(MIN_SECRET_LENGTH)}]`);
+    expect(out.text()).toBe(`[${REDACTED}]\n`);
+  });
+
   it('scrubs the longer of two overlapping secrets whole', () => {
     const out = sink();
     const o = createSafeOutput(out, sink());

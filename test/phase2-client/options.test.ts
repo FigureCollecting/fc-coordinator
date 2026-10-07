@@ -86,6 +86,8 @@ describe('parseOptions', () => {
     expect(() => parseOptions(['--redirect-uri', 'http://192.168.1.5:5173/callback'])).toThrow(/loopback/);
     expect(() => parseOptions(['--redirect-uri', 'nope'])).toThrow(/absolute URL/);
     expect(parseOptions(['--redirect-uri', 'http://127.0.0.1:0/callback']).redirectUri.port).toBe('0');
+    expect(() => parseOptions(['--redirect-uri', 'http://[::1]:5173/callback'])).toThrow(/loopback/);
+    expect(() => parseOptions(['--redirect-uri', 'http://localhost/callback'])).toThrow(/must name its port/);
   });
 
   it("validates the prefix with the coordinator's own rule", () => {
@@ -96,7 +98,8 @@ describe('parseOptions', () => {
   it('takes positive numbers only', () => {
     expect(() => parseOptions(['--nonce-period-seconds', '0'])).toThrow(/positive/);
     expect(() => parseOptions(['--nonce-period-seconds', 'abc'])).toThrow(/positive/);
-    expect(() => parseOptions(['--restart-timeout-seconds', '-1'])).toThrow(/positive/);
+    expect(() => parseOptions(['--restart-timeout-seconds=-1'])).toThrow(/positive/);
+    expect(() => parseOptions(['--restart-timeout-seconds', '-1'])).toThrow(UsageError);
     expect(parseOptions(['--nonce-period-seconds', '1.5']).noncePeriodSeconds).toBe(1.5);
     expect(parseOptions(['--restart-timeout-seconds', '60']).restartTimeoutSeconds).toBe(60);
   });
