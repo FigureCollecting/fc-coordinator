@@ -47,8 +47,9 @@ npm start        # node dist/server.js
 | `PGSSLMODE` | unset | `disable` \| `require` \| `verify-full`; production uses `verify-full` |
 | `PGSSLROOTCERT` | unset | path to the CA PEM for `verify-full` (contents are read, not the path) |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | collector endpoint; falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` |
-| `SPINE_READ_URL` | unset | ingest-server Connect base URL; **unset means Compare answers `UNAVAILABLE`** and no transport is built |
+| `SPINE_READ_URL` | unset | ingest-server's **gRPC h2c** read listener, `READ_H2C_PORT` (e.g. `http://ingest-server.<ns>.svc.cluster.local:50062`); **unset means Compare and GetProducts answer `UNAVAILABLE`** and no transport is built. The HTTP/1.1 port `:50052` no longer works with this client |
 | `SPINE_READ_TIMEOUT_MS` | `10000` | per-call deadline on the mesh hop |
+| `MEDIA_PUBLIC_BASE_URL` | unset | public base of the derivative image path. **Unset means `GetProductImages` returns nothing** and asks no one; set, it must be `https` with no credentials and no `?` or `#`, in canonical URL form exactly as a URL parser writes it (e.g. lower-case host, no default port, no surrounding whitespace, no dot segments), with no encoded slash or backslash (`%2F`, `%5C`), or the process refuses to start without echoing the value. Trailing slashes are trimmed, as the spine trims its copy |
 | `OPENFGA_GRPC_URL` `OPENFGA_STORE_ID` | unset | the entitlement Check, which is **gRPC over h2c on port 8081** (e.g. `http://openfga-mc-fc-ha.authz.svc.cluster.local:8081`); **unset means every Check denies** |
 | `OPENFGA_API_URL` | must be unset | the retired HTTP endpoint. **Setting it stops the process at boot**, naming the rename — there is no HTTP path left, so a manifest that still carries it would otherwise redact every read while looking configured |
 | `OPENFGA_MODEL_ID` `OPENFGA_APP_OBJECT` `OPENFGA_TIMEOUT_MS` | unset / `app:figurecollecting` / `2000` | optional Check settings. `OPENFGA_TIMEOUT_MS` becomes the gRPC call deadline. A `0` is refused and falls back: a deadline of zero has already expired when the call starts and would deny every read instantly |
@@ -117,6 +118,40 @@ people learn to ignore; the hash is what makes the offline copy evidence.
 That test is not theoretical — the proof-of-concept this work was built on
 numbered `authorization_model_id` 5, which upstream gives to `bool trace`, and it
 passed because both ends of it used the same wrong slice.
+
+### The spine wire, and CatalogService
+
+`SpineRead` (Compare, GetProducts, GetProductImages) is **gRPC over cleartext
+h2c** to ingest-server's `READ_H2C_PORT` (:50062), with mesh mTLS added by the
+Linkerd proxy (R4d; the shape R4a proved on prod). The client
+(`src/spine/spineReadClient.ts`) uses `createGrpcTransport`, which has no
+HTTP/1.1 mode, so moving to it is a flag day for this port: the
+`SPINE_READ_URL` change to :50062 ships in the same deploy as this image.
+`test/helpers/fakeSpineRead.ts` serves gRPC over h2c and nothing else, and
+records the content type and HTTP version of every stream.
+
+`coordinator.v1.CatalogService` (`src/connect/catalog.ts`):
+
+- **GetProducts** rejects an empty batch, more than 200 refs, or a blank ref
+  with `INVALID_ARGUMENT` before any spine call, mints the entitlement assertion
+  as Compare does, and maps each spine record onto a `ProductCard` through
+  `CARD_TEXT_ALLOWLIST`. Image URLs, originals and unknown keys cannot reach a
+  card because nothing outside that table is read. Each field carries its
+  claim's `as_of` as a canonical UTC instant, or an empty `as_of` when the value
+  came from a materialized column. A term the spine could not label never
+  shows as its bare uuid. `content_level` reads two keys: MFC's `contentLevel`
+  and the `r18` adult flag gkloot and solaris record. It is absent only when
+  the record's claims hold neither a `contentLevel` claim nor an `r18` claim
+  other than exactly `false`. It is `unknown` for a level claim it cannot read,
+  a level outside the contract's seven, an `attrs` that is not an object, and
+  an `r18` claim other than `false` unless the level already says 18+
+  (`explicit`, `controversial`, `nsfw`, `nsfw+`). No other key is read, so a
+  store that records adult content under any other key reaches the card with no
+  level. Pages pass through one to one.
+- **GetProductImages** returns nothing while `MEDIA_PUBLIC_BASE_URL` is unset.
+  When it is set, a row is kept only when its URL is exactly
+  `<base>/<derivative sha-256>`.
+- **SearchProducts** answers `UNIMPLEMENTED` until WK-17.
 
 ### OpenFGA's own status numbers
 
@@ -416,6 +451,7 @@ transaction control in a pending file, `6` out-of-order file.
 | `0001_identity.sql` | `app_user` (id **is** the Authentik uuid), `device` (DPoP `jkt` + public JWK, revoke-never-delete) |
 | `0002_collection.sql` | `collection`, `holding` — the HOLDING layer; spine references are TEXT, never foreign keys |
 | `0003_sync.sql` | `facet_state` (authoritative), `feed_event`, `feed_cursor`, `mutation_receipt` for SyncService; versions are `TEXT COLLATE "C"` with a grammar CHECK; the app role may not delete from any of them |
+| `0004_sync_transactions.sql` | `feed_event.opens_txn` (the first event of each server transaction, backfilled per database transaction) and `held_edit` (Push events answered HELD); the app role appends held edits and never rewrites them |
 
 ## Shared baseline
 
@@ -640,7 +676,7 @@ are in the emitted output.
 
 ## `coordinator.v1` — SyncService
 
-Delta, Push and Status over `0003_sync.sql`, behind the same DPoP guard as
+Delta, Push and Status over `0003_sync.sql` and `0004_sync_transactions.sql`, behind the same DPoP guard as
 Compare. The user is the token `sub` and the device is the DPoP binding.
 Push takes a per-user advisory lock first, so per user `seq` order is commit
 order and Delta never skips a late commit. Versions are ordered by
@@ -649,11 +685,33 @@ fc-api-contract's `compareVersion` in the handler, never by SQL `<`.
 
 A replayed `client_id` repeats each event's first outcome and reason (APPLIED
 as DUPLICATE); `current` is read at the replay. The REJECTED checks run in
-sync.proto's listed order, before any STALE or APPLIED routing, and a payload
+sync.proto's listed order, before any STALE, HELD or APPLIED routing, and a payload
 over 65,536 UTF-8 bytes is `payload_invalid`. Load bounds: a Push waits at
 most 5 s for its user's lock (then UNAVAILABLE), one user may have 8 Pushes
 running or queued per replica (then UNAVAILABLE), a queued Push whose client
 leaves is dropped, and a Connect request body over 16 MiB is RESOURCE_EXHAUSTED.
+
+Facet keys follow fc-api-contract 0.3.0 (sync.proto rule 6): Push takes the
+fourteen user-owned families (`occ/*`, `uf/*`, `coll/*/*/name`, `tag/*/name`,
+`res/*/*`, `pref/*/import`) and checks each payload against its family's
+schema. A server-owned key (`occ/{occ}/origin`, `imp/*`) and a retired 0.2.x
+`holding/*` key are REJECTED `facet_key_not_user_owned`; `holding/*` rows
+already stored stay inert. `scripts/holding-audit.sql` counts them in one
+read-only transaction (`psql -X -A -f scripts/holding-audit.sql`).
+
+Each Push is one server transaction (sync.proto rule 7): its written events
+are consecutive in the user's feed and Delta sets `commit_cursor` on the last
+one, so a 0.3.0 client applies a Push whole. `feed_event.opens_txn` marks each
+transaction's first event; the last is derived when Delta reads, so the feed
+stays append-only. Every pushed event needs `SyncEvent.basis`, `''` or a
+cursor: none, or one that is not a cursor, is REJECTED `basis_missing`, the
+last check. HELD is decided once per Push, before anything is applied, by a
+`HoldPolicy`; a held edit is kept in `held_edit` with its basis, not applied,
+answered with `current`, and HELD again on a replay. Until the import lands
+there is no frame, so the default policy holds nothing and every edit is
+placed by LWW whatever its basis. The start of a feed has one cursor, `''`:
+Status and `next_cursor` answer it while a user's feed is empty, so a client
+that has applied nothing compares equal and is not shown as behind.
 
 ## Phase-2 client (`scripts/phase2-client`)
 
@@ -686,11 +744,9 @@ npm run phase2 -- --target https://fc-api-canary.mindsignals1.com \
   both halves (the old nonce is refused on the nonce check, and a jti the old
   process accepted is accepted again).
 - **The smoke writes contract 0.3.0 keys**, `occ/{occ}/head` with
-  `occ/{occ}/status`, never `holding/*`. 0.3.0 is unpublished (fc-api-contract
-  PR #8), so the key shape and the two payload schemas are vendored from that
-  PR's head `555a107` under `vendor/` and pinned by sha256. A coordinator still
-  on 0.2.x rejects them `facet_key_not_user_owned` and the smoke fails, naming
-  WK-05b. Once a Push has applied the copy's status, the smoke tombstones it
+  `occ/{occ}/status`, never `holding/*`, built and checked by the installed
+  fc-api-contract. A coordinator still on 0.2.x rejects them
+  `facet_key_not_user_owned` and the smoke fails, naming WK-05b. Once a Push has applied the copy's status, the smoke tombstones it
   whatever failed after, and the run revokes each device it enrolled; a cleanup
   the coordinator refuses is a FAIL that says what is left. A run cut off
   (exit 2) skips the cleanup still ahead of it: its devices stay enrolled but

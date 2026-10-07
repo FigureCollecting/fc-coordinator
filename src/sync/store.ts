@@ -1,4 +1,4 @@
-// SQL over migrations/0003_sync.sql. Each function runs on the client it is handed, so Push can
+// SQL over migrations/0003_sync.sql and 0004_sync_transactions.sql. Each function runs on the client it is handed, so Push can
 // hold one transaction across them. Versions are ordered by the contract's compareVersion in
 // this process, never by SQL < or > (a locale collation is not bytewise).
 import { canonicalInstant, compareVersion, parseVersion } from '@figurecollecting/fc-api-contract';
@@ -28,6 +28,8 @@ export interface Facet {
 
 export interface FeedEvent extends Facet {
   seq: bigint;
+  /** The last event of its server transaction (sync.proto rule 7): Delta gives it commit_cursor. */
+  commits: boolean;
 }
 
 interface FacetRow {
@@ -43,6 +45,22 @@ const toFacet = (row: FacetRow): Facet => ({
   op: row.op,
   payload: row.payload,
 });
+
+/**
+ * One server transaction's writes to one user's feed (sync.proto rule 7): its first event opens
+ * it (feed_event.opens_txn) and Delta marks its last. Its writer holds lockUser, so its events
+ * are consecutive in the user's feed. One per Push; the import takes one the same way.
+ */
+export class FeedTransaction {
+  private opened = false;
+
+  /** Whether the event about to be written opens this transaction: only the first one does. */
+  opens(): boolean {
+    const first = !this.opened;
+    this.opened = true;
+    return first;
+  }
+}
 
 /** 'sync' in ASCII. The two-int key space never meets migrate.sh's single-bigint lock. */
 const LOCK_NAMESPACE = 0x73796e63;
@@ -102,42 +120,74 @@ export async function readFacet(db: SqlClient, userId: string, facetKey: string,
 
 /**
  * The one place a pushed version meets the stored one. The caller holds lockUser in a
- * transaction. Last writer wins per facet: equal or older is not applied.
+ * transaction, and writes every event of it in `feed`. Last writer wins per facet: equal or
+ * older is not applied.
  */
-export async function applyEvent(tx: SqlClient, userId: string, event: Facet): Promise<{ applied: boolean; current: Facet }> {
+export async function applyEvent(
+  tx: SqlClient,
+  userId: string,
+  event: Facet,
+  feed: FeedTransaction,
+): Promise<{ applied: boolean; current: Facet }> {
   const stored = await readFacet(tx, userId, event.facetKey, true);
   if (stored !== undefined && compareVersion(event.version, stored.version) <= 0) {
     return { applied: false, current: stored };
   }
   await tx.query(
     `WITH fed AS (
-       INSERT INTO feed_event (user_id, facet_key, version, op, payload)
-       VALUES ($1, $2, $3, $4, $5)
+       INSERT INTO feed_event (user_id, facet_key, version, op, payload, opens_txn)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING seq, user_id, facet_key, version, op, payload
      )
      INSERT INTO facet_state (user_id, facet_key, version, op, payload, seq)
      SELECT user_id, facet_key, version, op, payload, seq FROM fed
      ON CONFLICT (user_id, facet_key) DO UPDATE
        SET version = EXCLUDED.version, op = EXCLUDED.op, payload = EXCLUDED.payload, seq = EXCLUDED.seq`,
-    [userId, event.facetKey, event.version, event.op, event.payload],
+    [userId, event.facetKey, event.version, event.op, event.payload, feed.opens()],
   );
   return { applied: true, current: event };
 }
 
-/** One page of a user's feed after `afterSeq`, in seq order. */
+/** An edit a Push answered HELD (import.proto HELD): kept, not applied, with its basis. */
+export interface HeldEdit extends Facet {
+  clientId: string;
+  /** Its place in the Push. */
+  ordinal: number;
+  basisSeq: bigint;
+}
+
+/** Keep a held edit. The caller holds lockUser in the Push transaction. */
+export async function keepHeld(tx: SqlClient, userId: string, edit: HeldEdit): Promise<void> {
+  await tx.query(
+    `INSERT INTO held_edit (user_id, client_id, ordinal, facet_key, version, op, payload, basis_seq)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [userId, edit.clientId, edit.ordinal, edit.facetKey, edit.version, edit.op, edit.payload, edit.basisSeq.toString()],
+  );
+}
+
+/**
+ * One page of a user's feed after `afterSeq`, in seq order. An event commits its transaction when
+ * the user's next event opens one, or when there is no next event: one statement reads one
+ * snapshot, and a transaction is in it whole or not at all. The extra row read for has_more is
+ * that next event for the page's last.
+ */
 export async function readFeed(
   db: SqlClient,
   userId: string,
   afterSeq: bigint,
   limit: number,
 ): Promise<{ events: FeedEvent[]; hasMore: boolean }> {
-  const { rows } = await db.query<FacetRow & { seq: string }>(
-    `SELECT seq, facet_key, version, op, payload FROM feed_event
+  const { rows } = await db.query<FacetRow & { seq: string; opens_txn: boolean }>(
+    `SELECT seq, facet_key, version, op, payload, opens_txn FROM feed_event
       WHERE user_id = $1 AND seq > $2 ORDER BY seq LIMIT $3`,
     [userId, afterSeq.toString(), limit + 1],
   );
   return {
-    events: rows.slice(0, limit).map((row) => ({ ...toFacet(row), seq: BigInt(row.seq) })),
+    events: rows.slice(0, limit).map((row, i) => ({
+      ...toFacet(row),
+      seq: BigInt(row.seq),
+      commits: rows[i + 1]?.opens_txn ?? true,
+    })),
     hasMore: rows.length > limit,
   };
 }

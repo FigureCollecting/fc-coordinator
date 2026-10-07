@@ -124,7 +124,7 @@ afterAll(async () => {
  * exactly as src/server.ts calls it. No resolveIdentity is injected — the whole
  * point is that the default reads what the edge decorated.
  */
-async function start(options: { allow: boolean } = { allow: true }): Promise<Harness> {
+async function start(options: { allow: boolean; catalog?: boolean } = { allow: true }): Promise<Harness> {
   const kp = generateTestSigningKey(KID);
   process.env['ENTITLEMENT_SIGNING_KEY_PEM'] = kp.privatePem;
   process.env['ENTITLEMENT_SIGNING_KID'] = KID;
@@ -155,7 +155,12 @@ async function start(options: { allow: boolean } = { allow: true }): Promise<Har
         algorithms: config.oidcAlgorithms,
       }),
     },
-    compare: { spineRead: new SpineReadClient(spine.baseUrl) },
+    compare: {
+      spineRead: new SpineReadClient(spine.baseUrl),
+      ...(options.catalog === true
+        ? { catalog: { spineRead: new SpineReadClient(spine.baseUrl), mediaBaseUrl: null } }
+        : {}),
+    },
   });
 
   // Observe the REAL route table. Registered before ready(), which is the same
@@ -183,6 +188,13 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  // CLIENT BEFORE SERVER: drop the OpenFGA connection before its fake goes
+  // away. Closed the other way round, the fake's GOAWAY can be mid-flight when
+  // the reset aborts the session, and connect-node then emits the session's
+  // deferred error with no listener left (an uncaught "received GOAWAY without
+  // any open streams"). Which order wins was timing luck until the spine hop
+  // moved to h2c and shifted it.
+  resetEntitlementGrantsForTest();
   if (harness) {
     await harness.app.close();
     await harness.spine.close();
@@ -442,5 +454,88 @@ describe('a fully credentialed Connect unary POST', () => {
 
     expect(JSON.parse(res.resultJson).heads[0].perStore[0].offers[0].stockOnHand).toBe('7');
     expect(res.coverage?.redacted).toEqual([]);
+  });
+});
+
+// ===========================================================================
+// CatalogService (WK-07) — the same three levels, for the three new RPCs.
+// ===========================================================================
+const CATALOG_PATHS = [
+  '/coordinator.v1.CatalogService/GetProducts',
+  '/coordinator.v1.CatalogService/GetProductImages',
+  '/coordinator.v1.CatalogService/SearchProducts',
+];
+
+describe('the CatalogService routes', () => {
+  it('are registered, and NONE declares config.auth', async () => {
+    harness = await start({ allow: true, catalog: true });
+
+    const urls = harness.routes.map((r) => r.url);
+    for (const path of CATALOG_PATHS) expect(urls).toContain(path);
+    const optOuts = harness.routes.filter((r) => (r.config as { auth?: string } | undefined)?.auth !== undefined);
+    expect(optOuts).toEqual([]);
+  });
+
+  it.each(CATALOG_PATHS)('%s rejects an uncredentialed call and never reaches the spine', async (path) => {
+    harness = await start({ allow: true, catalog: true });
+
+    const res = await harness.app.inject({
+      method: 'POST',
+      url: path,
+      headers: { 'content-type': 'application/json', 'connect-protocol-version': '1' },
+      payload: JSON.stringify({ refs: [{ gtin14: GTIN }], headIds: ['x'], query: 'miku' }),
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect(harness.spine.wire).toHaveLength(0);
+    expect(harness.fga.calls).toHaveLength(0);
+  });
+
+  it('a credentialed GetProducts is minted for the subject the proof was signed for', async () => {
+    harness = await start({ allow: true, catalog: true });
+    const key = await makeDeviceKey();
+    const token = await harness.issuer.mint({ sub: SUB });
+    const first = await harness.app.inject({
+      method: 'POST',
+      url: '/auth/devices',
+      headers: {
+        authorization: `DPoP ${token}`,
+        dpop: await makeProof(key, { htm: 'POST', htu: `${TEST_ORIGIN}/auth/devices`, accessToken: token }),
+      },
+      payload: {},
+    });
+    let nonce = first.headers['dpop-nonce'] as string;
+    if (first.statusCode !== 200 && first.statusCode !== 201) {
+      const retry = await harness.app.inject({
+        method: 'POST',
+        url: '/auth/devices',
+        headers: {
+          authorization: `DPoP ${token}`,
+          dpop: await makeProof(key, { htm: 'POST', htu: `${TEST_ORIGIN}/auth/devices`, accessToken: token, nonce }),
+        },
+        payload: {},
+      });
+      expect([200, 201]).toContain(retry.statusCode);
+      nonce = retry.headers['dpop-nonce'] as string;
+    }
+
+    const path = CATALOG_PATHS[0] as string;
+    const res = await harness.app.inject({
+      method: 'POST',
+      url: path,
+      headers: {
+        'content-type': 'application/json',
+        'connect-protocol-version': '1',
+        authorization: `DPoP ${token}`,
+        dpop: await makeProof(key, { htm: 'POST', htu: `${TEST_ORIGIN}${path}`, accessToken: token, nonce }),
+      },
+      payload: JSON.stringify({ refs: [{ gtin14: GTIN }] }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body) as { products: { title?: { value: string } }[] };
+    expect(body.products[0]?.title?.value).toBe('Hatsune Miku Symphony 2025 Ver.');
+    expect(harness.fga.calls[0]?.user).toBe(`user:${SUB}`);
+    expect(harness.spine.productCalls[0]?.entitlementOutcome).toBe('granted');
   });
 });

@@ -3,9 +3,9 @@
 // nine proof-level cases give their expected outcome, and the run's stdout and stderr carry no
 // token, code, verifier, proof, nonce or JWK material.
 //
-// This coordinator is develop's, on fc-api-contract 0.2.1, so the sync smoke's 0.3.0 keys are
-// REJECTED here, and the client says so and exits 1: the smoke must never pass on a coordinator
-// that predates WK-05b. The passing smoke is in live-local-030.test.ts.
+// This coordinator is on fc-api-contract 0.3.0 (WK-05b), so the sync smoke's occ/{occ}/head and
+// occ/{occ}/status are APPLIED and the whole run passes. The smoke's failure paths, the refusal a
+// coordinator that predates 0.3.0 gives included, are in live-local-030.test.ts.
 import { fromBinary } from '@bufbuild/protobuf';
 import { PushRequestSchema } from '@figurecollecting/fc-api-contract';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -80,7 +80,7 @@ describe('acceptance (a): the nine cases against a local coordinator with the te
   });
 });
 
-describe('the sync smoke on a coordinator that predates contract 0.3.0', () => {
+describe('the sync smoke on a coordinator on contract 0.3.0', () => {
   it('pushes only occ/{occ}/head and occ/{occ}/status, never holding/*', () => {
     const pushes = run.log.filter((e) => e.request.label.startsWith('smoke:push'));
     expect(pushes.length).toBeGreaterThan(0);
@@ -93,14 +93,14 @@ describe('the sync smoke on a coordinator that predates contract 0.3.0', () => {
     expect(new Set(keys.map((k) => k.split('/').at(-1)))).toEqual(new Set(['head', 'status']));
   });
 
-  it('fails, naming the rejection and WK-05b, after a Status that answered', () => {
+  it('passes after a Status that answered: both keys APPLIED, and Delta shows both', () => {
     expect(run.log.find((e) => e.request.label === 'smoke:status')!.response!.status).toBe(200);
-    expect(line('smoke')).toMatch(/^smoke +FAIL .*facet_key_not_user_owned.*WK-05b/);
+    expect(line('smoke')).toMatch(/^smoke +PASS Status, then one Push \(occ\/[0-9a-f-]{36}\/head, occ\/[0-9a-f-]{36}\/status: APPLIED\)/);
   });
 
-  it('exits 1, and says how many cases passed', () => {
-    expect(run.exit).toBe(1);
-    expect(run.stdout).toMatch(/9 of 9 cases PASS; the sync smoke FAIL/);
+  it('exits 0, and says how many cases passed', () => {
+    expect(run.exit).toBe(0);
+    expect(run.stdout).toMatch(/9 of 9 cases PASS; the sync smoke PASS/);
   });
 });
 

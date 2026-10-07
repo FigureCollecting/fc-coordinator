@@ -1,7 +1,7 @@
 // SyncService's defensive branches, without a database: a context with no caller, and a Push
 // whose transaction fails part-way.
 import { randomUUID } from 'node:crypto';
-import { SyncOp, canonicalVersion, userFacetKey } from '@figurecollecting/fc-api-contract';
+import { SyncOp, canonicalVersion, occFacetKey } from '@figurecollecting/fc-api-contract';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../../src/app.js';
@@ -71,10 +71,11 @@ describe('a Push whose transaction fails', () => {
     clientId: randomUUID(),
     events: [
       {
-        facetKey: userFacetKey(randomUUID(), 'status'),
+        facetKey: occFacetKey(randomUUID(), 'status'),
         version: canonicalVersion({ instant: new Date(Date.now() - 1000), counter: 0, deviceId: DEVICE }),
         op: SyncOp.UPSERT,
         payload: '{}',
+        basis: '',
       },
     ],
   };
@@ -135,8 +136,33 @@ describe('the Connect options the process serves', () => {
     expect(app.hasRoute({ method: 'POST', url: '/coordinator.v1.CompareService/Compare' })).toBe(true);
   });
 
+  it('mount CatalogService beside them', async () => {
+    app = buildApp({ db: stubDb, logLevel: 'silent', compare: { ...productionConnectOptions(neverPool, {}), initSigning: false } });
+    await app.ready();
+    for (const method of ['GetProducts', 'GetProductImages', 'SearchProducts']) {
+      expect(app.hasRoute({ method: 'POST', url: `/coordinator.v1.CatalogService/${method}` })).toBe(true);
+    }
+  });
+
   it('take the spine from SPINE_READ_URL and run degraded without it', () => {
     expect(productionConnectOptions(neverPool, {}).spineRead).toBeNull();
     expect(productionConnectOptions(neverPool, { SPINE_READ_URL: 'http://spine.test.invalid' }).spineRead).toBeInstanceOf(SpineReadClient);
+  });
+
+  it('give Catalog the SAME spine client as Compare, and the media base from MEDIA_PUBLIC_BASE_URL', () => {
+    const off = productionConnectOptions(neverPool, { SPINE_READ_URL: 'http://spine.test.invalid' });
+    expect(off.catalog?.spineRead).toBe(off.spineRead);
+    // Unset by default: zero derivatives exist, so images stay off until configured.
+    expect(off.catalog?.mediaBaseUrl).toBeNull();
+
+    const on = productionConnectOptions(neverPool, { MEDIA_PUBLIC_BASE_URL: 'https://images.figurecollecting.com/d/' });
+    expect(on.catalog?.spineRead).toBeNull();
+    expect(on.catalog?.mediaBaseUrl).toBe('https://images.figurecollecting.com/d');
+  });
+
+  it('refuse to start on a media base that is not https', () => {
+    expect(() => productionConnectOptions(neverPool, { MEDIA_PUBLIC_BASE_URL: 'http://images.test/d' })).toThrow(
+      /MEDIA_PUBLIC_BASE_URL/,
+    );
   });
 });

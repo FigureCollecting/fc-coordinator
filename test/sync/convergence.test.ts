@@ -1,15 +1,38 @@
 // (1) Convergence. Two devices of one user, each on its own replica, edit offline (some edits
-// invalid, so REJECTED), push and pull in random interleavings, lose responses, and push
-// concurrently. Each device follows the contract's client rules, so the property is: both end on
-// the same facet map, equal to a replay from an empty cursor and to the server's facet_state.
+// invalid or minted with no basis, so REJECTED), push and pull in random interleavings, lose
+// responses, restart with a transaction half fetched, and push concurrently. Each device follows
+// the contract's 0.3.0 client rules (rule 7: a transaction is applied only once its commit_cursor
+// arrives, every edit carries its basis), so the property is: both end on the same facet map,
+// equal to a replay from an empty cursor and to the server's facet_state.
+// The edits span every 0.3.0 user-owned family (sync.proto rule 6), plus keys a client must never
+// push (a retired holding/* key, every server-owned family), which are always REJECTED.
 import { randomUUID } from 'node:crypto';
 import fc from 'fast-check';
 import {
+  COLLECTION_KINDS,
+  DISPOSAL_REASONS,
   Hlc,
+  IMPORT_ITEMS,
   PushOutcome,
+  SERVER_FACET_FAMILIES,
   SyncOp,
+  USER_FACET_FAMILIES,
+  answerKey,
+  collNameKey,
+  collectionRef,
   compareVersion,
-  userFacetKey,
+  importItemKey,
+  importMarkerKey,
+  importPrefKey,
+  occFacetKey,
+  occOriginKey,
+  occTagKey,
+  parseServerFacetKey,
+  parseUserFacetKey,
+  tagNameKey,
+  ufFacetKey,
+  ufKindTagKey,
+  ufTagKey,
   type HlcClock,
   type PushResult,
   type SyncEvent,
@@ -22,6 +45,18 @@ let db: SyncDatabase;
 let h: SyncApp;
 let h2: SyncApp;
 let rejected = 0;
+/** Families seen APPLIED, and edits on a key no client may push, across every run. */
+const appliedFamilies = new Set<string>();
+let refusedForeign = 0;
+let basisMissing = 0;
+/** Pulls that ended with events staged, and restarts that dropped some: rule 7 was exercised. */
+let stagedAcrossPages = 0;
+let restartsWhileStaged = 0;
+/** The class of every refused key: a server-owned family, or the retired holding/{h}/{field}. */
+const refusedFamilies = new Set<string>();
+const RETIRED = ['holding/status', 'holding/count'] as const;
+const refusedFamily = (key: string): string =>
+  parseServerFacetKey(key)?.family ?? key.replace(/^holding\/[^/]+\/([^/]+)$/, 'holding/$1');
 
 beforeAll(async () => {
   db = await startSyncDatabase();
@@ -40,14 +75,19 @@ interface Facet {
   op: SyncOp;
   payload: string;
 }
-type Edit = { facetKey: string } & Facet;
+type Edit = { facetKey: string; basis?: string } & Facet;
 
 /** A device that follows sync.proto's client rules and nothing else. */
 class SimDevice {
   readonly local = new Map<string, Facet>();
   private outbox: Edit[] = [];
   private inflight: { clientId: string; events: Edit[] } | undefined;
+  /** Where the next Delta starts: past what is staged. */
   private cursor = '';
+  /** The commit_cursor of the last transaction applied: every edit's basis, and where a restart resumes. */
+  private committed = '';
+  /** Fetched, waiting for the event that carries its transaction's commit_cursor. */
+  staged: SyncEvent[] = [];
   private readonly hlc: Hlc;
 
   constructor(
@@ -57,10 +97,11 @@ class SimDevice {
     this.hlc = new Hlc({ deviceId: caller.deviceId, clock });
   }
 
-  edit(facetKey: string, op: SyncOp, payload: string): void {
+  /** Mint an edit on the last transaction applied; `noBasis` mints one a 0.3.0 server refuses. */
+  edit(facetKey: string, op: SyncOp, payload: string, noBasis = false): void {
     const version = this.hlc.tick(this.local.get(facetKey)?.version);
     this.local.set(facetKey, { version, op, payload });
-    this.outbox.push({ facetKey, version, op, payload });
+    this.outbox.push({ facetKey, version, op, payload, ...(noBasis ? {} : { basis: this.committed }) });
   }
 
   /** Send the frozen batch, or freeze the outbox into a new one. A dropped response keeps it frozen. */
@@ -80,9 +121,24 @@ class SimDevice {
   async delta(limit: number, drop: boolean): Promise<boolean> {
     const page = ok(await this.caller.delta({ cursor: this.cursor, limit }));
     if (drop) return true;
-    for (const event of page.events) this.offer(event);
+    for (const event of page.events) {
+      expect(event.basis).toBeUndefined();
+      this.staged.push(event);
+      if (event.commitCursor === '') continue;
+      for (const staged of this.staged) this.offer(staged);
+      this.staged = [];
+      this.committed = event.commitCursor;
+    }
+    if (this.staged.length > 0) stagedAcrossPages += 1;
     this.cursor = page.nextCursor;
     return page.hasMore;
+  }
+
+  /** What was staged in memory is gone; the next pull resumes from the last commit applied. */
+  restart(): void {
+    if (this.staged.length > 0) restartsWhileStaged += 1;
+    this.staged = [];
+    this.cursor = this.committed;
   }
 
   async settleAll(): Promise<void> {
@@ -94,6 +150,18 @@ class SimDevice {
     expect(result.facetKey).toBe(sent.facetKey);
     expect([PushOutcome.APPLIED, PushOutcome.DUPLICATE, PushOutcome.STALE, PushOutcome.REJECTED]).toContain(result.outcome);
     if (result.outcome === PushOutcome.REJECTED) rejected += 1;
+    if (result.reason.startsWith('basis_missing')) {
+      expect(sent.basis).toBeUndefined();
+      basisMissing += 1;
+    }
+    const family = parseUserFacetKey(sent.facetKey)?.family;
+    if (family === undefined) {
+      expect([result.outcome, result.reason.split(':')[0]]).toEqual([PushOutcome.REJECTED, 'facet_key_not_user_owned']);
+      refusedForeign += 1;
+      refusedFamilies.add(refusedFamily(sent.facetKey));
+    } else if (result.outcome === PushOutcome.APPLIED) {
+      appliedFamilies.add(family);
+    }
     const local = this.local.get(sent.facetKey);
     if (local?.version === sent.version) {
       if (result.current) this.adopt(result.current);
@@ -114,20 +182,106 @@ class SimDevice {
   }
 }
 
+const OCCS = [randomUUID(), randomUUID(), randomUUID()];
 const HEADS = [randomUUID(), randomUUID(), randomUUID()];
-const FIELDS = ['status', 'count', 'score', 'note'] as const;
+const TAGS = [randomUUID(), randomUUID()];
+const COLLS = [randomUUID(), randomUUID()];
+/** Keys a client never pushes: the retired 0.2.x grain and every server-owned family. */
+const FOREIGN = [...RETIRED, ...SERVER_FACET_FAMILIES] as const;
+const FAMILIES = [...USER_FACET_FAMILIES, ...FOREIGN];
+type Family = (typeof FAMILIES)[number];
 
-function payloadFor(field: (typeof FIELDS)[number], n: number): string {
-  switch (field) {
-    case 'status':
-      return JSON.stringify({ status: ['owned', 'ordered', 'wished'][n % 3], ...DISPLAY });
-    case 'count':
-      return JSON.stringify({ count: 1 + (n % 9999), ...DISPLAY });
-    case 'score':
-      return JSON.stringify({ score: 1 + (n % 10), ...DISPLAY });
-    case 'note':
-      return JSON.stringify({ note: `note ${n}`, ...DISPLAY });
+const pick = <T>(list: readonly T[], n: number): T => list[n % list.length]!;
+const collId = (n: number) => (n % 3 === 0 ? 'default' : pick(COLLS, n));
+
+/** Slot `i` of a family: a small id space, so edits collide on keys. */
+function keyFor(family: Family, i: number): string {
+  switch (family) {
+    case 'occ/head':
+    case 'occ/status':
+    case 'occ/collection':
+    case 'occ/disposal':
+      return occFacetKey(pick(OCCS, i), family.slice(4) as 'head');
+    case 'occ/tag':
+      return occTagKey(pick(OCCS, i), pick(TAGS, i));
+    case 'uf/score':
+    case 'uf/note':
+    case 'uf/wishability':
+      return ufFacetKey(pick(HEADS, i), family.slice(3) as 'score');
+    case 'uf/tag':
+      return ufTagKey(pick(HEADS, i), pick(TAGS, i));
+    case 'uf/ktag':
+      return ufKindTagKey(pick(HEADS, i), pick(COLLECTION_KINDS, i), pick(TAGS, i));
+    case 'coll/name':
+      return collNameKey(pick(COLLECTION_KINDS, i), collId(i));
+    case 'tag/name':
+      return tagNameKey(pick(TAGS, i));
+    case 'res/answer':
+      return answerKey('mfc', pick(HEADS, i));
+    case 'pref/import':
+      return importPrefKey('mfc');
+    case 'holding/status':
+    case 'holding/count':
+      return `holding/${pick(HEADS, i)}/${family.slice(8)}`;
+    case 'occ/origin':
+      return occOriginKey(pick(OCCS, i));
+    case 'imp/figure':
+    case 'imp/held':
+    case 'imp/change':
+    case 'imp/align':
+      return importItemKey('mfc', family.slice(4) as 'figure', pick(HEADS, i));
+    case 'imp/import':
+      return importMarkerKey('mfc');
   }
+}
+
+function payloadFor(family: Family, n: number): string {
+  const body = ((): object => {
+    switch (family) {
+      case 'occ/head':
+        return { head_id: pick(HEADS, n) };
+      case 'occ/status':
+        return { status: pick(COLLECTION_KINDS, n) };
+      case 'occ/collection':
+        return { collection: collectionRef(pick(COLLECTION_KINDS, n), collId(n)) };
+      case 'occ/disposal':
+        return n % 2 === 0 ? { reason: pick(DISPOSAL_REASONS, n) } : { reason: pick(DISPOSAL_REASONS, n), note: `disposal ${n}` };
+      case 'occ/tag':
+      case 'uf/tag':
+      case 'uf/ktag':
+        return {};
+      case 'uf/score':
+        return { score: 1 + (n % 10) };
+      case 'uf/note':
+        return { note: `note ${n}` };
+      case 'uf/wishability':
+        return { wishability: 1 + (n % 5) };
+      case 'coll/name':
+      case 'tag/name':
+        return { name: `name ${n}` };
+      case 'res/answer':
+        return n % 2 === 0
+          ? { item: pick(IMPORT_ITEMS, n), rev: `r${n}`, choice: 'per_copy', copies: [{ occ: pick(OCCS, n), status: 'removed' }] }
+          : { item: pick(IMPORT_ITEMS, n), rev: `r${n}`, choice: pick(['keep', 'take', 'undo', 'dismiss'], n) };
+      case 'pref/import':
+        return { import_policy: pick(['ASK', 'FAVOR_APP', 'FAVOR_MFC'], n) };
+      case 'holding/status':
+        return { status: 'owned' };
+      case 'holding/count':
+        return { count: 1 + (n % 3) };
+      case 'occ/origin':
+        return { site: 'mfc', native_id: String(n + 1), ordinal: 1 };
+      case 'imp/figure':
+      case 'imp/held':
+      case 'imp/change':
+      case 'imp/align':
+      case 'imp/import':
+        // Refused on the key before any payload is read, so a bare rev stands in for each schema.
+        return { rev: `r${n}` };
+    }
+  })();
+  // A server-owned payload carries no display time; every client-written payload does.
+  return JSON.stringify((SERVER_FACET_FAMILIES as readonly string[]).includes(family) ? body : { ...body, ...DISPLAY });
 }
 
 const device = fc.constantFrom(0 as const, 1 as const);
@@ -137,10 +291,11 @@ const command = fc.oneof(
     arbitrary: fc.record({
       kind: fc.constant('edit' as const),
       d: device,
-      head: fc.nat({ max: HEADS.length - 1 }),
-      field: fc.constantFrom(...FIELDS),
+      slot: fc.nat({ max: 11 }),
+      family: fc.constantFrom(...FAMILIES),
       remove: fc.nat({ max: 4 }).map((n) => n === 0),
       bad: fc.nat({ max: 3 }).map((n) => n === 0),
+      noBasis: fc.nat({ max: 7 }).map((n) => n === 0),
       n: fc.nat({ max: 1000 }),
       tickMs: fc.nat({ max: 2 }),
     }),
@@ -149,8 +304,16 @@ const command = fc.oneof(
   { weight: 1, arbitrary: fc.record({ kind: fc.constant('pushBoth' as const), drops: fc.tuple(fc.boolean(), fc.boolean()) }) },
   {
     weight: 2,
-    arbitrary: fc.record({ kind: fc.constant('delta' as const), d: device, limit: fc.integer({ min: 1, max: 4 }), drop: fc.boolean() }),
+    arbitrary: fc.record({
+      kind: fc.constant('delta' as const),
+      d: device,
+      limit: fc.integer({ min: 1, max: 4 }),
+      drop: fc.boolean(),
+      restart: fc.boolean(),
+    }),
   },
+  // A copy filed in one go: its head, status and collection, three events of one transaction.
+  { weight: 1, arbitrary: fc.record({ kind: fc.constant('copy' as const), d: device, slot: fc.nat({ max: 11 }), n: fc.nat({ max: 1000 }) }) },
 );
 
 const sorted = (map: Map<string, Facet>) => [...map.entries()].sort(([a], [b]) => (a < b ? -1 : 1));
@@ -175,9 +338,9 @@ describe('(1) convergence', () => {
           switch (cmd.kind) {
             case 'edit': {
               t += cmd.tickMs;
-              const key = userFacetKey(HEADS[cmd.head]!, cmd.field);
-              const payload = cmd.bad ? JSON.stringify({ unknown_field: true, ...DISPLAY }) : payloadFor(cmd.field, cmd.n);
-              devices[cmd.d].edit(key, cmd.remove ? SyncOp.DELETE : SyncOp.UPSERT, cmd.remove ? '' : payload);
+              const key = keyFor(cmd.family, cmd.slot);
+              const payload = cmd.bad ? JSON.stringify({ unknown_field: true, ...DISPLAY }) : payloadFor(cmd.family, cmd.n);
+              devices[cmd.d].edit(key, cmd.remove ? SyncOp.DELETE : SyncOp.UPSERT, cmd.remove ? '' : payload, cmd.noBasis);
               break;
             }
             case 'push':
@@ -188,6 +351,13 @@ describe('(1) convergence', () => {
               break;
             case 'delta':
               await devices[cmd.d].delta(cmd.limit, cmd.drop);
+              if (cmd.restart) devices[cmd.d].restart();
+              break;
+            case 'copy':
+              for (const family of ['occ/head', 'occ/status', 'occ/collection'] as const) {
+                t += 1;
+                devices[cmd.d].edit(keyFor(family, cmd.slot), SyncOp.UPSERT, payloadFor(family, cmd.n));
+              }
               break;
           }
         }
@@ -198,6 +368,8 @@ describe('(1) convergence', () => {
 
         const replay = new SimDevice(a, clock);
         while (await replay.delta(replayPage, false));
+        // The feed ends on a commit: a caught-up client holds nothing staged.
+        expect([devices[0].staged, devices[1].staged, replay.staged]).toEqual([[], [], []]);
 
         const server = await db.admin.query<{ facet_key: string; version: string; op: string; payload: string }>(
           'SELECT facet_key, version, op, payload FROM facet_state WHERE user_id = $1',
@@ -218,19 +390,36 @@ describe('(1) convergence', () => {
         examples: [
           [
             [
-              { kind: 'edit', d: 1, head: 0, field: 'score', remove: false, bad: false, n: 3, tickMs: 1 },
-              { kind: 'edit', d: 0, head: 0, field: 'score', remove: false, bad: true, n: 0, tickMs: 1 },
+              { kind: 'edit', d: 1, slot: 0, family: 'uf/score', remove: false, bad: false, noBasis: false, n: 3, tickMs: 1 },
+              { kind: 'edit', d: 0, slot: 0, family: 'uf/score', remove: false, bad: true, noBasis: false, n: 0, tickMs: 1 },
               { kind: 'push', d: 0, drop: true },
               { kind: 'push', d: 1, drop: false },
-              { kind: 'delta', d: 0, limit: 4, drop: false },
+              { kind: 'delta', d: 0, limit: 4, drop: false, restart: false },
               { kind: 'push', d: 0, drop: false },
             ],
             1,
+          ],
+          // A restart with a copy half fetched: the client drops what it staged and fetches it
+          // again from the last commit it applied.
+          [
+            [
+              { kind: 'copy', d: 0, slot: 1, n: 5 },
+              { kind: 'push', d: 0, drop: false },
+              { kind: 'delta', d: 1, limit: 1, drop: false, restart: true },
+              { kind: 'delta', d: 1, limit: 2, drop: false, restart: false },
+            ],
+            2,
           ],
         ],
       },
     );
     expect(runs).toBeGreaterThanOrEqual(200);
     expect(rejected).toBeGreaterThan(50);
+    expect([...appliedFamilies].sort()).toEqual([...USER_FACET_FAMILIES].sort());
+    expect(refusedForeign).toBeGreaterThan(10);
+    expect(basisMissing).toBeGreaterThan(10);
+    expect(stagedAcrossPages).toBeGreaterThan(50);
+    expect(restartsWhileStaged).toBeGreaterThan(0);
+    expect([...refusedFamilies].sort()).toEqual([...SERVER_FACET_FAMILIES, ...RETIRED].sort());
   }, 600_000);
 });

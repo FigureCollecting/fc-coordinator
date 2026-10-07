@@ -31,6 +31,7 @@ import { createAccessTokenVerifier } from '../../src/auth/oidc.js';
 import { createDeviceStore } from '../../src/auth/plugin.js';
 import { productionConnectOptions } from '../../src/connect/register.js';
 import type { KeyedSerialiser } from '../../src/sync/serialise.js';
+import type { HoldPolicy } from '../../src/sync/service.js';
 import { makeDeviceKey, makeIssuer, makeProof, TEST_ORIGIN, type DeviceKey, type TestIssuer } from './auth.js';
 
 export const SYNC_SERVICE_PATH = '/coordinator.v1.SyncService';
@@ -43,10 +44,15 @@ export interface SyncApp {
 
 /**
  * Production wiring, as src/server.ts assembles it, minus the spine. Pass the issuer of a running
- * app to start a second replica on the same database that accepts the same tokens, and a Push
- * queue to watch it.
+ * app to start a second replica on the same database that accepts the same tokens, a Push queue
+ * to watch it, and a hold policy to stand in for the import's (import.proto HELD).
  */
-export async function startSyncApp(db: pg.Pool, sharedIssuer?: TestIssuer, writers?: KeyedSerialiser): Promise<SyncApp> {
+export async function startSyncApp(
+  db: pg.Pool,
+  sharedIssuer?: TestIssuer,
+  writers?: KeyedSerialiser,
+  holds?: HoldPolicy,
+): Promise<SyncApp> {
   const issuer = sharedIssuer ?? (await makeIssuer());
   const config = resolveAuthConfig({
     OIDC_ISSUER: issuer.issuer,
@@ -67,7 +73,11 @@ export async function startSyncApp(db: pg.Pool, sharedIssuer?: TestIssuer, write
         algorithms: config.oidcAlgorithms,
       }),
     },
-    compare: { ...productionConnectOptions(db, {}), ...(writers !== undefined ? { sync: { db, writers } } : {}), initSigning: false },
+    compare: {
+      ...productionConnectOptions(db, {}),
+      ...(writers !== undefined || holds !== undefined ? { sync: { db, ...(writers !== undefined ? { writers } : {}), ...(holds !== undefined ? { holds } : {}) } } : {}),
+      initSigning: false,
+    },
   });
   await app.ready();
   return { app, issuer, close: () => app.close() };

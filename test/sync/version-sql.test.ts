@@ -7,7 +7,7 @@ import { createRequire } from 'node:module';
 import fc from 'fast-check';
 import { isCanonicalVersion } from '@figurecollecting/fc-api-contract';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { applyEvent, lockUser, serverNow, type Facet } from '../../src/sync/store.js';
+import { FeedTransaction, applyEvent, lockUser, serverNow, type Facet } from '../../src/sync/store.js';
 import { startSyncDatabase, SYNC_PG_LOCALE, type SyncDatabase } from '../helpers/syncDatabase.js';
 
 interface Golden {
@@ -47,7 +47,7 @@ async function apply(userId: string, event: Facet): Promise<{ applied: boolean; 
   try {
     await client.query('BEGIN');
     await lockUser(client, userId);
-    const result = await applyEvent(client, userId, event);
+    const result = await applyEvent(client, userId, event, new FeedTransaction());
     await client.query('COMMIT');
     return result;
   } catch (err) {

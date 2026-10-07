@@ -1,21 +1,13 @@
 // The sync smoke's keys are contract 0.3.0's (Ross, GR 2026-09-26): occ/{occ}/status with its
-// occ/{occ}/head, never holding/*. 0.3.0 is unpublished (fc-api-contract PR #8), so the key shape
-// and the two payload schemas are VENDORED from that PR's head, byte for byte, and pinned here.
-import { createHash } from 'node:crypto';
+// occ/{occ}/head, never holding/*. They and their two payload schemas come from the installed
+// package, held here to its golden key vectors.
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { describe, expect, it } from 'vitest';
-import {
-  CONTRACT_030_PIN,
-  assertOccPayload,
-  OCC_SMOKE_KEY,
-  isOccSmokeKey,
-  occKey,
-  occPayload,
-} from '../../scripts/phase2-client/occ030.js';
+import { assertOccPayload, isOccSmokeKey, occKey, occPayload } from '../../scripts/phase2-client/occ030.js';
 
-const vendored = (rel: string): Buffer =>
-  readFileSync(fileURLToPath(new URL(`../../scripts/phase2-client/vendor/fc-api-contract-0.3.0/${rel}`, import.meta.url)));
+const require = createRequire(import.meta.url);
+const installed = (rel: string): string => readFileSync(require.resolve(`@figurecollecting/fc-api-contract/${rel}`), 'utf8');
 
 interface KeyVectors {
   valid: { key: string; parsed: { family: string; occId?: string } }[];
@@ -23,21 +15,12 @@ interface KeyVectors {
   build: { input: { family: string; occId?: string }; key: string }[];
   buildRejects: { input: { family: string; occId?: string } }[];
 }
-const vectors = JSON.parse(vendored('golden/key-vectors.json').toString('utf8')) as KeyVectors;
+const vectors = JSON.parse(installed('golden/key-vectors.json')) as KeyVectors;
 const SMOKE_FAMILIES = new Set(['occ/head', 'occ/status']);
 
-describe('the vendored 0.3.0 files', () => {
-  it('are byte-identical to fc-api-contract PR #8 at its pinned head', () => {
-    expect(CONTRACT_030_PIN.commit).toBe('555a1075b5dfbd3b6af52bab8242d4f48cccbdcf');
-    expect(CONTRACT_030_PIN.pr).toBe('FigureCollecting/fc-api-contract#8');
-    for (const [rel, sha256] of Object.entries(CONTRACT_030_PIN.sha256)) {
-      expect(createHash('sha256').update(vendored(rel)).digest('hex'), rel).toBe(sha256);
-    }
-    expect(Object.keys(CONTRACT_030_PIN.sha256).sort()).toEqual([
-      'golden/key-vectors.json',
-      'schemas/occ-head.schema.json',
-      'schemas/occ-status.schema.json',
-    ]);
+describe('the installed contract', () => {
+  it('is 0.3.x, the release that defines the occurrence keys', () => {
+    expect((JSON.parse(installed('package.json')) as { version: string }).version).toMatch(/^0\.3\.\d+$/);
   });
 });
 
@@ -52,7 +35,8 @@ describe('the smoke key grammar', () => {
     for (const v of vectors.invalid) expect(isOccSmokeKey(v.key), v.key).toBe(false);
     expect(isOccSmokeKey('holding/6f1c2b3a-4d5e-4f60-8a71-92b3c4d5e6f7/status')).toBe(false);
     expect(isOccSmokeKey('holding/6f1c2b3a-4d5e-4f60-8a71-92b3c4d5e6f7/count')).toBe(false);
-    expect(OCC_SMOKE_KEY.exec('occ/6f1c2b3a-4d5e-4f60-8a71-92b3c4d5e6f7/status')?.groups).toEqual({ occ: '6f1c2b3a-4d5e-4f60-8a71-92b3c4d5e6f7', field: 'status' });
+    expect(isOccSmokeKey('occ/6f1c2b3a-4d5e-4f60-8a71-92b3c4d5e6f7/origin')).toBe(false);
+    expect(isOccSmokeKey('occ/6f1c2b3a-4d5e-4f60-8a71-92b3c4d5e6f7/collection')).toBe(false);
   });
 
   it('builds keys the way the golden build vectors do, folding case, and refuses what they refuse', () => {
@@ -60,7 +44,7 @@ describe('the smoke key grammar', () => {
       expect(occKey(b.input.occId!, b.input.family.slice(4) as 'head' | 'status')).toBe(b.key);
     }
     for (const b of vectors.buildRejects.filter((v) => SMOKE_FAMILIES.has(v.input.family))) {
-      expect(() => occKey(b.input.occId!, b.input.family.slice(4) as 'head' | 'status')).toThrow(/uuid/);
+      expect(() => occKey(b.input.occId!, b.input.family.slice(4) as 'head' | 'status')).toThrow(/not an occurrence id/);
     }
     expect(occKey('6f1c2b3a-4d5e-4f60-8a71-92b3c4d5e6f7', 'head')).toBe('occ/6f1c2b3a-4d5e-4f60-8a71-92b3c4d5e6f7/head');
   });
@@ -69,7 +53,7 @@ describe('the smoke key grammar', () => {
 describe('the smoke payloads', () => {
   const display = { editedAt: '2026-10-07T03:15:00.250Z', tz: 'America/Chicago' };
 
-  it('are the closed 0.3.0 shapes, checked against the vendored schemas before they are pushed', () => {
+  it('are the closed 0.3.0 shapes, checked against the package schemas before they are pushed', () => {
     expect(JSON.parse(occPayload({ field: 'status', status: 'wished', ...display }))).toEqual({
       status: 'wished',
       edited_at: display.editedAt,

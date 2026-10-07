@@ -25,7 +25,7 @@
     "@connectrpc/connect": "^2.2.0",
     "@connectrpc/connect-fastify": "^2.2.0",
     "@connectrpc/connect-node": "^2.2.0",
-    "@figurecollecting/fc-api-contract": "^0.2.1",
+    "@figurecollecting/fc-api-contract": "^0.3.0",
     "@figurecollecting/fc-shared": "^1.7.0",
     "@figurecollecting/ingest-contract": "^0.5.0",
     "@opentelemetry/api": "^1.9.1",

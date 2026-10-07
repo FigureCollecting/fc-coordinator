@@ -1,6 +1,8 @@
-// coordinator.v1.SyncService: Delta, Push and Status over migrations/0003_sync.sql.
+// coordinator.v1.SyncService: Delta, Push and Status over migrations/0003_sync.sql and 0004.
 // The user is the token's `sub` and the device is the DPoP binding; the client names neither.
 // REVIEW is never emitted: there are no policy tables yet, so every user facet is AUTO_ACCEPT.
+// Each Push is one server transaction (sync.proto rule 7), and Delta gives its last event
+// commit_cursor. HELD is decided by a HoldPolicy; until the import supplies one, nothing is held.
 import { createHash } from 'node:crypto';
 import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
@@ -28,11 +30,13 @@ import { kCallerDevice, kCallerSubject } from '../connect/identity.js';
 import { decodeCursor, encodeCursor } from './cursor.js';
 import { KeyedSerialiser, QueueFull } from './serialise.js';
 import {
+  FeedTransaction,
   LOCK_NOT_AVAILABLE,
   applyEvent,
   boundLockWaits,
   feedHead,
   issuedHead,
+  keepHeld,
   lockUser,
   readFacet,
   readFeed,
@@ -42,6 +46,7 @@ import {
   transaction,
   writeReceipt,
   type Facet,
+  type FeedEvent,
   type SqlClient,
   type SyncPool,
   type TxClient,
@@ -59,14 +64,35 @@ export const PUSH_LOCK_TIMEOUT_MS = 5_000;
 export const MAX_QUEUED_PUSHES = 8;
 /**
  * The largest request body read, before any handler runs. 200 notes of 10,000 U+0001, which
- * JSON.stringify writes as \u0001 and the JSON envelope escapes again, are 14,064,954 bytes.
+ * JSON.stringify writes as \u0001 and the JSON envelope escapes again, each with the longest
+ * basis (the cursor of the largest seq), are 14,073,154 bytes.
  */
 export const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
+
+/** One event of a Push that passed every REJECTED check, as a HoldPolicy sees it. */
+export interface PushedEdit extends Facet {
+  /** Its place in the Push. */
+  index: number;
+  /** The seq its basis names; 0 for ''. */
+  basisSeq: bigint;
+}
+
+/**
+ * import.proto HELD: decided once, when a Push arrives, over its edits in push order, before
+ * any of them is applied. Runs in the Push transaction under the user lock and returns the
+ * indexes held.
+ */
+export type HoldPolicy = (tx: SqlClient, userId: string, edits: readonly PushedEdit[]) => Promise<ReadonlySet<number>>;
+
+/** No import has run, so no edit meets a frame and none is late: each is placed by LWW. */
+export const holdNothing: HoldPolicy = async () => new Set();
 
 export interface SyncRoutesDeps {
   db: SyncPool;
   /** The per-user Push queue; tests pass one in to watch it. */
   writers?: KeyedSerialiser;
+  /** Which edits a Push holds; holdNothing by default. */
+  holds?: HoldPolicy;
 }
 
 interface Caller {
@@ -84,12 +110,14 @@ function callerOf(ctx: HandlerContext): Caller {
   return { userId, deviceId };
 }
 
-const toWire = (facet: Facet): SyncEvent =>
+/** A facet on the wire, with commit_cursor when it is a Delta event that ends its transaction. */
+const toWire = (facet: Facet | FeedEvent): SyncEvent =>
   create(SyncEventSchema, {
     facetKey: facet.facetKey,
     version: facet.version,
     op: facet.op === 'delete' ? SyncOp.DELETE : SyncOp.UPSERT,
     payload: facet.payload,
+    commitCursor: 'commits' in facet && facet.commits ? encodeCursor(facet.seq) : '',
   });
 
 function result(facetKey: string, outcome: PushOutcome, current: Facet | undefined, reason = ''): PushResult {
@@ -126,6 +154,7 @@ async function replay(tx: SqlClient, userId: string, recorded: PushResponse): Pr
 export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) => void {
   const { db } = deps;
   const writers = deps.writers ?? new KeyedSerialiser(MAX_QUEUED_PUSHES);
+  const holds = deps.holds ?? holdNothing;
 
   const delta = async (req: DeltaRequest, ctx: HandlerContext): Promise<DeltaResponse> => {
     const caller = callerOf(ctx);
@@ -168,21 +197,33 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
       }
 
       const now = await serverNow(tx);
-      const results: PushResult[] = [];
-      for (const event of req.events) {
-        const verdict = validateEvent(event, { deviceHex, nowMicros: now.micros });
-        if (!verdict.ok) {
-          const current = verdict.userOwned ? await readFacet(tx, caller.userId, event.facetKey) : undefined;
-          results.push(result(event.facetKey, PushOutcome.REJECTED, current, verdict.reason));
-          continue;
-        }
-        const applied = await applyEvent(tx, caller.userId, {
+      const verdicts = req.events.map((event) => validateEvent(event, { deviceHex, nowMicros: now.micros }));
+      const facets = req.events.map(
+        (event): Facet => ({
           facetKey: event.facetKey,
           version: event.version,
           op: event.op === SyncOp.DELETE ? 'delete' : 'upsert',
           payload: event.payload,
-        });
-        results.push(result(event.facetKey, applied.applied ? PushOutcome.APPLIED : PushOutcome.STALE, applied.current));
+        }),
+      );
+      // Every REJECTED check runs before HELD routing: only an edit that passed them can be held.
+      const edits = verdicts.flatMap((verdict, index) => (verdict.ok ? [{ ...facets[index]!, index, basisSeq: verdict.basisSeq }] : []));
+      const held = await holds(tx, caller.userId, edits);
+
+      const feed = new FeedTransaction();
+      const results: PushResult[] = [];
+      for (const [index, verdict] of verdicts.entries()) {
+        const facet = facets[index]!;
+        if (!verdict.ok) {
+          const current = verdict.userOwned ? await readFacet(tx, caller.userId, facet.facetKey) : undefined;
+          results.push(result(facet.facetKey, PushOutcome.REJECTED, current, verdict.reason));
+        } else if (held.has(index)) {
+          await keepHeld(tx, caller.userId, { ...facet, clientId: req.clientId, ordinal: index, basisSeq: verdict.basisSeq });
+          results.push(result(facet.facetKey, PushOutcome.HELD, await readFacet(tx, caller.userId, facet.facetKey)));
+        } else {
+          const applied = await applyEvent(tx, caller.userId, facet, feed);
+          results.push(result(facet.facetKey, applied.applied ? PushOutcome.APPLIED : PushOutcome.STALE, applied.current));
+        }
       }
       const response = create(PushResponseSchema, { results });
       await writeReceipt(tx, caller.userId, req.clientId, requestSha256, Buffer.from(outcomesOf(response)));

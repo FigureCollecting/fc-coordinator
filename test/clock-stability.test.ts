@@ -100,13 +100,21 @@ describe('the suite does not read the wall clock twice for one assertion', () =>
     // and would go on being green after the fix was reverted, which is the one
     // failure mode a mechanical guard must not have. So the helper's own
     // arithmetic is measured: two consecutive reads, one step apart.
-    const probe = (step: string): number => {
+    //
+    // THE TWO READS ARE NOT SIMULTANEOUS. The helper returns the real clock
+    // plus the drift, so b - a is the step PLUS whatever real time passed
+    // between the reads, and Date.now() has a 1 ms tick. Asserting a bare
+    // `<= -1000` therefore demanded that zero milliseconds elapse, and failed
+    // as `-999` whenever the pair straddled a tick on a loaded runner. The real
+    // gap is measured with the monotonic clock, which the helper does not touch,
+    // and the residual after the step is held to that gap plus one tick.
+    const probe = (step: string): { delta: number; residual: number; gapMs: number } => {
       const run = spawnSync(
         'node',
         [
           '--input-type=module',
           '-e',
-          "await import('./test/helpers/steppingClock.ts'); const a = Date.now(); const b = Date.now(); console.log(b - a);",
+          "await import('./test/helpers/steppingClock.ts'); const t0 = performance.now(); const a = Date.now(); const b = Date.now(); const gapMs = performance.now() - t0; console.log(JSON.stringify({ delta: b - a, gapMs }));",
         ],
         { cwd: REPO, encoding: 'utf8', timeout: 60_000, env: childEnv({ CLOCK_STEP_MS: step }) },
       );
@@ -116,14 +124,22 @@ describe('the suite does not read the wall clock twice for one assertion', () =>
         .split('\n')
         .map((line) => line.trim())
         .filter((line) => line !== '');
-      return Number(lines.at(-1));
+      const { delta, gapMs } = JSON.parse(lines.at(-1) ?? 'null') as { delta: number; gapMs: number };
+      return { delta, gapMs, residual: delta - Number(step) };
     };
 
-    // Two reads a second apart, in whichever direction was asked for...
-    expect(probe('1000')).toBeGreaterThanOrEqual(1_000);
-    expect(probe('-1000')).toBeLessThanOrEqual(-1_000);
+    // Two reads a second apart, in whichever direction was asked for. The
+    // residual is the real time between the reads: never negative beyond one
+    // tick of rounding, never more than the measured gap plus one tick. A step
+    // of 5000 or of 0 would leave the residual at +-4000 or +-1000 and fail.
+    for (const step of ['1000', '-1000']) {
+      const measured = probe(step);
+      expect(Math.abs(measured.residual), `step ${step}: ${JSON.stringify(measured)}`).toBeLessThanOrEqual(
+        Math.ceil(measured.gapMs) + 1,
+      );
+    }
     // ...and untouched when the variable is absent, which is how every other
     // run in this repo, and every run in CI, executes.
-    expect(probe('0')).toBeLessThan(100);
+    expect(probe('0').delta).toBeLessThan(100);
   });
 });

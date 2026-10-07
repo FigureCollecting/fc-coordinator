@@ -1,23 +1,27 @@
 /**
- * Spine read client — Connect client for read.v1 SpineRead.Compare
- * (@figurecollecting/ingest-contract/read). This is fc-backend's SCREEN
- * surface for the spine's derived comparison view: fc-backend is the SINGLE
- * user-facing caller (lookup-caller-architecture, RATIFIED) — the frontend
- * never talks to the spine directly.
+ * Spine read client — the coordinator's half of read.v1 SpineRead
+ * (@figurecollecting/ingest-contract/read): Compare for CompareService, and
+ * GetProducts / GetProductImages for CatalogService. The coordinator is the
+ * client-facing caller; fc-mobile never talks to the spine directly.
  *
- * SCOPE (this increment): THIN READ-THROUGH ONLY. NO buy/sell framing, NO
- * landed-cost, NO comps — those are HELD for the product vision. Callers get
- * neutral observations out (the spine's CompareResult, opaque JSON, passed
- * through verbatim).
+ * SCOPE: THIN READ-THROUGH ONLY. Each method sends one request and returns the
+ * spine's response message unedited (opaque JSON text plus a page token). What
+ * a caller may SEE is decided by the handlers in src/connect/, not here.
  *
- * TRANSPORT (load-bearing — DO NOT CHANGE without re-validating the meshed
- * hop end-to-end): createConnectTransport({ baseUrl, httpVersion: '1.1' })
- * from @connectrpc/connect-node. The spine's ingest-server serves the
- * Connect protocol over cleartext HTTP/1.1 (Linkerd meshes h1 natively, no
- * appProtocol hint or opaque-port tuning needed). This RPC is UNARY, so
- * HTTP/2 buys nothing here. createGrpcTransport requires h2 and FAILS
- * against this server — mirrors scraper/src/services/ingestEmitter.ts's
- * TRANSPORT note for the sibling ingest RPC verbatim.
+ * TRANSPORT (R4d — load-bearing): gRPC over HTTP/2 cleartext (h2c), via
+ * createGrpcTransport from @connectrpc/connect-node, aimed at ingest-server's
+ * READ_H2C_PORT (:50062). Inside the pod the hop is cleartext; the Linkerd
+ * proxy on each side is what makes it mutual TLS on the wire, which R4a proved
+ * on prod for this exact shape (a real gRPC client through two meshed proxies,
+ * `grpc-status` read from the TRAILER). Ross's rule, 2026-09-17: every
+ * component-to-component API is gRPC with mTLS; the Connect-over-HTTP/1.1 hop
+ * this replaces (:50052) was a violation of it.
+ *
+ * NO `httpVersion` OPTION, and that is the point: gRPC is HTTP/2 by
+ * construction, so no value of any option here can put this hop back on
+ * HTTP/1.1. The consequence is a FLAG DAY PER PORT — this client cannot talk to
+ * :50052 at all (test/spine/spineReadClient.test.ts proves it), so the
+ * SPINE_READ_URL change to :50062 must ship in the same deploy as this image.
  */
 import {
   Code,
@@ -26,13 +30,19 @@ import {
   type Client,
   type Interceptor,
 } from '@connectrpc/connect';
-import { createConnectTransport } from '@connectrpc/connect-node';
+import { createGrpcTransport } from '@connectrpc/connect-node';
 import { traceparentClientInterceptor } from '../connect/interceptors.js';
 import { create } from '@bufbuild/protobuf';
 import {
   SpineRead,
   CompareRequestSchema,
+  GetProductImagesRequestSchema,
+  GetProductsRequestSchema,
+  SourceItemSchema,
   type CompareResponse,
+  type GetProductImagesResponse,
+  type GetProductsResponse,
+  type ProductRef as WireProductRef,
 } from '@figurecollecting/ingest-contract/read';
 import { ENTITLEMENTS_HEADER } from '@figurecollecting/ingest-contract/entitlement';
 
@@ -41,6 +51,24 @@ import { ENTITLEMENTS_HEADER } from '@figurecollecting/ingest-contract/entitleme
 export const DEFAULT_COMPARE_TIMEOUT_MS = 10_000;
 
 export type CompareSeed = { gtin14: string } | { headId: string };
+
+/** read.v1.ProductRef, as this client sends it: one product, named one of three ways. */
+export type SpineProductRef =
+  | { productId: string }
+  | { gtin14: string }
+  | { sourceItem: { site: string; nativeId: string } };
+
+/** One page of a batch read. Both values are forwarded verbatim; the spine clamps and binds them. */
+export interface SpinePage {
+  pageSize: number;
+  pageToken: string;
+}
+
+const wireRef = (ref: SpineProductRef): WireProductRef['ref'] => {
+  if ('productId' in ref) return { case: 'productId', value: ref.productId };
+  if ('gtin14' in ref) return { case: 'gtin14', value: ref.gtin14 };
+  return { case: 'sourceItem', value: create(SourceItemSchema, ref.sourceItem) };
+};
 
 export class SpineReadClient {
   private readonly client: Client<typeof SpineRead>;
@@ -57,9 +85,8 @@ export class SpineReadClient {
     timeoutMs: number = DEFAULT_COMPARE_TIMEOUT_MS,
     interceptors: Interceptor[] = [traceparentClientInterceptor()],
   ) {
-    // Connect over HTTP/1.1 — see the TRANSPORT note above. NEVER
-    // createGrpcTransport here.
-    const transport = createConnectTransport({ baseUrl, httpVersion: '1.1', interceptors });
+    // gRPC over h2c — see the TRANSPORT note above.
+    const transport = createGrpcTransport({ baseUrl, interceptors });
     this.client = createClient(SpineRead, transport);
     this.timeoutMs = timeoutMs;
   }
@@ -95,17 +122,58 @@ export class SpineReadClient {
           : { case: 'headId' as const, value: seed.headId },
       nowIso,
     });
-    // Set the header only when there is one to set: an empty value reads as
-    // `absent` at the spine anyway, but sending it always would make a caller
-    // that lost its key look exactly like one that never had one.
-    const headers =
-      assertion !== undefined && assertion !== null && assertion !== ''
-        ? { [ENTITLEMENTS_HEADER]: assertion }
-        : undefined;
-    return this.client.compare(request, {
-      timeoutMs: this.timeoutMs,
-      ...(headers === undefined ? {} : { headers }),
+    return this.client.compare(request, this.callOptions(assertion));
+  }
+
+  /**
+   * Call SpineRead.GetProducts for one page of a batch. The assertion travels
+   * exactly as it does for Compare, for the same reasons, and its absence is
+   * just as normal.
+   */
+  async getProducts(
+    refs: readonly SpineProductRef[],
+    nowIso: string,
+    assertion: string | null,
+    page: SpinePage,
+  ): Promise<GetProductsResponse> {
+    const request = create(GetProductsRequestSchema, {
+      refs: refs.map((ref) => ({ ref: wireRef(ref) })),
+      nowIso,
+      pageSize: page.pageSize,
+      pageToken: page.pageToken,
     });
+    return this.client.getProducts(request, this.callOptions(assertion));
+  }
+
+  /** Call SpineRead.GetProductImages for one page of image rows. */
+  async getProductImages(
+    productIds: readonly string[],
+    nowIso: string,
+    assertion: string | null,
+    page: SpinePage,
+  ): Promise<GetProductImagesResponse> {
+    const request = create(GetProductImagesRequestSchema, {
+      productIds: [...productIds],
+      nowIso,
+      pageSize: page.pageSize,
+      pageToken: page.pageToken,
+    });
+    return this.client.getProductImages(request, this.callOptions(assertion));
+  }
+
+  /**
+   * The deadline, and the assertion header ONLY when there is one to set: an
+   * empty value reads as `absent` at the spine anyway, but sending it always
+   * would make a caller that lost its key look exactly like one that never
+   * had one.
+   */
+  private callOptions(assertion: string | null | undefined): {
+    timeoutMs: number;
+    headers?: Record<string, string>;
+  } {
+    return assertion !== undefined && assertion !== null && assertion !== ''
+      ? { timeoutMs: this.timeoutMs, headers: { [ENTITLEMENTS_HEADER]: assertion } }
+      : { timeoutMs: this.timeoutMs };
   }
 }
 
