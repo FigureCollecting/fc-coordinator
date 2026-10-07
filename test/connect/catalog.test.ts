@@ -501,9 +501,11 @@ describe('GetProducts failure behaviour', () => {
         throw new ConnectError('page_token was issued for a different batch', Code.InvalidArgument);
       },
     });
-    expect(await codeOf(harness.catalog.getProducts({ refs: [gtinRef()], pageToken: 'stale' }))).toBe(
-      Code.InvalidArgument,
-    );
+    const err = await harness.catalog.getProducts({ refs: [gtinRef()], pageToken: 'stale' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConnectError);
+    expect((err as ConnectError).code).toBe(Code.InvalidArgument);
+    // The code is relayed; the spine's own words are not.
+    expect((err as ConnectError).rawMessage).not.toContain('different batch');
   });
 
   it.each([
@@ -597,6 +599,18 @@ describe('(e) GetProductImages', () => {
     harness = await start({ mediaBaseUrl: MEDIA });
     expect(await codeOf(harness.catalog.getProductImages({ headIds }))).toBe(Code.InvalidArgument);
     expect(harness.spine.imageCalls).toHaveLength(0);
+  });
+
+  it.each([
+    ['no head ids', []],
+    ['201 head ids', Array.from({ length: 201 }, (_, i) => `id-${i}`)],
+    ['a blank head id', [' ']],
+  ])('%s is INVALID_ARGUMENT even while images are off, never a quiet empty OK', async (_label, headIds) => {
+    // The batch is the client's bug whatever the server's configuration; an OK
+    // here would hide it until the day images are switched on.
+    harness = await start({ mediaBaseUrl: null });
+    expect(await codeOf(harness.catalog.getProductImages({ headIds }))).toBe(Code.InvalidArgument);
+    expect(harness.spine.wire).toHaveLength(0);
   });
 
   it('answers UNAVAILABLE when the base is set but no spine is configured', async () => {

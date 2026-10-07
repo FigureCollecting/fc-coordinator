@@ -90,6 +90,37 @@ describe('toProductCard — values', () => {
     expect(toProductCard(record({ character: f }))?.character).toBeUndefined();
   });
 
+  it('never shows a bare term uuid that the projection fell back to for a label-less term', () => {
+    // The spine's display projection is `label ?? value`, so a term whose label
+    // it could not resolve arrives as its uuid on a display-backed field.
+    const uuid = '0d6f6e1a-1111-4222-8333-444455556666';
+    const card = toProductCard(
+      record(
+        {
+          manufacturer: facet({ kind: 'term', value: uuid }),
+          origin_series: facet({ kind: 'term', value: uuid, label: 'Vocaloid' }),
+          scale: facet({ kind: 'text', value: uuid }),
+        },
+        { manufacturer: uuid, originSeries: uuid, scale: uuid },
+      ),
+    );
+    expect(card?.manufacturer).toBeUndefined();
+    // Not a bare uuid: the display value names a label that came from elsewhere,
+    // or a text claim that simply is that string.
+    expect(card?.series).toMatchObject({ value: uuid, asOf: '' });
+    expect(card?.scale).toMatchObject({ value: uuid, asOf: '2026-09-01T10:00:00.000000Z' });
+  });
+
+  it('keeps a display value that differs from a label-less term (a materialized column)', () => {
+    const card = toProductCard(
+      record(
+        { manufacturer: facet({ kind: 'term', value: '0d6f6e1a-1111-4222-8333-444455556666' }) },
+        { manufacturer: 'Good Smile Company' },
+      ),
+    );
+    expect(card?.manufacturer).toMatchObject({ value: 'Good Smile Company', asOf: '' });
+  });
+
   it('leaves a display field absent when the projection has no usable value', () => {
     const card = toProductCard(record({ name: facet({ value: 'n' }) }, { name: 42, manufacturer: '' }));
     expect(card?.title).toBeUndefined();
@@ -127,7 +158,15 @@ describe('toProductCard — as_of', () => {
 });
 
 describe('toProductCard — content_level', () => {
-  it.each(CONTENT_LEVELS.map((l) => [l]))('passes the contract value %s through', (level) => {
+  // Written out, not read from CONTENT_LEVELS: iterating the implementation's
+  // own list would delete a level's test case along with the level.
+  const CONTRACT_LEVELS = ['general', 'intermediate', 'explicit', 'controversial', 'nsfw', 'nsfw+', 'unknown'];
+
+  it('knows exactly the seven levels catalog.proto names', () => {
+    expect([...CONTENT_LEVELS]).toEqual(CONTRACT_LEVELS);
+  });
+
+  it.each(CONTRACT_LEVELS.map((l) => [l]))('passes the contract value %s through', (level) => {
     expect(toProductCard(record({ contentLevel: facet({ value: level }) }))?.contentLevel?.value).toBe(level);
   });
 
@@ -142,6 +181,29 @@ describe('toProductCard — content_level', () => {
   it('is absent when the source has no level concept', () => {
     expect(toProductCard(record({}))?.contentLevel).toBeUndefined();
   });
+
+  // FAIL CLOSED. A level the source HAS but this build cannot read is still a
+  // level: absent would tell the client "no level concept", which it treats
+  // permissively.
+  it.each([
+    ['a term with no label', facet({ kind: 'term', value: '0d6f6e1a-1111-4222-8333-444455556666' })],
+    ['a json value', facet({ kind: 'json', value: null, json: { level: 'nsfw' } })],
+    ['an empty value', facet({ value: '' })],
+    ['a kind nobody has defined', facet({ kind: 'blob', value: 'nsfw' })],
+    ['a non-string value', facet({ value: 18 })],
+  ])('reads a level claim it cannot read (%s) as unknown, keeping its time', (_label, f) => {
+    expect(toProductCard(record({ contentLevel: f }))?.contentLevel).toMatchObject({
+      value: 'unknown',
+      asOf: '2026-09-01T10:00:00.000000Z',
+    });
+  });
+
+  it.each([
+    ['not an object', 'nsfw'],
+    ['null', null],
+  ])('reads a level claim that is %s as unknown, with no time to give', (_label, f) => {
+    expect(toProductCard(record({ contentLevel: f }))?.contentLevel).toMatchObject({ value: 'unknown', asOf: '' });
+  });
 });
 
 describe('toProductCard — identifiers and refs', () => {
@@ -152,6 +214,9 @@ describe('toProductCard — identifiers and refs', () => {
         { idType: 'jan', gtin14: '04573102591234' },
         { idType: 'source_native', value: '1144', gtin14: null },
         { idType: 'jan', gtin14: '4573102591234' },
+        { idType: 'jan', gtin14: '045731025912345' },
+        { idType: 'jan', gtin14: 'x04573102591234' },
+        { idType: 'jan', gtin14: '04573102591234x' },
         'junk',
         { idType: 'upc', gtin14: '00012345678905' },
         { idType: 'jan', gtin14: '04573102591234' },
@@ -232,6 +297,12 @@ describe('readImagesPayload', () => {
     ['no url at all', image({ url: undefined })],
     ['a derivative id that is not a sha-256', image({ derivativeSha256: 'abc', url: `${MEDIA}/abc` })],
     ['an upper-case derivative id', image({ derivativeSha256: SHA.toUpperCase(), url: `${MEDIA}/${SHA.toUpperCase()}` })],
+    // The id check is the ONLY guard on the id half of `<base>/<id>`: in each of
+    // these the url and the id agree, so the exact-url test admits them all.
+    ['an id with a traversal prefix', image({ derivativeSha256: `../originals/${SHA}`, url: `${MEDIA}/../originals/${SHA}` })],
+    ['an id with a query suffix', image({ derivativeSha256: `${SHA}?raw=1`, url: `${MEDIA}/${SHA}?raw=1` })],
+    ['an id with a path suffix', image({ derivativeSha256: `${SHA}/../../originals/x.jpg`, url: `${MEDIA}/${SHA}/../../originals/x.jpg` })],
+    ['an id of 65 hex digits', image({ derivativeSha256: `${SHA}c`, url: `${MEDIA}/${SHA}c` })],
     ['a row that is not an object', 'https://images.figurecollecting.test/d/x'],
   ])('drops %s, and the product with it when nothing is left', (_label, row) => {
     expect(read([row])).toEqual([]);
@@ -285,8 +356,9 @@ describe('resolveMediaBaseUrl', () => {
   it.each([
     ['https://images.figurecollecting.com/d', 'https://images.figurecollecting.com/d'],
     ['https://images.figurecollecting.com/d/', 'https://images.figurecollecting.com/d'],
-    [' https://images.figurecollecting.com// ', 'https://images.figurecollecting.com'],
-  ])('normalises %s the way the spine does, by trimming trailing slashes', (raw, expected) => {
+    ['https://images.figurecollecting.com//', 'https://images.figurecollecting.com'],
+    ['https://images.figurecollecting.com', 'https://images.figurecollecting.com'],
+  ])('normalises %s the way the spine does, by trimming trailing slashes and nothing else', (raw, expected) => {
     expect(resolveMediaBaseUrl({ MEDIA_PUBLIC_BASE_URL: raw })).toBe(expected);
   });
 
@@ -296,6 +368,18 @@ describe('resolveMediaBaseUrl', () => {
     ['a query string', 'https://images.figurecollecting.com/d?sig=1'],
     ['a fragment', 'https://images.figurecollecting.com/d#x'],
     ['credentials', 'https://user:pass@images.figurecollecting.com/d'],
+    // URL.search and URL.hash are '' for an EMPTY query or fragment.
+    ['an empty query', 'https://images.figurecollecting.com/d?'],
+    ['an empty fragment', 'https://images.figurecollecting.com/d#'],
+    ['an empty query and fragment after a slash', 'https://images.figurecollecting.com/d/?#'],
+    // A dot segment resolves away: the phone would fetch from somewhere else.
+    ['a dot-dot segment', 'https://images.figurecollecting.com/d/..'],
+    ['an encoded dot-dot segment', 'https://images.figurecollecting.com/d/%2e%2e'],
+    ['a dot segment mid-path', 'https://images.figurecollecting.com/./d'],
+    // The spine trims trailing slashes only; with whitespace around it the two
+    // sides would build different URLs and every image would be dropped.
+    ['surrounding whitespace', ' https://images.figurecollecting.com/d '],
+    ['a trailing newline', 'https://images.figurecollecting.com/d/\n'],
   ])('refuses %s at boot, rather than shipping it to every phone', (_label, raw) => {
     expect(() => resolveMediaBaseUrl({ MEDIA_PUBLIC_BASE_URL: raw })).toThrow(/MEDIA_PUBLIC_BASE_URL/);
   });

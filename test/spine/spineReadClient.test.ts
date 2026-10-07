@@ -15,7 +15,7 @@ import { context, trace } from '@opentelemetry/api';
 import { startTelemetry, type Telemetry } from '../../src/platform/telemetry.js';
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { createClient, type ConnectRouter } from '@connectrpc/connect';
+import { Code, createClient, type ConnectRouter } from '@connectrpc/connect';
 import { connectNodeAdapter, createConnectTransport } from '@connectrpc/connect-node';
 import { create } from '@bufbuild/protobuf';
 import {
@@ -426,6 +426,13 @@ describe('SpineReadClient.getProductImages — the request it makes', () => {
     spine = await startFakeSpineRead({ keys: NO_KEYS });
     await new SpineReadClient(spine.baseUrl).getProductImages([HEAD], NOW_ISO, '', { pageSize: 0, pageToken: '' });
     expect(spine.imageCalls[0]?.headers.get(ENTITLEMENTS_HEADER)).toBeNull();
+  });
+
+  it('times out rather than hanging', { timeout: 5_000 }, async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS, respondImages: () => new Promise<never>(() => {}) });
+    await expect(
+      new SpineReadClient(spine.baseUrl, 150).getProductImages([HEAD], NOW_ISO, null, { pageSize: 0, pageToken: '' }),
+    ).rejects.toMatchObject({ code: Code.DeadlineExceeded });
   });
 
   it('returns images_json and next_page_token unedited', async () => {
