@@ -49,6 +49,7 @@ npm start        # node dist/server.js
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | collector endpoint; falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` |
 | `SPINE_READ_URL` | unset | ingest-server's **gRPC h2c** read listener, `READ_H2C_PORT` (e.g. `http://ingest-server.<ns>.svc.cluster.local:50062`); **unset means Compare and GetProducts answer `UNAVAILABLE`** and no transport is built. The HTTP/1.1 port `:50052` no longer works with this client |
 | `SPINE_READ_TIMEOUT_MS` | `10000` | per-call deadline on the mesh hop |
+| `IMPORT_OCC_ID_KEY` | unset | the MFC import's occ-id key, 64 hex digits (32 bytes), held by the coordinator alone (import.proto OCCURRENCE IDS). **Unset means ImportMfcExport answers `UNAVAILABLE`**; any other value stops the process at boot without echoing it |
 | `MEDIA_PUBLIC_BASE_URL` | unset | public base of the derivative image path. **Unset means `GetProductImages` returns nothing** and asks no one; set, it must be `https` with no credentials and no `?` or `#`, in canonical URL form exactly as a URL parser writes it (e.g. lower-case host, no default port, no surrounding whitespace, no dot segments), with no encoded slash or backslash (`%2F`, `%5C`), or the process refuses to start without echoing the value. Trailing slashes are trimmed, as the spine trims its copy |
 | `OPENFGA_GRPC_URL` `OPENFGA_STORE_ID` | unset | the entitlement Check, which is **gRPC over h2c on port 8081** (e.g. `http://openfga-mc-fc-ha.authz.svc.cluster.local:8081`); **unset means every Check denies** |
 | `OPENFGA_API_URL` | must be unset | the retired HTTP endpoint. **Setting it stops the process at boot**, naming the rename — there is no HTTP path left, so a manifest that still carries it would otherwise redact every read while looking configured |
@@ -708,10 +709,29 @@ cursor: none, or one that is not a cursor, is REJECTED `basis_missing`, the
 last check. HELD is decided once per Push, before anything is applied, by a
 `HoldPolicy`; a held edit is kept in `held_edit` with its basis, not applied,
 answered with `current`, and HELD again on a replay. Until the import lands
-there is no frame, so the default policy holds nothing and every edit is
-placed by LWW whatever its basis. The start of a feed has one cursor, `''`:
+there is no frame, every edit is placed by LWW whatever its basis; the
+process serves the import's policy (below). The start of a feed has one cursor, `''`:
 Status and `next_cursor` answer it while a user's feed is empty, so a client
 that has applied nothing compares equal and is not shown as behind.
+
+## `coordinator.v1` — ImportService (WK-14a: the one-time MFC import)
+
+`ImportMfcExport` (`src/import/`) reads the export by header (ID and Status
+required; `,` or `;`, quoted fields, Price twice, `N/10` scores), resolves the
+MFC ids through SpineRead GetProducts, 200 refs a call, and decides each figure
+under the user's lock as one server transaction, written through Push's
+`applyEvent`, marker `imp/mfc/import` last (`0005_import.sql` keeps runs,
+frames, bases and pending figure items). Each write is versioned
+`<server instant>#<import number>#<server device>` above the facet's own and
+displayed at the export date, UTC. A figure no import settled gets a copy
+(origin, head, status) per MFC Count beyond the app's copies of the kind, and
+MFC's score, note and wishability where the app shows none; where the app shows
+another value nothing of the figure is written and a conflict item is raised.
+The same export again writes only its marker. 14a refuses (FAILED_PRECONDITION,
+nothing written) an export that changes a figure an earlier import settled, and
+a FAVOR preference that would settle a conflict: both are WK-14b. A Push edit
+to an imported figure made before its device saw the import is HELD
+(`held_edit`), since 14a has no replay; cards and answers are WK-14b.
 
 ## Phase-2 client (`scripts/phase2-client`)
 
