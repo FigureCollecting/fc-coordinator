@@ -1,8 +1,6 @@
-// The sync smoke against a coordinator that ACCEPTS contract 0.3.0's occ/{occ}/head and
-// occ/{occ}/status, as WK-05b's will. WK-05b is not built, so its Push validation is stood in for
-// here, for exactly those two families, from the schemas vendored out of fc-api-contract PR #8:
-// the real Fastify app, the real Push transaction, the real feed and the real Delta do the rest.
-// Every other key still goes through develop's validateEvent unchanged.
+// The sync smoke against this coordinator, which takes contract 0.3.0's occ/{occ}/head and
+// occ/{occ}/status (WK-05b): the real Fastify app, the real Push validation and transaction, the
+// real feed and the real Delta. Then the smoke's failure paths, each forced on one exchange.
 import { randomUUID } from 'node:crypto';
 import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
 import {
@@ -12,7 +10,6 @@ import {
   PushResponseSchema,
   SyncEventSchema,
   SyncOp,
-  parseVersion,
   type SyncEvent,
 } from '@figurecollecting/fc-api-contract';
 import type { FastifyInstance } from 'fastify';
@@ -26,29 +23,6 @@ import type { HttpRequest, HttpResponse } from '../../scripts/phase2-client/tran
 import { makeIssuer } from '../helpers/auth.js';
 import { CLIENT_ID, buildCoordinator, injectTransport, recording, withStatus, type Exchanged } from '../helpers/phase2Harness.js';
 import { leaks, startRunEnv, type FullRun, type RunEnv } from '../helpers/phase2Run.js';
-
-vi.mock('../../src/sync/validate.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/sync/validate.js')>();
-  const occ = await import('../../scripts/phase2-client/occ030.js');
-  const reject = (reason: string) => ({ ok: false as const, reason, userOwned: true });
-  return {
-    ...actual,
-    validateEvent: (event: Parameters<typeof actual.validateEvent>[0], ctx: Parameters<typeof actual.validateEvent>[1]) => {
-      const key = occ.OCC_SMOKE_KEY.exec(event.facetKey);
-      if (key === null) return actual.validateEvent(event, ctx);
-      const version = parseVersion(event.version);
-      if (version === undefined || version.counter === null) return reject('version_malformed: stand-in');
-      if (version.deviceId !== ctx.deviceHex) return reject('device_mismatch: stand-in');
-      if (event.op === SyncOp.DELETE) return event.payload === '' ? { ok: true as const } : reject('payload_invalid: stand-in');
-      try {
-        occ.assertOccPayload(key.groups!['field'] as 'head' | 'status', event.payload);
-      } catch {
-        return reject('payload_invalid: stand-in');
-      }
-      return { ok: true as const };
-    },
-  };
-});
 
 let env: RunEnv;
 let run: FullRun;
@@ -181,6 +155,12 @@ describe('the smoke, when the coordinator misbehaves', () => {
       return { ...res, body: toBinary(DeltaResponseSchema, create(DeltaResponseSchema, { events: [foreign], hasMore: true, nextCursor: asked.cursor })) };
     });
     expect(result).toMatchObject({ verdict: 'PASS' });
+  });
+
+  it('names WK-05b when the coordinator refuses the 0.3.0 keys as a 0.2.x one does', async () => {
+    const refusal = 'facet_key_not_user_owned: not one of the four user-owned key forms';
+    const result = await smokeAgainst(on('smoke:push', pushAnswer([{ outcome: PushOutcome.REJECTED, reason: refusal }, { outcome: PushOutcome.REJECTED, reason: refusal }])));
+    expect(result).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/REJECTED facet_key_not_user_owned.*\(this coordinator predates fc-api-contract 0\.3\.0: WK-05b\)$/) });
   });
 
   it('names a rejection that is not the 0.2.x key refusal without blaming WK-05b', async () => {

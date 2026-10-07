@@ -1,7 +1,7 @@
 // SyncService's defensive branches, without a database: a context with no caller, and a Push
 // whose transaction fails part-way.
 import { randomUUID } from 'node:crypto';
-import { SyncOp, canonicalVersion, userFacetKey } from '@figurecollecting/fc-api-contract';
+import { SyncOp, canonicalVersion, occFacetKey } from '@figurecollecting/fc-api-contract';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../../src/app.js';
@@ -71,7 +71,7 @@ describe('a Push whose transaction fails', () => {
     clientId: randomUUID(),
     events: [
       {
-        facetKey: userFacetKey(randomUUID(), 'status'),
+        facetKey: occFacetKey(randomUUID(), 'status'),
         version: canonicalVersion({ instant: new Date(Date.now() - 1000), counter: 0, deviceId: DEVICE }),
         op: SyncOp.UPSERT,
         payload: '{}',

@@ -2,14 +2,31 @@
 // invalid, so REJECTED), push and pull in random interleavings, lose responses, and push
 // concurrently. Each device follows the contract's client rules, so the property is: both end on
 // the same facet map, equal to a replay from an empty cursor and to the server's facet_state.
+// The edits span every 0.3.0 user-owned family (sync.proto rule 6), plus keys a client must never
+// push (a retired holding/* key, a copy's server-owned origin), which are always REJECTED.
 import { randomUUID } from 'node:crypto';
 import fc from 'fast-check';
 import {
+  COLLECTION_KINDS,
+  DISPOSAL_REASONS,
   Hlc,
+  IMPORT_ITEMS,
   PushOutcome,
   SyncOp,
+  USER_FACET_FAMILIES,
+  answerKey,
+  collNameKey,
+  collectionRef,
   compareVersion,
-  userFacetKey,
+  importPrefKey,
+  occFacetKey,
+  occOriginKey,
+  occTagKey,
+  parseUserFacetKey,
+  tagNameKey,
+  ufFacetKey,
+  ufKindTagKey,
+  ufTagKey,
   type HlcClock,
   type PushResult,
   type SyncEvent,
@@ -22,6 +39,9 @@ let db: SyncDatabase;
 let h: SyncApp;
 let h2: SyncApp;
 let rejected = 0;
+/** Families seen APPLIED, and edits on a key no client may push, across every run. */
+const appliedFamilies = new Set<string>();
+let refusedForeign = 0;
 
 beforeAll(async () => {
   db = await startSyncDatabase();
@@ -94,6 +114,13 @@ class SimDevice {
     expect(result.facetKey).toBe(sent.facetKey);
     expect([PushOutcome.APPLIED, PushOutcome.DUPLICATE, PushOutcome.STALE, PushOutcome.REJECTED]).toContain(result.outcome);
     if (result.outcome === PushOutcome.REJECTED) rejected += 1;
+    const family = parseUserFacetKey(sent.facetKey)?.family;
+    if (family === undefined) {
+      expect([result.outcome, result.reason.split(':')[0]]).toEqual([PushOutcome.REJECTED, 'facet_key_not_user_owned']);
+      refusedForeign += 1;
+    } else if (result.outcome === PushOutcome.APPLIED) {
+      appliedFamilies.add(family);
+    }
     const local = this.local.get(sent.facetKey);
     if (local?.version === sent.version) {
       if (result.current) this.adopt(result.current);
@@ -114,20 +141,89 @@ class SimDevice {
   }
 }
 
+const OCCS = [randomUUID(), randomUUID(), randomUUID()];
 const HEADS = [randomUUID(), randomUUID(), randomUUID()];
-const FIELDS = ['status', 'count', 'score', 'note'] as const;
+const TAGS = [randomUUID(), randomUUID()];
+const COLLS = [randomUUID(), randomUUID()];
+/** Keys a client never pushes: the retired 0.2.x grain and a copy's server-owned origin. */
+const FOREIGN = ['holding/status', 'occ/origin'] as const;
+const FAMILIES = [...USER_FACET_FAMILIES, ...FOREIGN];
+type Family = (typeof FAMILIES)[number];
 
-function payloadFor(field: (typeof FIELDS)[number], n: number): string {
-  switch (field) {
-    case 'status':
-      return JSON.stringify({ status: ['owned', 'ordered', 'wished'][n % 3], ...DISPLAY });
-    case 'count':
-      return JSON.stringify({ count: 1 + (n % 9999), ...DISPLAY });
-    case 'score':
-      return JSON.stringify({ score: 1 + (n % 10), ...DISPLAY });
-    case 'note':
-      return JSON.stringify({ note: `note ${n}`, ...DISPLAY });
+const pick = <T>(list: readonly T[], n: number): T => list[n % list.length]!;
+const collId = (n: number) => (n % 3 === 0 ? 'default' : pick(COLLS, n));
+
+/** Slot `i` of a family: a small id space, so edits collide on keys. */
+function keyFor(family: Family, i: number): string {
+  switch (family) {
+    case 'occ/head':
+    case 'occ/status':
+    case 'occ/collection':
+    case 'occ/disposal':
+      return occFacetKey(pick(OCCS, i), family.slice(4) as 'head');
+    case 'occ/tag':
+      return occTagKey(pick(OCCS, i), pick(TAGS, i));
+    case 'uf/score':
+    case 'uf/note':
+    case 'uf/wishability':
+      return ufFacetKey(pick(HEADS, i), family.slice(3) as 'score');
+    case 'uf/tag':
+      return ufTagKey(pick(HEADS, i), pick(TAGS, i));
+    case 'uf/ktag':
+      return ufKindTagKey(pick(HEADS, i), pick(COLLECTION_KINDS, i), pick(TAGS, i));
+    case 'coll/name':
+      return collNameKey(pick(COLLECTION_KINDS, i), collId(i));
+    case 'tag/name':
+      return tagNameKey(pick(TAGS, i));
+    case 'res/answer':
+      return answerKey('mfc', pick(HEADS, i));
+    case 'pref/import':
+      return importPrefKey('mfc');
+    case 'holding/status':
+      return `holding/${pick(HEADS, i)}/status`;
+    case 'occ/origin':
+      return occOriginKey(pick(OCCS, i));
   }
+}
+
+function payloadFor(family: Family, n: number): string {
+  const body = ((): object => {
+    switch (family) {
+      case 'occ/head':
+        return { head_id: pick(HEADS, n) };
+      case 'occ/status':
+        return { status: pick(COLLECTION_KINDS, n) };
+      case 'occ/collection':
+        return { collection: collectionRef(pick(COLLECTION_KINDS, n), collId(n)) };
+      case 'occ/disposal':
+        return n % 2 === 0 ? { reason: pick(DISPOSAL_REASONS, n) } : { reason: pick(DISPOSAL_REASONS, n), note: `disposal ${n}` };
+      case 'occ/tag':
+      case 'uf/tag':
+      case 'uf/ktag':
+        return {};
+      case 'uf/score':
+        return { score: 1 + (n % 10) };
+      case 'uf/note':
+        return { note: `note ${n}` };
+      case 'uf/wishability':
+        return { wishability: 1 + (n % 5) };
+      case 'coll/name':
+      case 'tag/name':
+        return { name: `name ${n}` };
+      case 'res/answer':
+        return n % 2 === 0
+          ? { item: pick(IMPORT_ITEMS, n), rev: `r${n}`, choice: 'per_copy', copies: [{ occ: pick(OCCS, n), status: 'removed' }] }
+          : { item: pick(IMPORT_ITEMS, n), rev: `r${n}`, choice: pick(['keep', 'take', 'undo', 'dismiss'], n) };
+      case 'pref/import':
+        return { import_policy: pick(['ASK', 'FAVOR_APP', 'FAVOR_MFC'], n) };
+      case 'holding/status':
+        return { status: 'owned' };
+      case 'occ/origin':
+        return { site: 'mfc', native_id: String(n + 1), ordinal: 1 };
+    }
+  })();
+  // occ/origin is server-owned and carries no display time; every client-written payload does.
+  return JSON.stringify(family === 'occ/origin' ? body : { ...body, ...DISPLAY });
 }
 
 const device = fc.constantFrom(0 as const, 1 as const);
@@ -137,8 +233,8 @@ const command = fc.oneof(
     arbitrary: fc.record({
       kind: fc.constant('edit' as const),
       d: device,
-      head: fc.nat({ max: HEADS.length - 1 }),
-      field: fc.constantFrom(...FIELDS),
+      slot: fc.nat({ max: 11 }),
+      family: fc.constantFrom(...FAMILIES),
       remove: fc.nat({ max: 4 }).map((n) => n === 0),
       bad: fc.nat({ max: 3 }).map((n) => n === 0),
       n: fc.nat({ max: 1000 }),
@@ -175,8 +271,8 @@ describe('(1) convergence', () => {
           switch (cmd.kind) {
             case 'edit': {
               t += cmd.tickMs;
-              const key = userFacetKey(HEADS[cmd.head]!, cmd.field);
-              const payload = cmd.bad ? JSON.stringify({ unknown_field: true, ...DISPLAY }) : payloadFor(cmd.field, cmd.n);
+              const key = keyFor(cmd.family, cmd.slot);
+              const payload = cmd.bad ? JSON.stringify({ unknown_field: true, ...DISPLAY }) : payloadFor(cmd.family, cmd.n);
               devices[cmd.d].edit(key, cmd.remove ? SyncOp.DELETE : SyncOp.UPSERT, cmd.remove ? '' : payload);
               break;
             }
@@ -218,8 +314,8 @@ describe('(1) convergence', () => {
         examples: [
           [
             [
-              { kind: 'edit', d: 1, head: 0, field: 'score', remove: false, bad: false, n: 3, tickMs: 1 },
-              { kind: 'edit', d: 0, head: 0, field: 'score', remove: false, bad: true, n: 0, tickMs: 1 },
+              { kind: 'edit', d: 1, slot: 0, family: 'uf/score', remove: false, bad: false, n: 3, tickMs: 1 },
+              { kind: 'edit', d: 0, slot: 0, family: 'uf/score', remove: false, bad: true, n: 0, tickMs: 1 },
               { kind: 'push', d: 0, drop: true },
               { kind: 'push', d: 1, drop: false },
               { kind: 'delta', d: 0, limit: 4, drop: false },
@@ -232,5 +328,7 @@ describe('(1) convergence', () => {
     );
     expect(runs).toBeGreaterThanOrEqual(200);
     expect(rejected).toBeGreaterThan(50);
+    expect([...appliedFamilies].sort()).toEqual([...USER_FACET_FAMILIES].sort());
+    expect(refusedForeign).toBeGreaterThan(10);
   }, 600_000);
 });
