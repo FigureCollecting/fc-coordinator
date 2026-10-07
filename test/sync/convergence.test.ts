@@ -12,6 +12,7 @@ import {
   Hlc,
   IMPORT_ITEMS,
   PushOutcome,
+  SERVER_FACET_FAMILIES,
   SyncOp,
   USER_FACET_FAMILIES,
   answerKey,
@@ -22,6 +23,7 @@ import {
   occFacetKey,
   occOriginKey,
   occTagKey,
+  parseServerFacetKey,
   parseUserFacetKey,
   tagNameKey,
   ufFacetKey,
@@ -42,6 +44,11 @@ let rejected = 0;
 /** Families seen APPLIED, and edits on a key no client may push, across every run. */
 const appliedFamilies = new Set<string>();
 let refusedForeign = 0;
+/** The class of every refused key: a server-owned family, or the retired holding/{h}/{field}. */
+const refusedFamilies = new Set<string>();
+const RETIRED = ['holding/status', 'holding/count'] as const;
+const refusedFamily = (key: string): string =>
+  parseServerFacetKey(key)?.family ?? key.replace(/^holding\/[^/]+\/([^/]+)$/, 'holding/$1');
 
 beforeAll(async () => {
   db = await startSyncDatabase();
@@ -118,6 +125,7 @@ class SimDevice {
     if (family === undefined) {
       expect([result.outcome, result.reason.split(':')[0]]).toEqual([PushOutcome.REJECTED, 'facet_key_not_user_owned']);
       refusedForeign += 1;
+      refusedFamilies.add(refusedFamily(sent.facetKey));
     } else if (result.outcome === PushOutcome.APPLIED) {
       appliedFamilies.add(family);
     }
@@ -330,5 +338,6 @@ describe('(1) convergence', () => {
     expect(rejected).toBeGreaterThan(50);
     expect([...appliedFamilies].sort()).toEqual([...USER_FACET_FAMILIES].sort());
     expect(refusedForeign).toBeGreaterThan(10);
+    expect([...refusedFamilies].sort()).toEqual([...SERVER_FACET_FAMILIES, ...RETIRED].sort());
   }, 600_000);
 });
