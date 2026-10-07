@@ -60,9 +60,11 @@ export interface RunRecord {
   version: string;
   markerSeq: bigint;
   figures: readonly string[];
+  /** The framed figures it wrote to or moved a base of. */
+  settled: readonly string[];
 }
 
-/** Record an import and the figures it framed. */
+/** Record an import and the figures it framed, each with whether it settled it. */
 export async function recordRun(tx: SqlClient, userId: string, run: RunRecord): Promise<void> {
   await tx.query('INSERT INTO import_run (user_id, import_number, export_date, version, marker_seq) VALUES ($1, $2, $3, $4, $5)', [
     userId,
@@ -72,8 +74,8 @@ export async function recordRun(tx: SqlClient, userId: string, run: RunRecord): 
     run.markerSeq.toString(),
   ]);
   await tx.query(
-    'INSERT INTO import_frame (user_id, import_number, head_id) SELECT $1, $2, h FROM unnest($3::uuid[]) AS h',
-    [userId, run.importNumber, run.figures],
+    'INSERT INTO import_frame (user_id, import_number, head_id, settled) SELECT $1, $2, h, h = ANY($4::uuid[]) FROM unnest($3::uuid[]) AS h',
+    [userId, run.importNumber, run.figures, run.settled],
   );
 }
 

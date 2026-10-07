@@ -166,7 +166,7 @@ export function createImportRoutes(deps: ImportRoutesDeps): (router: ConnectRout
         { facetKey: marker, op: 'upsert', payload: JSON.stringify({ import: importNumber, export_date: req.exportDate }), version: writeVersion(version, previous?.version) },
         feed,
       );
-      await recordRun(tx, userId, { importNumber, exportDate: req.exportDate, version, markerSeq: await feedHead(tx, userId), figures: plan.figures });
+      await recordRun(tx, userId, { importNumber, exportDate: req.exportDate, version, markerSeq: await feedHead(tx, userId), figures: plan.figures, settled: plan.settled });
       await saveBases(tx, userId, importNumber, { rows: plan.rowBases, copies: plan.copyBases, fields: plan.fieldBases, items: plan.items });
 
       const review = plan.pending.map((item) =>

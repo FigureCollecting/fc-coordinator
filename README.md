@@ -730,8 +730,12 @@ another value nothing of the figure is written and a conflict item is raised.
 The same export again writes only its marker. 14a refuses (FAILED_PRECONDITION,
 nothing written) an export that changes a figure an earlier import settled, and
 a FAVOR preference that would settle a conflict: both are WK-14b. A Push edit
-to an imported figure made before its device saw the import is HELD
-(`held_edit`), since 14a has no replay; cards and answers are WK-14b.
+to a figure an import settled (wrote to, or moved a copy or field base of),
+made before its device saw that import, is HELD (`held_edit`), since 14a has no
+replay; moving a copy into or out of such a figure counts. A marker-only
+re-import or a figure the import only raised a conflict on holds nothing: LWW
+places the edit, as the replay would. Until WK-14b's cards and answers a held
+edit is invisible to its user.
 
 ## Phase-2 client (`scripts/phase2-client`)
 

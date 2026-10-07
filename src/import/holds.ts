@@ -4,8 +4,13 @@
 // and holds it only in the cases HELD (i) to (iv) list; 14a has no replay, so it holds every late
 // edit instead of letting LWW drop it as STALE or write it over the import's decision. A held
 // edit is kept with its basis (held_edit) and answered HELD with `current`; the held-edit card,
-// its answers and the replay are WK-14b's. An edit to a figure no import decided, or one made
-// after its device applied the import (basis at or past the marker), is placed by LWW as ever.
+// its answers and the replay are WK-14b's. Until then a held edit is invisible to its user.
+//
+// Held only for a SETTLED frame: one whose import wrote to the figure or moved a copy or field
+// base of it. Where an import did neither (a marker-only re-import, a figure it only raised a
+// conflict on, a row that states nothing new) the replay leaves the device's edit standing, as
+// LWW does, so 14a places it by LWW. So is an edit to a figure no import settled, or one made
+// after its device applied the import that settled it (basis at or past that marker).
 //
 // Held per UNIT: one push's edits to one copy's head, status, collection and disposal are one
 // unit; every other edit is a unit with the push's other edits of its key.
@@ -23,7 +28,7 @@ export const holdLateForImport: HoldPolicy = async (tx, userId, edits) => {
   if (last[0]!.seq === null) return held;
   const lastMarker = BigInt(last[0]!.seq);
 
-  // What each edit touches: its unit, and the figure (a copy's head: as this push writes it, else as stored).
+  // What each edit touches: its unit, and its figure (a copy's is found below).
   const touched = edits.map((e) => {
     const key = parseUserFacetKey(e.facetKey)!;
     if (key.family.startsWith('uf/')) return { e, unit: e.facetKey, head: (key as { headId: string }).headId, occ: null };
@@ -36,34 +41,36 @@ export const holdLateForImport: HoldPolicy = async (tx, userId, edits) => {
   const candidates = touched.filter((t) => (t.head !== null || t.occ !== null) && t.e.basisSeq < lastMarker);
   if (candidates.length === 0) return held;
 
-  // A copy's head as this push writes it, else as stored; a copy with neither belongs to no figure.
-  const copyHeads = new Map<string, string>();
+  // A copy's figures: its head as stored and as this push writes it, so a copy moved out of a
+  // figure is an edit to that figure as much as one moved into it. A copy with neither is in none.
+  const pushedHeads = new Map<string, string>();
   for (const e of edits) {
     const m = /^occ\/([^/]+)\/head$/.exec(e.facetKey);
-    if (m !== null && e.op === 'upsert') copyHeads.set(m[1]!, headOf(e.payload));
+    if (m !== null && e.op === 'upsert') pushedHeads.set(m[1]!, headOf(e.payload));
   }
   const { rows: stored } = await tx.query<{ facet_key: string; payload: string }>(
     "SELECT facet_key, payload FROM facet_state WHERE user_id = $1 AND facet_key = ANY($2::text[]) AND op = 'upsert'",
-    [userId, candidates.flatMap((t) => (t.occ !== null && !copyHeads.has(t.occ) ? [`occ/${t.occ}/head`] : []))],
+    [userId, [...new Set(candidates.flatMap((t) => (t.occ !== null ? [`occ/${t.occ}/head`] : [])))]],
   );
-  for (const r of stored) copyHeads.set(r.facet_key.split('/')[1]!, headOf(r.payload));
-  const placed = candidates.flatMap((t) => {
-    const head = t.head ?? copyHeads.get(t.occ!);
-    return head === undefined ? [] : [{ ...t, head }];
-  });
-  const heads = [...new Set(placed.map((t) => t.head))];
+  const storedHeads = new Map(stored.map((r) => [r.facet_key.split('/')[1]!, headOf(r.payload)]));
+  const placed = candidates.map((t) => ({
+    ...t,
+    heads: t.head !== null ? [t.head] : [storedHeads.get(t.occ!), pushedHeads.get(t.occ!)].filter((h): h is string => h !== undefined),
+  }));
+  const heads = [...new Set(placed.flatMap((t) => t.heads))];
 
+  // Only a frame whose import wrote to the figure or moved a base of it: one that did neither (a
+  // marker-only re-import, a figure it only raised a conflict on) leaves what a replay would, LWW.
   const { rows: frames } = await tx.query<{ head_id: string; seq: string }>(
     `SELECT f.head_id, max(r.marker_seq) AS seq FROM import_frame f
        JOIN import_run r ON r.user_id = f.user_id AND r.import_number = f.import_number
-      WHERE f.user_id = $1 AND f.head_id = ANY($2::uuid[]) GROUP BY f.head_id`,
+      WHERE f.user_id = $1 AND f.head_id = ANY($2::uuid[]) AND f.settled GROUP BY f.head_id`,
     [userId, heads],
   );
   const framedAt = new Map(frames.map((f) => [f.head_id, BigInt(f.seq)]));
   const lateUnits = new Set<string>();
   for (const t of placed) {
-    const marker = framedAt.get(t.head);
-    if (marker !== undefined && t.e.basisSeq < marker) lateUnits.add(t.unit);
+    if (t.heads.some((head) => t.e.basisSeq < (framedAt.get(head) ?? -1n))) lateUnits.add(t.unit);
   }
   for (const t of touched) if (lateUnits.has(t.unit)) held.add(t.e.index);
   return held;

@@ -8,7 +8,9 @@
 --   import_run         one row per import: its per-user counter, the export date, the version
 --                      its writes carry and the seq of its marker imp/mfc/import (FRAME, F1).
 --   import_frame       the figures an import decided: a pushed edit to one of them whose basis is
---                      before the marker is a LATE EDIT (import.proto HELD).
+--                      before the marker is a LATE EDIT (import.proto HELD). `settled`: the import
+--                      wrote to the figure or moved a copy or field base of it; WK-14a, which has
+--                      no replay, holds a late edit only for such a frame (src/import/holds.ts).
 --   import_row_base    ROW BASE per MFC id: what the last import that settled the row took.
 --   import_copy_base   COPY BASE per copy: the kind (or out) and head a settlement gave it.
 --   import_field_base  FIELD BASE per head and field: the value MFC last stated (null: none).
@@ -34,6 +36,7 @@ CREATE TABLE import_frame (
   user_id        uuid NOT NULL,
   import_number  integer NOT NULL,
   head_id        uuid NOT NULL,
+  settled        boolean NOT NULL,
   PRIMARY KEY (user_id, import_number, head_id),
   FOREIGN KEY (user_id, import_number) REFERENCES import_run (user_id, import_number)
 );

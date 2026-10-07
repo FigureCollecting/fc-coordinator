@@ -94,6 +94,8 @@ export interface Plan {
   items: { set: FigureItem[]; end: string[] };
   /** Every figure the import decided (its frame), in head order. */
   figures: string[];
+  /** The figures it wrote to or moved a copy or field base of, in head order. */
+  settled: string[];
   /** The figures whose decision is a conflict. */
   conflicted: string[];
   /** Settled figures this export changes: WK-14b's to decide. */
@@ -301,6 +303,7 @@ export function planImport(input: PlanInput): Plan {
     fieldBases: [],
     items: { set: [], end: [] },
     figures: [],
+    settled: [],
     conflicted: [],
     beyond: [],
     pending: [],
@@ -360,6 +363,8 @@ export function planImport(input: PlanInput): Plan {
       plan.writes.push({ facetKey: `${FIGURE_ITEM_PREFIX}${S}`, op: 'delete', payload: '' });
       plan.items.end.push(S);
     }
+    // Every op writes to S or moves a copy or field base of it; a row that states nothing new has none.
+    if (d.ops.length > 0) plan.settled.push(S);
     for (const op of d.ops) {
       if (op.op === 'create') {
         // The origin is server-owned and carries no display time.

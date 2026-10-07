@@ -371,7 +371,7 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
         `INSERT INTO import_run (user_id, import_number, export_date, version, marker_seq) VALUES ('${USER}', 1, '2026-09-09', '${V}', ${seq})`,
       );
       expect(run.exitCode).toBe(0);
-      expect((await asApp(`INSERT INTO import_frame (user_id, import_number, head_id) VALUES ('${USER}', 1, '${HEAD}')`)).exitCode).toBe(0);
+      expect((await asApp(`INSERT INTO import_frame (user_id, import_number, head_id, settled) VALUES ('${USER}', 1, '${HEAD}', true)`)).exitCode).toBe(0);
       denied(await asApp('UPDATE import_run SET export_date = export_date WHERE false'));
       denied(await asApp('DELETE FROM import_run WHERE false'));
       denied(await asApp('UPDATE import_frame SET head_id = head_id WHERE false'));
