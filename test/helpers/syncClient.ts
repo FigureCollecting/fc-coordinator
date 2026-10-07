@@ -15,11 +15,14 @@ import {
 import {
   DeltaRequestSchema,
   DeltaResponseSchema,
+  ImportMfcExportRequestSchema,
+  ImportMfcExportResponseSchema,
   PushRequestSchema,
   PushResponseSchema,
   StatusRequestSchema,
   StatusResponseSchema,
   type DeltaResponse,
+  type ImportMfcExportResponse,
   type PushResponse,
   type StatusResponse,
 } from '@figurecollecting/fc-api-contract';
@@ -29,12 +32,13 @@ import { buildApp } from '../../src/app.js';
 import { resolveAuthConfig } from '../../src/auth/config.js';
 import { createAccessTokenVerifier } from '../../src/auth/oidc.js';
 import { createDeviceStore } from '../../src/auth/plugin.js';
-import { productionConnectOptions } from '../../src/connect/register.js';
+import { productionConnectOptions, type ConnectOptions } from '../../src/connect/register.js';
 import type { KeyedSerialiser } from '../../src/sync/serialise.js';
 import type { HoldPolicy } from '../../src/sync/service.js';
 import { makeDeviceKey, makeIssuer, makeProof, TEST_ORIGIN, type DeviceKey, type TestIssuer } from './auth.js';
 
 export const SYNC_SERVICE_PATH = '/coordinator.v1.SyncService';
+export const IMPORT_PATH = '/coordinator.v1.ImportService/ImportMfcExport';
 
 export interface SyncApp {
   app: FastifyInstance;
@@ -45,13 +49,15 @@ export interface SyncApp {
 /**
  * Production wiring, as src/server.ts assembles it, minus the spine. Pass the issuer of a running
  * app to start a second replica on the same database that accepts the same tokens, a Push queue
- * to watch it, and a hold policy to stand in for the import's (import.proto HELD).
+ * to watch it, a hold policy to stand in for the import's (import.proto HELD), and any Connect
+ * option to lay over production's (the import's spine and key).
  */
 export async function startSyncApp(
   db: pg.Pool,
   sharedIssuer?: TestIssuer,
   writers?: KeyedSerialiser,
   holds?: HoldPolicy,
+  connect: Partial<ConnectOptions> = {},
 ): Promise<SyncApp> {
   const issuer = sharedIssuer ?? (await makeIssuer());
   const config = resolveAuthConfig({
@@ -76,6 +82,7 @@ export async function startSyncApp(
     compare: {
       ...productionConnectOptions(db, {}),
       ...(writers !== undefined || holds !== undefined ? { sync: { db, ...(writers !== undefined ? { writers } : {}), ...(holds !== undefined ? { holds } : {}) } } : {}),
+      ...connect,
       initSigning: false,
     },
   });
@@ -142,8 +149,12 @@ export class SyncCaller {
   }
 
   /** Raw signed call. Retries once when the server asks for a nonce. */
-  async send(method: SyncMethod, body: string | Buffer, binary = false): Promise<LightMyRequestResponse> {
-    const url = `${SYNC_SERVICE_PATH}/${method}`;
+  send(method: SyncMethod, body: string | Buffer, binary = false): Promise<LightMyRequestResponse> {
+    return this.sendTo(`${SYNC_SERVICE_PATH}/${method}`, body, binary);
+  }
+
+  /** Raw signed call to any Connect path. */
+  async sendTo(url: string, body: string | Buffer, binary = false): Promise<LightMyRequestResponse> {
     let res: LightMyRequestResponse | undefined;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       res = await this.app.inject({
@@ -170,12 +181,13 @@ export class SyncCaller {
   }
 
   private async call<I extends DescMessage, O extends DescMessage>(
-    method: SyncMethod,
+    method: SyncMethod | { url: string },
     input: I,
     output: O,
     init: MessageInitShape<I>,
   ): Promise<Rpc<MessageShape<O>>> {
-    const raw = await this.send(method, toJsonString(input, create(input, init)));
+    const body = toJsonString(input, create(input, init));
+    const raw = typeof method === 'string' ? await this.send(method, body) : await this.sendTo(method.url, body);
     if (raw.statusCode === 200) return { ok: true, message: fromJsonString(output, raw.body), raw };
     const err = (raw.headers['content-type'] ?? '').toString().includes('json')
       ? (raw.json() as { code?: string; message?: string })
@@ -193,6 +205,10 @@ export class SyncCaller {
 
   status(): Promise<Rpc<StatusResponse>> {
     return this.call('Status', StatusRequestSchema, StatusResponseSchema, {});
+  }
+
+  importMfcExport(init: MessageInitShape<typeof ImportMfcExportRequestSchema>): Promise<Rpc<ImportMfcExportResponse>> {
+    return this.call({ url: IMPORT_PATH }, ImportMfcExportRequestSchema, ImportMfcExportResponseSchema, init);
   }
 
   /** Push over the binary protocol: the wire bytes are returned untouched. */
