@@ -33,7 +33,7 @@ describe('migrations — numbered-SQL doctrine', () => {
     // refuses a back-dated prefix (exit 6), so this file can never be added
     // later to a database that has already applied 0001 — it is 0000 or it is a
     // hand-run psql nobody can prove.
-    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql']);
+    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql', '0004_sync_transactions.sql']);
   });
 
   it('contains no transaction control — the runner owns the boundaries (psql -1)', () => {
@@ -101,10 +101,10 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     await pg?.stop();
   });
 
-  it('applies all four migrations in one run and records them in the ledger', async () => {
+  it('applies all five migrations in one run and records them in the ledger', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=4 skipped=0');
+    expect(run.output).toContain('applied=5 skipped=0');
 
     const ledger = await asMigratorDb('SELECT filename FROM schema_migrations ORDER BY filename');
     expect(ledger.stdout.trim().split('\n')).toEqual([
@@ -112,13 +112,14 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
       '0001_identity.sql',
       '0002_collection.sql',
       '0003_sync.sql',
+      '0004_sync_transactions.sql',
     ]);
   });
 
   it('is a no-op on re-run', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=4');
+    expect(run.output).toContain('applied=0 skipped=5');
   });
 
   // ── The two-role split, proven rather than described ──────────────────────
@@ -292,6 +293,54 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     });
   });
 
+  // 0004: the transaction marker and the held edits, on the same append-only terms as the feed.
+  describe('0004_sync_transactions for the application role', () => {
+    const USER = '88888888-8888-8888-8888-888888888888';
+    const denied = (run: ExecResult): void => {
+      expect(run.exitCode).not.toBe(0);
+      expect(run.output).toMatch(/42501|permission denied/i);
+    };
+
+    beforeAll(async () => {
+      await asMigratorDb(`INSERT INTO app_user (id) VALUES ('${USER}')`);
+    });
+
+    it('opens a server transaction on every feed event the writer does not mark', async () => {
+      const append = await asApp(
+        `INSERT INTO feed_event (user_id, facet_key, version, op, payload) VALUES ('${USER}', 'k', '2026-09-26T00:00:00.000000Z', 'delete', '') RETURNING opens_txn`,
+      );
+      expect(append.exitCode).toBe(0);
+      expect(append.stdout.trim().split('\n')[0]).toBe('t');
+    });
+
+    it('lets the app keep a held edit once, and refuses UPDATE and DELETE on it', async () => {
+      const keep = await asApp(
+        `INSERT INTO held_edit (user_id, client_id, ordinal, facet_key, version, op, payload, basis_seq) VALUES ('${USER}', 'c1', 0, 'k', '2026-09-26T00:00:00.000000Z', 'delete', '', 0)`,
+      );
+      expect(keep.exitCode).toBe(0);
+      denied(await asApp("UPDATE held_edit SET payload = '' WHERE false"));
+      denied(await asApp('DELETE FROM held_edit WHERE false'));
+    });
+
+    it('holds a held edit to the feed\'s own rules: canonical version, op and payload paired, a basis of 0 or more', async () => {
+      const keep = (version: string, op: string, payload: string, basis: number, ordinal: number) =>
+        asApp(
+          `INSERT INTO held_edit (user_id, client_id, ordinal, facet_key, version, op, payload, basis_seq) VALUES ('${USER}', 'c2', ${ordinal}, 'k', '${version}', '${op}', '${payload}', ${basis})`,
+        );
+      for (const [i, run] of [
+        await keep('2026-09-26T00:00:00Z', 'delete', '', 0, 1),
+        await keep('2026-09-26T00:00:00.000000Z', 'delete', '{}', 0, 2),
+        await keep('2026-09-26T00:00:00.000000Z', 'upsert', '', 0, 3),
+        await keep('2026-09-26T00:00:00.000000Z', 'remove', '', 0, 4),
+        await keep('2026-09-26T00:00:00.000000Z', 'delete', '', -1, 5),
+        await keep('2026-09-26T00:00:00.000000Z', 'delete', '', 0, -1),
+      ].entries()) {
+        expect([i, run.exitCode]).not.toEqual([i, 0]);
+        expect(run.output).toMatch(/check constraint/i);
+      }
+    });
+  });
+
   it('refuses to run as a SUPERUSER', async () => {
     const run = await migrate({ PGUSER: 'postgres', PGPASSWORD: 'postgres' });
     expect(run.exitCode).toBe(2);
@@ -325,7 +374,7 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
   it('still exits 0 on a correctly named directory', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=4');
+    expect(run.output).toContain('applied=0 skipped=5');
   });
 
   it('refuses the whole run when an applied migration has been edited on disk', async () => {

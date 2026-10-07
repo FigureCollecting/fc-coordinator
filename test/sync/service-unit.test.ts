@@ -75,6 +75,7 @@ describe('a Push whose transaction fails', () => {
         version: canonicalVersion({ instant: new Date(Date.now() - 1000), counter: 0, deviceId: DEVICE }),
         op: SyncOp.UPSERT,
         payload: '{}',
+        basis: '',
       },
     ],
   };

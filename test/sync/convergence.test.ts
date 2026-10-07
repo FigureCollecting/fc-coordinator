@@ -1,7 +1,9 @@
 // (1) Convergence. Two devices of one user, each on its own replica, edit offline (some edits
-// invalid, so REJECTED), push and pull in random interleavings, lose responses, and push
-// concurrently. Each device follows the contract's client rules, so the property is: both end on
-// the same facet map, equal to a replay from an empty cursor and to the server's facet_state.
+// invalid or minted with no basis, so REJECTED), push and pull in random interleavings, lose
+// responses, restart with a transaction half fetched, and push concurrently. Each device follows
+// the contract's 0.3.0 client rules (rule 7: a transaction is applied only once its commit_cursor
+// arrives, every edit carries its basis), so the property is: both end on the same facet map,
+// equal to a replay from an empty cursor and to the server's facet_state.
 // The edits span every 0.3.0 user-owned family (sync.proto rule 6), plus keys a client must never
 // push (a retired holding/* key, every server-owned family), which are always REJECTED.
 import { randomUUID } from 'node:crypto';
@@ -46,6 +48,10 @@ let rejected = 0;
 /** Families seen APPLIED, and edits on a key no client may push, across every run. */
 const appliedFamilies = new Set<string>();
 let refusedForeign = 0;
+let basisMissing = 0;
+/** Pulls that ended with events staged, and restarts that dropped some: rule 7 was exercised. */
+let stagedAcrossPages = 0;
+let restartsWhileStaged = 0;
 /** The class of every refused key: a server-owned family, or the retired holding/{h}/{field}. */
 const refusedFamilies = new Set<string>();
 const RETIRED = ['holding/status', 'holding/count'] as const;
@@ -69,14 +75,19 @@ interface Facet {
   op: SyncOp;
   payload: string;
 }
-type Edit = { facetKey: string } & Facet;
+type Edit = { facetKey: string; basis?: string } & Facet;
 
 /** A device that follows sync.proto's client rules and nothing else. */
 class SimDevice {
   readonly local = new Map<string, Facet>();
   private outbox: Edit[] = [];
   private inflight: { clientId: string; events: Edit[] } | undefined;
+  /** Where the next Delta starts: past what is staged. */
   private cursor = '';
+  /** The commit_cursor of the last transaction applied: every edit's basis, and where a restart resumes. */
+  private committed = '';
+  /** Fetched, waiting for the event that carries its transaction's commit_cursor. */
+  staged: SyncEvent[] = [];
   private readonly hlc: Hlc;
 
   constructor(
@@ -86,10 +97,11 @@ class SimDevice {
     this.hlc = new Hlc({ deviceId: caller.deviceId, clock });
   }
 
-  edit(facetKey: string, op: SyncOp, payload: string): void {
+  /** Mint an edit on the last transaction applied; `noBasis` mints one a 0.3.0 server refuses. */
+  edit(facetKey: string, op: SyncOp, payload: string, noBasis = false): void {
     const version = this.hlc.tick(this.local.get(facetKey)?.version);
     this.local.set(facetKey, { version, op, payload });
-    this.outbox.push({ facetKey, version, op, payload });
+    this.outbox.push({ facetKey, version, op, payload, ...(noBasis ? {} : { basis: this.committed }) });
   }
 
   /** Send the frozen batch, or freeze the outbox into a new one. A dropped response keeps it frozen. */
@@ -109,9 +121,24 @@ class SimDevice {
   async delta(limit: number, drop: boolean): Promise<boolean> {
     const page = ok(await this.caller.delta({ cursor: this.cursor, limit }));
     if (drop) return true;
-    for (const event of page.events) this.offer(event);
+    for (const event of page.events) {
+      expect(event.basis).toBeUndefined();
+      this.staged.push(event);
+      if (event.commitCursor === '') continue;
+      for (const staged of this.staged) this.offer(staged);
+      this.staged = [];
+      this.committed = event.commitCursor;
+    }
+    if (this.staged.length > 0) stagedAcrossPages += 1;
     this.cursor = page.nextCursor;
     return page.hasMore;
+  }
+
+  /** What was staged in memory is gone; the next pull resumes from the last commit applied. */
+  restart(): void {
+    if (this.staged.length > 0) restartsWhileStaged += 1;
+    this.staged = [];
+    this.cursor = this.committed;
   }
 
   async settleAll(): Promise<void> {
@@ -123,6 +150,10 @@ class SimDevice {
     expect(result.facetKey).toBe(sent.facetKey);
     expect([PushOutcome.APPLIED, PushOutcome.DUPLICATE, PushOutcome.STALE, PushOutcome.REJECTED]).toContain(result.outcome);
     if (result.outcome === PushOutcome.REJECTED) rejected += 1;
+    if (result.reason.startsWith('basis_missing')) {
+      expect(sent.basis).toBeUndefined();
+      basisMissing += 1;
+    }
     const family = parseUserFacetKey(sent.facetKey)?.family;
     if (family === undefined) {
       expect([result.outcome, result.reason.split(':')[0]]).toEqual([PushOutcome.REJECTED, 'facet_key_not_user_owned']);
@@ -264,6 +295,7 @@ const command = fc.oneof(
       family: fc.constantFrom(...FAMILIES),
       remove: fc.nat({ max: 4 }).map((n) => n === 0),
       bad: fc.nat({ max: 3 }).map((n) => n === 0),
+      noBasis: fc.nat({ max: 7 }).map((n) => n === 0),
       n: fc.nat({ max: 1000 }),
       tickMs: fc.nat({ max: 2 }),
     }),
@@ -274,6 +306,7 @@ const command = fc.oneof(
     weight: 2,
     arbitrary: fc.record({ kind: fc.constant('delta' as const), d: device, limit: fc.integer({ min: 1, max: 4 }), drop: fc.boolean() }),
   },
+  { weight: 1, arbitrary: fc.record({ kind: fc.constant('restart' as const), d: device }) },
 );
 
 const sorted = (map: Map<string, Facet>) => [...map.entries()].sort(([a], [b]) => (a < b ? -1 : 1));
@@ -300,7 +333,7 @@ describe('(1) convergence', () => {
               t += cmd.tickMs;
               const key = keyFor(cmd.family, cmd.slot);
               const payload = cmd.bad ? JSON.stringify({ unknown_field: true, ...DISPLAY }) : payloadFor(cmd.family, cmd.n);
-              devices[cmd.d].edit(key, cmd.remove ? SyncOp.DELETE : SyncOp.UPSERT, cmd.remove ? '' : payload);
+              devices[cmd.d].edit(key, cmd.remove ? SyncOp.DELETE : SyncOp.UPSERT, cmd.remove ? '' : payload, cmd.noBasis);
               break;
             }
             case 'push':
@@ -312,6 +345,9 @@ describe('(1) convergence', () => {
             case 'delta':
               await devices[cmd.d].delta(cmd.limit, cmd.drop);
               break;
+            case 'restart':
+              devices[cmd.d].restart();
+              break;
           }
         }
 
@@ -321,6 +357,8 @@ describe('(1) convergence', () => {
 
         const replay = new SimDevice(a, clock);
         while (await replay.delta(replayPage, false));
+        // The feed ends on a commit: a caught-up client holds nothing staged.
+        expect([devices[0].staged, devices[1].staged, replay.staged]).toEqual([[], [], []]);
 
         const server = await db.admin.query<{ facet_key: string; version: string; op: string; payload: string }>(
           'SELECT facet_key, version, op, payload FROM facet_state WHERE user_id = $1',
@@ -341,8 +379,8 @@ describe('(1) convergence', () => {
         examples: [
           [
             [
-              { kind: 'edit', d: 1, slot: 0, family: 'uf/score', remove: false, bad: false, n: 3, tickMs: 1 },
-              { kind: 'edit', d: 0, slot: 0, family: 'uf/score', remove: false, bad: true, n: 0, tickMs: 1 },
+              { kind: 'edit', d: 1, slot: 0, family: 'uf/score', remove: false, bad: false, noBasis: false, n: 3, tickMs: 1 },
+              { kind: 'edit', d: 0, slot: 0, family: 'uf/score', remove: false, bad: true, noBasis: false, n: 0, tickMs: 1 },
               { kind: 'push', d: 0, drop: true },
               { kind: 'push', d: 1, drop: false },
               { kind: 'delta', d: 0, limit: 4, drop: false },
@@ -357,6 +395,9 @@ describe('(1) convergence', () => {
     expect(rejected).toBeGreaterThan(50);
     expect([...appliedFamilies].sort()).toEqual([...USER_FACET_FAMILIES].sort());
     expect(refusedForeign).toBeGreaterThan(10);
+    expect(basisMissing).toBeGreaterThan(10);
+    expect(stagedAcrossPages).toBeGreaterThan(10);
+    expect(restartsWhileStaged).toBeGreaterThan(0);
     expect([...refusedFamilies].sort()).toEqual([...SERVER_FACET_FAMILIES, ...RETIRED].sort());
   }, 600_000);
 });
