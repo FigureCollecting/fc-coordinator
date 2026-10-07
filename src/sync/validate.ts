@@ -55,7 +55,7 @@ const reject = (code: PushRejectReason, detail: string, userOwned = true): Verdi
 export function validateEvent(event: Pick<SyncEvent, 'facetKey' | 'version' | 'op' | 'payload' | 'basis'>, ctx: EventContext): Verdict {
   const payload = checkPayload(event, ctx);
   if (payload !== undefined) return payload;
-  // A basis is a commit_cursor this server issued, or '' (decodeCursor reads it as 0). One past
+  // A basis is a commit_cursor this server issued, or '' (the start of the feed, 0). One past
   // the head is still a basis: an outbox minted before a restore keeps its bases (rule 6).
   if (event.basis === undefined) return reject('basis_missing', 'the event carries no basis');
   const basisSeq = decodeCursor(event.basis);

@@ -709,7 +709,9 @@ last check. HELD is decided once per Push, before anything is applied, by a
 `HoldPolicy`; a held edit is kept in `held_edit` with its basis, not applied,
 answered with `current`, and HELD again on a replay. Until the import lands
 there is no frame, so the default policy holds nothing and every edit is
-placed by LWW whatever its basis.
+placed by LWW whatever its basis. The start of a feed has one cursor, `''`:
+Status and `next_cursor` answer it while a user's feed is empty, so a client
+that has applied nothing compares equal and is not shown as behind.
 
 ## Phase-2 client (`scripts/phase2-client`)
 
