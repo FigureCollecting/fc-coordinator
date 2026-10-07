@@ -69,10 +69,19 @@ describe('resolveMfcIds', () => {
     expect(s.calls).toHaveLength(0);
   });
 
+  it('maps an id only from a ref this batch sent, on site mfc', async () => {
+    const s = spine(2, 50, (payload) => {
+      (payload['products'] as unknown[]).push({ productId: head(97), requestedAs: [{ sourceItem: { site: 'other', nativeId: '3' } }, { sourceItem: { site: 'mfc', nativeId: '4' } }] });
+    });
+    const map = await resolveMfcIds(s, ['1', '3'], 'now');
+    expect([...map]).toEqual([['1', head(1)]]);
+  });
+
   it('keeps the first product that names an id, and ignores refs it did not send', async () => {
     const s = spine(10, 50, (payload) => {
       const products = payload['products'] as { productId: string; requestedAs: unknown[] }[];
       products.push({ productId: head(99), requestedAs: [{ sourceItem: { site: 'mfc', nativeId: '1' } }, { sourceItem: { site: 'other', nativeId: '2' } }, { gtin14: '1' }, 'junk'] });
+      (products as unknown[]).push({ productId: head(98) });
     });
     const map = await resolveMfcIds(s, ['1', '2'], 'now');
     expect(map.get('1')).toBe(head(1));

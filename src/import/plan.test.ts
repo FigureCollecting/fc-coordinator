@@ -2,7 +2,7 @@
 // a re-import that finds a settled figure unchanged), as a pure function of the server's state.
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import Ajv2020 from 'ajv/dist/2020.js';
+import { Ajv2020 } from 'ajv/dist/2020.js';
 import { describe, expect, it } from 'vitest';
 import type { Facet } from '../sync/store.js';
 import { importOccId } from './occ.js';
@@ -136,6 +136,11 @@ describe('planImport: a figure new to the import', () => {
     expect([...p.copyBases]).toEqual([[APP_A, { head: S1, kind: 'owned' }]]);
   });
 
+  it('counts a copy whose head was tombstoned as no copy of any figure', () => {
+    const p = plan(state([gone(`occ/${APP_A}/head`), up(`occ/${APP_A}/status`, { status: 'owned', ...SHOWN })]), [row('119', S1, 'owned')]);
+    expect(keys(p)).toEqual([`occ/${occ('119', 1)}/origin`, `occ/${occ('119', 1)}/head`, `occ/${occ('119', 1)}/status`]);
+  });
+
   it('creates MFC\'s kind beside a copy of another kind, which it never touches', () => {
     const p = plan(state(appCopy(APP_A, S1, 'wished')), [row('119', S1, 'owned')]);
     expect(keys(p)).toEqual([`occ/${occ('119', 1)}/origin`, `occ/${occ('119', 1)}/head`, `occ/${occ('119', 1)}/status`]);
@@ -166,9 +171,10 @@ describe('planImport: a figure new to the import', () => {
     expect(p.rowBases).toEqual([row('119', S1, 'owned', 0, { score: 6 })]);
   });
 
-  it('settles a row that states nothing new as nochange, writing nothing', () => {
-    const p = plan(state(), [row('119', S1, 'owned', 0)]);
+  it('settles a row that states nothing new as nochange: nothing written, no copy base moved', () => {
+    const p = plan(state(appCopy(APP_B, S1, 'former')), [row('119', S1, 'owned', 0)]);
     expect(p.writes).toEqual([]);
+    expect(p.copyBases.size).toBe(0);
     expect(p.rowBases).toEqual([row('119', S1, 'owned', 0)]);
   });
 
@@ -222,6 +228,22 @@ describe('planImport: conflicts (GR-Q1: surfaced, never written over)', () => {
     expect(p.writes[0]!.payload).toBe(sortedJson(item));
   });
 
+  it('lists every pending item after the import, earlier ones of figures it did not decide included, in head order', () => {
+    const earlier = plan(state([up(`uf/${S2}/score`, { score: 9, ...SHOWN })]), [row('120', S2, 'owned', 0, { score: 7 })]);
+    const standing = earlier.items.set[0]!;
+    const st = state(
+      [up(`uf/${S1}/score`, { score: 9, ...SHOWN }), { facetKey: `imp/mfc/figure/${S2}`, version: V, op: 'upsert', payload: earlier.writes[0]!.payload }],
+      { items: new Map([[S2, standing]]) },
+    );
+    const p = plan(st, [row('119', S1, 'owned', 0, { score: 7 })], { importNumber: 2 });
+    expect(p.pending.map((i) => [i.head, i.rev])).toEqual([
+      [S1, p.items.set[0]!.rev],
+      [S2, standing.rev],
+    ]);
+    expect(p.pending[0]!.payload).toBe(p.writes[0]!.payload);
+    expect(p.pending[1]!.payload).toBe(earlier.writes[0]!.payload);
+  });
+
   it('calls rows of one figure stating different values a conflict', () => {
     const p = plan(state(), [row('9', S1, 'owned', 1, { score: 7 }), row('10', S1, 'owned', 1, { score: 8 })]);
     expect(p.conflicted).toEqual([S1]);
@@ -261,20 +283,29 @@ describe('planImport: conflicts (GR-Q1: surfaced, never written over)', () => {
     expect(again.stats.conflictsRaised).toBe(1);
   });
 
-  it('rewrites an item whose rev stands when the app\'s side it shows has moved', () => {
+  it('keeps what the raising import found, and rewrites the item when the app\'s copies it shows have moved', () => {
     const rows = [row('119', S1, 'owned', 1, { score: 7 })];
     const st = state([up(`uf/${S1}/score`, { score: 9, ...SHOWN })]);
     const first = plan(st, rows);
     const raised = first.items.set[0]!;
-    const again = plan(
-      state([up(`uf/${S1}/score`, { score: 8, ...SHOWN }), { facetKey: `imp/mfc/figure/${S1}`, version: V, op: 'upsert', payload: first.writes[0]!.payload }], { items: new Map([[S1, raised]]) }),
-      rows,
-      { importNumber: 2 },
-    );
-    expect(keys(again)).toEqual([`imp/mfc/figure/${S1}`]);
-    expect(again.items.set[0]!.rev).toBe(raised.rev);
-    expect(JSON.parse(again.writes[0]!.payload)).toMatchObject({ import: 1, fields: { score: { app: 8 } } });
-    expect(again.stats.conflictsRaised).toBe(0);
+    const stored = { facetKey: `imp/mfc/figure/${S1}`, version: V, op: 'upsert' as const, payload: first.writes[0]!.payload };
+    // The app's score moved to 8: the rev carries the app's side as the raising import found it, so nothing changes.
+    const moved = plan(state([up(`uf/${S1}/score`, { score: 8, ...SHOWN }), stored], { items: new Map([[S1, raised]]) }), rows, { importNumber: 2 });
+    expect(moved.writes).toEqual([]);
+    // The app filed the copy MFC counts: the counts and copies it shows, and the keep it previews, change; the rev stands.
+    const filed = plan(state([...st.facets.values(), ...appCopy(APP_A, S1, 'owned'), stored], { items: new Map([[S1, raised]]) }), rows, { importNumber: 2 });
+    expect(keys(filed)).toEqual([`imp/mfc/figure/${S1}`]);
+    expect(filed.items.set[0]!.rev).toBe(raised.rev);
+    const item = JSON.parse(filed.writes[0]!.payload) as Record<string, unknown>;
+    expect(figureSchema(item)).toBe(true);
+    expect(item).toMatchObject({
+      import: 1,
+      counts: { owned: { base: 0, app: 1, mfc: 1 } },
+      fields: { score: { status: 'conflict', app: 9, mfc: 7 } },
+      copies: [{ occ: APP_A, status: 'owned', tracked: false }],
+      preview: { keep: { copies: [], fields: [] } },
+    });
+    expect(filed.stats.conflictsRaised).toBe(0);
   });
 
   it('ends the item when a later import finds the sides agreeing, and settles the figure', () => {

@@ -20,6 +20,9 @@ import {
   initOpenFgaTransport,
   setEntitlementAuditSink,
 } from '../entitlements/index.js';
+import { holdLateForImport } from '../import/holds.js';
+import { resolveImportOccKey } from '../import/occ.js';
+import { createImportRoutes, type ImportRoutesDeps } from '../import/service.js';
 import { createSpineReadClientFromEnv } from '../spine/spineReadClient.js';
 import { createSyncRoutes, MAX_REQUEST_BYTES, type SyncRoutesDeps } from '../sync/service.js';
 import type { SyncPool } from '../sync/store.js';
@@ -47,6 +50,8 @@ export interface ConnectOptions extends CompareRoutesDeps {
   sync?: SyncRoutesDeps;
   /** Serve coordinator.v1 CatalogService beside Compare, on the same guard and interceptors. */
   catalog?: CatalogRoutesDeps;
+  /** Serve coordinator.v1 ImportService beside Compare, on the same guard and interceptors. */
+  import?: ImportRoutesDeps;
   /**
    * Load the entitlement signing key at registration and log whether minting is
    * on, and name which OpenFGA credential path is configured. Default true: a
@@ -80,17 +85,18 @@ export interface ConnectOptions extends CompareRoutesDeps {
 }
 
 /**
- * The surface the process serves: Compare and Catalog on the env's spine (null = degraded),
- * Sync on the pool. ONE spine client for both, so both ride one HTTP/2 connection through
- * the mesh. Here rather than in server.ts, which is outside coverage, so dropping a service
- * fails a test.
+ * The surface the process serves: Compare, Catalog and Import on the env's spine (null =
+ * degraded), Sync and Import on the pool, Sync holding a late edit to an imported figure. ONE
+ * spine client for all three, so they ride one HTTP/2 connection through the mesh. Here rather
+ * than in server.ts, which is outside coverage, so dropping a service fails a test.
  */
 export function productionConnectOptions(pool: SyncPool, env: NodeJS.ProcessEnv = process.env): ConnectOptions {
   const spineRead = createSpineReadClientFromEnv(env);
   return {
     spineRead,
-    sync: { db: pool },
+    sync: { db: pool, holds: holdLateForImport },
     catalog: { spineRead, mediaBaseUrl: resolveMediaBaseUrl(env) },
+    import: { db: pool, spineRead, occIdKey: resolveImportOccKey(env) },
   };
 }
 
@@ -125,6 +131,7 @@ export function registerConnect(app: FastifyInstance, options: ConnectOptions): 
   const compareRoutes = createCompareRoutes(options);
   const syncRoutes = options.sync === undefined ? undefined : createSyncRoutes(options.sync);
   const catalogRoutes = options.catalog === undefined ? undefined : createCatalogRoutes(options.catalog);
+  const importRoutes = options.import === undefined ? undefined : createImportRoutes(options.import);
 
   void app.register(fastifyConnectPlugin, {
     // `prefix` is read by Fastify's register, not by the plugin, which ignores
@@ -134,6 +141,7 @@ export function registerConnect(app: FastifyInstance, options: ConnectOptions): 
       compareRoutes(router);
       syncRoutes?.(router);
       catalogRoutes?.(router);
+      importRoutes?.(router);
     },
     // §A.5 rule 3, inbound half: continue the caller's trace and be a span in
     // it, so every log line the handler writes carries the trace tag and the

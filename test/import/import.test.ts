@@ -15,7 +15,7 @@ import {
   type SyncEvent,
 } from '@figurecollecting/fc-api-contract';
 import { GetProductsResponseSchema } from '@figurecollecting/ingest-contract/read';
-import Ajv2020 from 'ajv/dist/2020.js';
+import { Ajv2020 } from 'ajv/dist/2020.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { importOccId } from '../../src/import/occ.js';
 import { decodeCursor } from '../../src/sync/cursor.js';
@@ -315,6 +315,8 @@ describe('unresolved rows', () => {
     // Only the rows that could be written were asked about; invalid ones never reach the spine.
     const asked = spine.productCalls.at(-1)!.request.refs.map((r) => (r.ref.case === 'sourceItem' ? r.ref.value.nativeId : ''));
     expect(asked).toEqual([known, gone]);
+    // The same export again, its unresolved rows included, writes only its marker.
+    expect(ok(await a.importMfcExport({ csvText: csv, exportDate: EXPORT_DATE }))).toMatchObject({ facetsWritten: 1, unchanged: 1, unresolved: res.unresolved });
   });
 });
 
@@ -371,6 +373,49 @@ describe("the app's side (GR-Q1: an import surfaces a conflict and never writes 
     expect(await feedCount(a.userId)).toBe(before + 1);
   });
 
+  it('ends the conflict when a later import finds the app agreeing, and settles the figure then', async () => {
+    const a = await SyncCaller.enrol(h);
+    const scored = nextId();
+    const version = (n: number) => canonicalVersion({ instant: new Date(Date.now() - 1000), counter: n, deviceId: a.deviceId });
+    const score = (n: number, v: string) => ({ facetKey: `uf/${headFor(scored)}/score`, version: v, op: SyncOp.UPSERT, payload: JSON.stringify({ score: n, ...DISPLAY }), basis: '' });
+    ok(await a.push({ clientId: randomUUID(), events: [score(9, version(1))] }));
+    const csv = mfcCsv([row(scored, 'Owned', { score: '7/10' })]);
+    expect(ok(await a.importMfcExport({ csvText: csv, exportDate: EXPORT_DATE })).conflictsPending).toBe(1);
+    const { cursor } = await drain(a);
+
+    // The user takes MFC's score by hand, knowing the import; the next import finds the sides agreeing.
+    const knowing = canonicalVersion({ instant: new Date(Date.now() + 2000), counter: 1, deviceId: a.deviceId });
+    expect(ok(await a.push({ clientId: randomUUID(), events: [{ ...score(7, knowing), basis: cursor }] })).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    const settled = ok(await a.importMfcExport({ csvText: csv, exportDate: EXPORT_DATE }));
+    expect(settled).toMatchObject({ conflictsPending: 0, conflictsRaised: 0, occurrencesAdded: 1, review: [] });
+    const { events } = await drain(a, cursor);
+    expect(events.map((e) => [e.facetKey.replace(/^occ\/[^/]+/, 'occ'), e.op])).toEqual([
+      [`uf/${headFor(scored)}/score`, SyncOp.UPSERT],
+      [`imp/mfc/figure/${headFor(scored)}`, SyncOp.DELETE],
+      ['occ/origin', SyncOp.UPSERT],
+      ['occ/head', SyncOp.UPSERT],
+      ['occ/status', SyncOp.UPSERT],
+      ['imp/mfc/import', SyncOp.UPSERT],
+    ]);
+    const { rows } = await db.admin.query('SELECT 1 FROM import_figure_item WHERE user_id = $1', [a.userId]);
+    expect(rows).toHaveLength(0);
+    // Settled now: the same export again writes only its marker.
+    expect(ok(await a.importMfcExport({ csvText: csv, exportDate: EXPORT_DATE })).facetsWritten).toBe(1);
+  });
+
+  it('writes over a value the app removed even at a version ahead of the server clock, minting above it', async () => {
+    const a = await SyncCaller.enrol(h);
+    const noted = nextId();
+    const ahead = canonicalVersion({ instant: new Date(Date.now() + 4 * 60_000), counter: 3, deviceId: a.deviceId });
+    const key = `uf/${headFor(noted)}/note`;
+    ok(await a.push({ clientId: randomUUID(), events: [{ facetKey: key, version: ahead, op: SyncOp.DELETE, payload: '', basis: '' }] }));
+    ok(await a.importMfcExport({ csvText: mfcCsv([row(noted, 'Wished', { note: 'from MFC' })]), exportDate: EXPORT_DATE }));
+    const written = (await drain(a)).events.filter((e) => e.facetKey === key).at(-1)!;
+    expect(written).toMatchObject({ op: SyncOp.UPSERT, payload: JSON.stringify({ note: 'from MFC', edited_at: `${EXPORT_DATE}T00:00:00Z`, tz: 'UTC' }) });
+    expect(written.version > ahead).toBe(true);
+    expect(written.version.endsWith('#00000000000000000000000000000000')).toBe(true);
+  });
+
   it('refuses, writing nothing, an import whose conflict a FAVOR preference would settle (WK-14b)', async () => {
     const a = await SyncCaller.enrol(h);
     const scored = nextId();
@@ -403,7 +448,8 @@ describe('HELD: an edit made before an import it had not seen', () => {
     expect(res.occurrencesAdded).toBe(2);
     const { cursor } = await drain(a);
     const copyX = importOccId(KEY, a.userId, x, 1);
-    const version = (n: number) => canonicalVersion({ instant: new Date(Date.now() - 500), counter: n, deviceId: b.deviceId });
+    // Above the import's own versions, so LWW alone would apply every one of these.
+    const version = (n: number) => canonicalVersion({ instant: new Date(Date.now() + 2000), counter: n, deviceId: b.deviceId });
     const newCopy = randomUUID();
 
     // b made these before it had pulled the import: basis ''.
@@ -433,11 +479,36 @@ describe('HELD: an edit made before an import it had not seen', () => {
       [`occ/${newCopy}/status`, String(decodeCursor(cursor))],
     ]);
 
+    // A tag on an imported copy is its own unit, and late; a copy with no head anywhere and a
+    // collection name belong to no figure; a late new copy is held with its head.
+    const other = randomUUID();
+    const tagged = ok(
+      await b.push({
+        clientId: randomUUID(),
+        events: [
+          { facetKey: `occ/${copyX}/tag/${randomUUID()}`, version: version(7), op: SyncOp.UPSERT, payload: JSON.stringify(DISPLAY), basis: '' },
+          { facetKey: `occ/${randomUUID()}/status`, version: version(8), op: SyncOp.UPSERT, payload: JSON.stringify({ status: 'owned', ...DISPLAY }), basis: '' },
+          { facetKey: 'coll/owned/default/name', version: version(9), op: SyncOp.UPSERT, payload: JSON.stringify({ name: 'Shelf', ...DISPLAY }), basis: '' },
+        ],
+      }),
+    );
+    expect(tagged.results.map((r) => r.outcome)).toEqual([PushOutcome.HELD, PushOutcome.APPLIED, PushOutcome.APPLIED]);
+    const added = ok(
+      await b.push({
+        clientId: randomUUID(),
+        events: [
+          { facetKey: `occ/${other}/head`, version: version(10), op: SyncOp.UPSERT, payload: JSON.stringify({ head_id: headFor(x), ...DISPLAY }), basis: '' },
+          { facetKey: `occ/${other}/status`, version: version(11), op: SyncOp.UPSERT, payload: JSON.stringify({ status: 'owned', ...DISPLAY }), basis: '' },
+        ],
+      }),
+    );
+    expect(added.results.map((r) => r.outcome)).toEqual([PushOutcome.HELD, PushOutcome.HELD]);
+
     // Made after pulling the import: knowing, applied by LWW.
     const knowing = ok(
       await b.push({
         clientId: randomUUID(),
-        events: [{ facetKey: `occ/${copyX}/status`, version: version(6), op: SyncOp.UPSERT, payload: JSON.stringify({ status: 'former', ...DISPLAY }), basis: cursor }],
+        events: [{ facetKey: `occ/${copyX}/status`, version: version(12), op: SyncOp.UPSERT, payload: JSON.stringify({ status: 'former', ...DISPLAY }), basis: cursor }],
       }),
     );
     expect(knowing.results[0]!.outcome).toBe(PushOutcome.APPLIED);

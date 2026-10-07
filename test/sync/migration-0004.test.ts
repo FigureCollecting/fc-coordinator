@@ -44,6 +44,8 @@ beforeAll(async () => {
   await asSuper(`CREATE DATABASE ${DB} OWNER ${MIGRATOR}`);
   await run(['sh', '-c', 'mkdir -p /repo/before && cp /repo/migrations/000[0-3]_*.sql /repo/before/']);
   await migrate('/repo/before');
+  // 0004 alone on top: the migrations after it have their own suites.
+  await run(['sh', '-c', 'mkdir -p /repo/upto4 && cp /repo/migrations/000[0-4]_*.sql /repo/upto4/']);
 }, 240_000);
 
 afterAll(async () => {
@@ -59,7 +61,7 @@ describe('0004_sync_transactions over an existing feed', () => {
     await asMigrator(event(A, 'a3'));
     await asMigrator(event(A, 'a4') + event(B, 'b1') + event(A, 'a5'));
 
-    expect(await migrate('/repo/migrations')).toContain('applied=1 skipped=4');
+    expect(await migrate('/repo/upto4')).toContain('applied=1 skipped=4');
 
     const rows = await asMigrator("SELECT facet_key || '=' || opens_txn FROM feed_event ORDER BY seq");
     expect(rows.trim().split('\n')).toEqual(['a1=true', 'a2=false', 'a3=true', 'a4=true', 'b1=true', 'a5=false']);
