@@ -515,6 +515,31 @@ describe('HELD: an edit made before an import it had not seen', () => {
   });
 });
 
+describe('HELD, across two imports', () => {
+  it('applies an edit made after one import to a figure only that import decided, though a later import has run', async () => {
+    const a = await SyncCaller.enrol(h);
+    const b = await SyncCaller.sibling(h, a);
+    const [x, y] = [nextId(), nextId()];
+    const early = (n: number) => canonicalVersion({ instant: new Date(Date.now() - 1000), counter: n, deviceId: a.deviceId });
+    ok(await a.push({ clientId: randomUUID(), events: [{ facetKey: `uf/${headFor(x)}/score`, version: early(1), op: SyncOp.UPSERT, payload: JSON.stringify({ score: 9, ...DISPLAY }), basis: '' }] }));
+    // Import 1 decides x (a conflict: no base is set, so import 2 does not decide it again); import 2 decides only y.
+    expect(ok(await a.importMfcExport({ csvText: mfcCsv([row(x, 'Owned', { score: '7/10' })]), exportDate: EXPORT_DATE })).conflictsRaised).toBe(1);
+    const { cursor: afterFirst } = await drain(b);
+    ok(await a.importMfcExport({ csvText: mfcCsv([row(y, 'Owned')]), exportDate: EXPORT_DATE }));
+    const later = canonicalVersion({ instant: new Date(Date.now() + 2000), counter: 1, deviceId: b.deviceId });
+    const res = ok(
+      await b.push({
+        clientId: randomUUID(),
+        events: [
+          { facetKey: `uf/${headFor(x)}/score`, version: later, op: SyncOp.UPSERT, payload: JSON.stringify({ score: 8, ...DISPLAY }), basis: afterFirst },
+          { facetKey: `uf/${headFor(y)}/note`, version: later, op: SyncOp.UPSERT, payload: JSON.stringify({ note: 'n', ...DISPLAY }), basis: afterFirst },
+        ],
+      }),
+    );
+    expect(res.results.map((r) => r.outcome)).toEqual([PushOutcome.APPLIED, PushOutcome.HELD]);
+  });
+});
+
 describe('failure, lock and configuration', () => {
   it('answers UNAVAILABLE and writes nothing while the spine is down; a retry then imports', async () => {
     const a = await SyncCaller.enrol(h);

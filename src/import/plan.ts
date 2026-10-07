@@ -418,10 +418,11 @@ function preview(S: string, ops: readonly Op[]): { copies: PreviewCopy[]; fields
  * the app has not changed it since (decided again, it is still MFC's change alone).
  */
 function keepOps(item: FigureItem, d: Decision): Op[] {
+  // `d` writes a create or a field only where, decided again, that part is still MFC's alone.
   const ops: Op[] = [];
-  if (item.comps.counts === 'apply' && d.comps.counts === 'apply') ops.push(...d.ops.filter((op) => op.op === 'create'));
+  if (item.comps.counts === 'apply') ops.push(...d.ops.filter((op) => op.op === 'create'));
   for (const f of FIELDS) {
-    if (item.comps[f] === 'apply' && d.comps[f] === 'apply') ops.push(...d.ops.filter((op) => op.op === 'field' && op.field === f));
+    if (item.comps[f] === 'apply') ops.push(...d.ops.filter((op) => op.op === 'field' && op.field === f));
   }
   return ops;
 }
@@ -466,7 +467,8 @@ function figurePayload(v: View, S: string, exp: readonly Row[], item: FigureItem
     const status = v.copies.get(c)!.status;
     // A copy out of S is shown without a status, but a former one, which is kept.
     const shown = v.curKind(c, S) !== OUT || status === 'former';
-    return { occ: c, ...(shown ? { status } : {}), tracked: v.baseKind(c, S) !== OUT };
+    // MFC tracks no copy of a figure with no row base: the plan refuses one whose copies carry a base.
+    return { occ: c, ...(shown ? { status } : {}), tracked: false };
   });
   return stable({
     rev: item.rev,

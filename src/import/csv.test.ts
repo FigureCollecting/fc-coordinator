@@ -31,6 +31,9 @@ describe('parseCsv', () => {
     expect(detectDelimiter('"ID";"Title, long";"Status"\r\n1;2;3')).toBe(';');
     expect(detectDelimiter('ID,Status;x\n')).toBe(',');
     expect(detectDelimiter('ID\n')).toBe(',');
+    // Only the header is counted: the rows' own punctuation does not choose.
+    expect(detectDelimiter('ID,Status\n1;2;3;4\n')).toBe(',');
+    expect(detectDelimiter('ID;Status\r1,2,3,4\r')).toBe(';');
     expect(parseCsv('"ID";"Title, long";"Status"\r\n"7";"x, y";Owned')).toEqual([
       { line: 1, fields: ['ID', 'Title, long', 'Status'] },
       { line: 2, fields: ['7', 'x, y', 'Owned'] },

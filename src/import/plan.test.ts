@@ -308,6 +308,25 @@ describe('planImport: conflicts (GR-Q1: surfaced, never written over)', () => {
     expect(filed.stats.conflictsRaised).toBe(0);
   });
 
+  it('previews keep from what the raising import found: no copy it did not find MFC\'s alone, no value it found disputed', () => {
+    // Raised with the app's copy matching MFC's Count, and both values disputed.
+    const rows = [row('119', S1, 'owned', 1, { score: 7, note: 'mfc' })];
+    const raisedState = state([...appCopy(APP_A, S1, 'owned'), up(`uf/${S1}/score`, { score: 9, ...SHOWN }), up(`uf/${S1}/note`, { note: 'app', ...SHOWN })]);
+    const first = plan(raisedState, rows);
+    const raised = first.items.set[0]!;
+    expect(raised.comps).toMatchObject({ counts: 'alike', score: 'conflict', note: 'conflict' });
+    // Since: the app removed its copy and its score, so decided again both look like MFC's alone.
+    const since = state(
+      [...appCopy(APP_A, S1, null), gone(`uf/${S1}/score`), up(`uf/${S1}/note`, { note: 'app', ...SHOWN }), { facetKey: `imp/mfc/figure/${S1}`, version: V, op: 'upsert', payload: first.writes[0]!.payload }],
+      { items: new Map([[S1, raised]]) },
+    );
+    const again = plan(since, rows, { importNumber: 2 });
+    const item = JSON.parse(again.writes[0]!.payload) as { preview: { keep: object; take: { copies: unknown[]; fields: unknown[] } } };
+    expect(item.preview.keep).toEqual({ copies: [], fields: [] });
+    expect(item.preview.take.copies).toHaveLength(1);
+    expect(item.preview.take.fields).toHaveLength(2);
+  });
+
   it('ends the item when a later import finds the sides agreeing, and settles the figure', () => {
     const rows = [row('119', S1, 'owned', 0, { score: 7 })];
     const first = plan(state([up(`uf/${S1}/score`, { score: 9, ...SHOWN })]), rows);
