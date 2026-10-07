@@ -622,6 +622,9 @@ describe('HELD only for a figure an import settled (wrote to or moved a base of)
     expect(out.results[0]!.outcome).toBe(PushOutcome.HELD);
     const back = ok(await b.push({ clientId: randomUUID(), events: [head(headFor(x), at(b.deviceId, 2, 3000))] }));
     expect(back.results[0]!.outcome).toBe(PushOutcome.HELD);
+    // A late tombstone of the head takes the copy out too: held, by the head it had.
+    const removed = ok(await b.push({ clientId: randomUUID(), events: [{ facetKey: `occ/${c}/head`, version: at(b.deviceId, 3, 4000), op: SyncOp.DELETE, payload: '', basis: '' }] }));
+    expect(removed.results[0]!.outcome).toBe(PushOutcome.HELD);
   });
 
   it('places by LWW a late edit to a copy whose head was tombstoned: it belongs to no figure', async () => {
