@@ -411,3 +411,43 @@ describe('planImport: what an earlier import settled', () => {
     expect(plan(st, [row('119', S1, 'owned')]).beyond).toEqual([S1]);
   });
 });
+
+describe('planImport: the figures it settles, the only ones a late edit is held for in 14a', () => {
+  it('settles a figure it writes to or moves a base of, not one it conflicts on, finds unchanged or leaves as it is', () => {
+    const rows = [row('119', S1, 'owned'), row('120', S2, 'owned', 1, { score: 7 }), row('121', S3, 'wished', 0)];
+    const first = plan(state([up(`uf/${S2}/score`, { score: 9, ...SHOWN })]), rows);
+    expect(first.figures).toEqual([S1, S2, S3]);
+    expect(first.conflicted).toEqual([S2]);
+    // S3: Count 0 and no value, so nothing is written and no copy or field base moves.
+    expect(first.settled).toEqual([S1]);
+    const again = plan(state([], { rowBases: new Map(first.rowBases.map((r) => [r.id, r])) }), rows.filter((r) => r.head !== S2), { importNumber: 2 });
+    expect(again.figures).toEqual([S1, S3]);
+    expect(again.stats.unchanged).toBe(2);
+    expect(again.settled).toEqual([]);
+  });
+
+  it('settles a figure whose only move is a base: the app already shows what MFC states', () => {
+    const p = plan(state([...appCopy(APP_A, S1, 'owned'), up(`uf/${S2}/note`, { note: 'n', ...SHOWN })]), [row('119', S1, 'owned'), row('120', S2, 'wished', 0, { note: 'n' })]);
+    expect(p.writes).toEqual([]);
+    expect(p.settled).toEqual([S1, S2]);
+  });
+});
+
+describe('planImport: what a conflict previews and lists, part by part', () => {
+  it('previews keep with each field MFC alone changed once, when two fields apply beside a disputed one', () => {
+    const p = plan(state([up(`uf/${S1}/score`, { score: 9, ...SHOWN })]), [row('119', S1, 'wished', 0, { score: 7, note: 'mfc', wishability: 3 })]);
+    const item = JSON.parse(p.writes[0]!.payload) as { preview: { keep: { fields: unknown[] } } };
+    expect(item.preview.keep.fields).toEqual([
+      { head_id: S1, field: 'note', note: 'mfc' },
+      { head_id: S1, field: 'wishability', wishability: 3 },
+    ]);
+  });
+
+  it('reads the rows of one figure in numeric id order, however the export orders them', () => {
+    const p = plan(state(), [row('20', S1, 'owned', 1, { score: 8 }), row('3', S1, 'owned', 1, { score: 7 })]);
+    const item = JSON.parse(p.writes[0]!.payload) as { mfc_rows: { mfc_id: string }[]; preview: { take: { fields: unknown[] } } };
+    expect(item.mfc_rows.map((r) => r.mfc_id)).toEqual(['3', '20']);
+    // MFC's value is the first row's, in id order, that states one.
+    expect(item.preview.take.fields).toEqual([{ head_id: S1, field: 'score', score: 7 }]);
+  });
+});

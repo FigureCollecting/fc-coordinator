@@ -109,6 +109,13 @@ describe('readExport', () => {
     }
   });
 
+  it('treats a Score or Wishability cell of spaces alone as blank: no value, no refusal', () => {
+    expect(readExport('ID,Status,Score,Wishability\n1,Owned,  ,\n2,Wished,, \n').map((r) => [r.fields, r.reason])).toEqual([
+      [{}, undefined],
+      [{}, undefined],
+    ]);
+  });
+
   it('reads wishability 1 to 5, treats blank and 0 as none, and refuses anything else naming the line', () => {
     expect(readExport('ID,Status,Wishability\n1,Wished,3\n2,Wished,0\n3,Wished,\n4,Wished,5\n').map((r) => r.fields.wishability)).toEqual([
       3,

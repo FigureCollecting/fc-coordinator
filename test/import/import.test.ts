@@ -540,6 +540,144 @@ describe('HELD, across two imports', () => {
   });
 });
 
+describe('HELD only for a figure an import settled (wrote to or moved a base of)', () => {
+  const at = (device: string, n: number, offsetMs: number) => canonicalVersion({ instant: new Date(Date.now() + offsetMs), counter: n, deviceId: device });
+  const score = (head: string, n: number, version: string, basis: string) => ({
+    facetKey: `uf/${head}/score`,
+    version,
+    op: SyncOp.UPSERT,
+    payload: JSON.stringify({ score: n, ...DISPLAY }),
+    basis,
+  });
+  const frames = async (userId: string) =>
+    (
+      await db.admin.query<{ import_number: number; settled: boolean }>(
+        'SELECT import_number, settled FROM import_frame WHERE user_id = $1 ORDER BY import_number',
+        [userId],
+      )
+    ).rows.map((r) => [r.import_number, r.settled]);
+
+  it('applies an edit made after the first import though a marker-only re-import ran before it arrived', async () => {
+    const a = await SyncCaller.enrol(h);
+    const b = await SyncCaller.sibling(h, a);
+    const x = nextId();
+    const csv = mfcCsv([row(x, 'Owned', { score: '7/10' })]);
+    ok(await a.importMfcExport({ csvText: csv, exportDate: EXPORT_DATE }));
+    const { cursor: bSaw } = await drain(b);
+    expect(ok(await a.importMfcExport({ csvText: csv, exportDate: EXPORT_DATE })).facetsWritten).toBe(1);
+    // Both imports frame the figure; only the first wrote to it.
+    expect(await frames(a.userId)).toEqual([
+      [1, true],
+      [2, false],
+    ]);
+    const res = ok(await b.push({ clientId: randomUUID(), events: [score(headFor(x), 9, at(b.deviceId, 1, 2000), bSaw)] }));
+    expect(res.results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(replica((await drain(a)).events).get(`uf/${headFor(x)}/score`)).toMatchObject({ score: 9 });
+  });
+
+  it('applies a late edit to a figure the import only raised a conflict on, and holds one for a later import that settled it', async () => {
+    const a = await SyncCaller.enrol(h);
+    const b = await SyncCaller.sibling(h, a);
+    const x = nextId();
+    const S = headFor(x);
+    ok(await a.push({ clientId: randomUUID(), events: [score(S, 9, at(a.deviceId, 1, -1000), '')] }));
+    const csv = mfcCsv([row(x, 'Owned', { score: '7/10' })]);
+    expect(ok(await a.importMfcExport({ csvText: csv, exportDate: EXPORT_DATE })).conflictsRaised).toBe(1);
+    // b had not seen the import: late for it, but the import wrote nothing of the figure.
+    const conflicted = ok(await b.push({ clientId: randomUUID(), events: [score(S, 7, at(b.deviceId, 1, 1000), '')] }));
+    expect(conflicted.results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    const { cursor: bSaw } = await drain(b);
+
+    // Import 2 finds the sides agreeing and settles the figure: framed twice, settled once.
+    expect(ok(await a.importMfcExport({ csvText: csv, exportDate: EXPORT_DATE })).occurrencesAdded).toBe(1);
+    expect(await frames(a.userId)).toEqual([
+      [1, false],
+      [2, true],
+    ]);
+    const late = ok(await b.push({ clientId: randomUUID(), events: [score(S, 8, at(b.deviceId, 2, 2000), bSaw)] }));
+    expect(late.results[0]!.outcome).toBe(PushOutcome.HELD);
+    const { cursor: bNow } = await drain(b);
+    const knowing = ok(await b.push({ clientId: randomUUID(), events: [score(S, 8, at(b.deviceId, 3, 3000), bNow)] }));
+    expect(knowing.results[0]!.outcome).toBe(PushOutcome.APPLIED);
+  });
+
+  it('holds a late move of a copy out of a settled figure, as one into it', async () => {
+    const a = await SyncCaller.enrol(h);
+    const b = await SyncCaller.sibling(h, a);
+    const [x, t] = [nextId(), nextId()];
+    const c = randomUUID();
+    const head = (to: string, version: string) => ({ facetKey: `occ/${c}/head`, version, op: SyncOp.UPSERT, payload: JSON.stringify({ head_id: to, ...DISPLAY }), basis: '' });
+    ok(
+      await a.push({
+        clientId: randomUUID(),
+        events: [
+          head(headFor(x), at(a.deviceId, 1, -1000)),
+          { facetKey: `occ/${c}/status`, version: at(a.deviceId, 2, -1000), op: SyncOp.UPSERT, payload: JSON.stringify({ status: 'owned', ...DISPLAY }), basis: '' },
+        ],
+      }),
+    );
+    // The app's copy is MFC's one: the import pairs it and writes nothing.
+    expect(ok(await a.importMfcExport({ csvText: mfcCsv([row(x, 'Owned')]), exportDate: EXPORT_DATE })).occurrencesAdded).toBe(0);
+    const out = ok(await b.push({ clientId: randomUUID(), events: [head(headFor(t), at(b.deviceId, 1, 2000))] }));
+    expect(out.results[0]!.outcome).toBe(PushOutcome.HELD);
+    const back = ok(await b.push({ clientId: randomUUID(), events: [head(headFor(x), at(b.deviceId, 2, 3000))] }));
+    expect(back.results[0]!.outcome).toBe(PushOutcome.HELD);
+  });
+
+  it('places by LWW a late edit to a copy whose head was tombstoned: it belongs to no figure', async () => {
+    const a = await SyncCaller.enrol(h);
+    const b = await SyncCaller.sibling(h, a);
+    const x = nextId();
+    const c = randomUUID();
+    ok(
+      await a.push({
+        clientId: randomUUID(),
+        events: [
+          { facetKey: `occ/${c}/head`, version: at(a.deviceId, 1, -1000), op: SyncOp.UPSERT, payload: JSON.stringify({ head_id: headFor(x), ...DISPLAY }), basis: '' },
+          { facetKey: `occ/${c}/status`, version: at(a.deviceId, 2, -1000), op: SyncOp.UPSERT, payload: JSON.stringify({ status: 'owned', ...DISPLAY }), basis: '' },
+        ],
+      }),
+    );
+    ok(await a.push({ clientId: randomUUID(), events: [{ facetKey: `occ/${c}/head`, version: at(a.deviceId, 3, -500), op: SyncOp.DELETE, payload: '', basis: '' }] }));
+    ok(await a.importMfcExport({ csvText: mfcCsv([row(x, 'Wished')]), exportDate: EXPORT_DATE }));
+    const res = ok(
+      await b.push({
+        clientId: randomUUID(),
+        events: [{ facetKey: `occ/${c}/status`, version: at(b.deviceId, 1, 2000), op: SyncOp.UPSERT, payload: JSON.stringify({ status: 'wished', ...DISPLAY }), basis: '' }],
+      }),
+    );
+    expect(res.results[0]!.outcome).toBe(PushOutcome.APPLIED);
+  });
+});
+
+describe('the pending count and the spine', () => {
+  it("counts an earlier import's item still pending beside this import's", async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, y] = [nextId(), nextId()];
+    ok(
+      await a.push({
+        clientId: randomUUID(),
+        events: [{ facetKey: `uf/${headFor(x)}/score`, version: canonicalVersion({ instant: new Date(Date.now() - 1000), counter: 1, deviceId: a.deviceId }), op: SyncOp.UPSERT, payload: JSON.stringify({ score: 9, ...DISPLAY }), basis: '' }],
+      }),
+    );
+    const first = ok(await a.importMfcExport({ csvText: mfcCsv([row(x, 'Owned', { score: '7/10' })]), exportDate: EXPORT_DATE }));
+    const second = ok(await a.importMfcExport({ csvText: mfcCsv([row(y, 'Owned')]), exportDate: EXPORT_DATE }));
+    expect(second).toMatchObject({ conflictsRaised: 0, conflictsPending: 1 });
+    expect(second.review[0]!.items.map((i) => [i.headId, i.rev])).toEqual([[headFor(x), first.review[0]!.items[0]!.rev]]);
+  });
+
+  it('imports a header-only export with no spine configured, and answers UNAVAILABLE once there are ids to resolve', async () => {
+    const bare = await startSyncApp(db.app, h.issuer, undefined, undefined, { import: { db: db.app, spineRead: null, occIdKey: KEY } });
+    try {
+      const a = await SyncCaller.enrol(bare);
+      expect(ok(await a.importMfcExport({ csvText: 'ID,Status\n', exportDate: EXPORT_DATE })).importNumber).toBe(1);
+      expect(failed(await a.importMfcExport({ csvText: mfcCsv([row(nextId(), 'Owned')]), exportDate: EXPORT_DATE })).code).toBe('unavailable');
+    } finally {
+      await bare.close();
+    }
+  });
+});
+
 describe('failure, lock and configuration', () => {
   it('answers UNAVAILABLE and writes nothing while the spine is down; a retry then imports', async () => {
     const a = await SyncCaller.enrol(h);
