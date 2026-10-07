@@ -244,6 +244,15 @@ describe('planImport: conflicts (GR-Q1: surfaced, never written over)', () => {
     expect(p.pending[1]!.payload).toBe(earlier.writes[0]!.payload);
   });
 
+  it('records with a conflict what it found of the counts: alike, matched with app-only copies, or MFC\'s alone', () => {
+    const disputed = (copies: Facet[], count: number) =>
+      plan(state([...copies, up(`uf/${S1}/score`, { score: 9, ...SHOWN })]), [row('119', S1, 'owned', count, { score: 7 })]).items.set[0]!.comps.counts;
+    expect(disputed(appCopy(APP_A, S1, 'owned'), 1)).toBe('alike');
+    expect(disputed([...appCopy(APP_A, S1, 'owned'), ...appCopy(APP_B, S1, 'owned')], 1)).toBe('matched+app-only');
+    expect(disputed(appCopy(APP_A, S1, 'owned'), 2)).toBe('apply');
+    expect(disputed([], 0)).toBe('nochange');
+  });
+
   it('calls rows of one figure stating different values a conflict', () => {
     const p = plan(state(), [row('9', S1, 'owned', 1, { score: 7 }), row('10', S1, 'owned', 1, { score: 8 })]);
     expect(p.conflicted).toEqual([S1]);
