@@ -71,6 +71,7 @@ export const MAX_CATALOG_REFS = 200;
  *
  * `contentLevel` is the key the MFC ruleset emits (fields.contentLevel); the
  * claim lifter keeps unmapped scraped keys verbatim, so that is the attr_key.
+ * It is not the only adult-content key in the estate: see ADULT_FLAG_CLAIM.
  * test/connect/catalog-map.test.ts pins that this table names no key that could
  * carry an image, a URL or an original, and that it covers exactly the card's
  * CardText fields.
@@ -89,7 +90,7 @@ export const CARD_TEXT_ALLOWLIST = {
  * The content-level vocabulary catalog.proto names. Anything else reads as
  * `unknown`, which the contract tells every client to treat as the most
  * restrictive — an unrecognised level must never render as a permissive one.
- * See contentLevelOf for what counts as "anything else".
+ * See levelClaimOf for what counts as "anything else", and contentLevelOf for the r18 flag.
  */
 export const CONTENT_LEVELS = [
   'general',
@@ -100,6 +101,28 @@ export const CONTENT_LEVELS = [
   'nsfw+',
   'unknown',
 ] as const;
+
+/**
+ * The attr_key gkloot and solaris record adult content under: their rulesets
+ * emit `fields.r18` as a boolean, which the claim lifter keeps under the same
+ * key as the text 'true' or 'false'. It is NOT a card field and never shows;
+ * it can only make content_level stricter (see contentLevelOf).
+ */
+export const ADULT_FLAG_CLAIM = 'r18';
+
+/**
+ * The levels an adult flag agrees with: each already says 18+, or is `unknown`.
+ * Any other level (general, intermediate) contradicted by the flag reads as
+ * `unknown`. Listed by what they DO say, so a level added to CONTENT_LEVELS
+ * later is overridden by the flag until someone places it here.
+ */
+const LEVELS_AN_ADULT_FLAG_KEEPS: readonly string[] = [
+  'explicit',
+  'controversial',
+  'nsfw',
+  'nsfw+',
+  'unknown',
+] satisfies readonly (typeof CONTENT_LEVELS)[number][];
 
 const GTIN14 = /^\d{14}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
@@ -135,10 +158,11 @@ export interface CatalogRoutesDeps {
 /**
  * Read MEDIA_PUBLIC_BASE_URL. Unset or blank -> null (images off, the default).
  * Set, it must be an absolute https URL with no credentials, no `?` or `#` (not
- * even an empty query or fragment), no surrounding whitespace, and already in
- * the form a URL parser writes it (so no dot segments), or the process refuses
- * to start: this string is prefixed onto URLs that every phone caches forever,
- * so a typo is better found at boot than in the field.
+ * even an empty query or fragment), no surrounding whitespace, already in the
+ * form a URL parser writes it (so no dot segments), and with no encoded slash
+ * or backslash, or the process refuses to start: this string is prefixed onto
+ * URLs that every phone caches forever, so a typo is better found at boot than
+ * in the field. No refusal repeats the value, which may carry a credential.
  *
  * The spine builds each row's URL from ITS copy of the same value by trimming
  * trailing slashes and nothing else, and this module does exactly the same, so
@@ -165,8 +189,14 @@ export function resolveMediaBaseUrl(env: NodeJS.ProcessEnv = process.env): strin
   const base = raw.replace(/\/+$/, '');
   if (url.href.replace(/\/+$/, '') !== base) {
     throw new Error(
-      'MEDIA_PUBLIC_BASE_URL must be written exactly as a URL parser writes it: no surrounding whitespace, no dot segments',
+      'MEDIA_PUBLIC_BASE_URL must be in canonical URL form, exactly as a URL parser writes it ' +
+        '(e.g. a lower-case host, no default port, no backslash, no whitespace, no dot segments)',
     );
+  }
+  // Canonical by the URL standard, yet a CDN that decodes them could resolve
+  // the path somewhere else.
+  if (/%(?:2f|5c)/i.test(raw)) {
+    throw new Error('MEDIA_PUBLIC_BASE_URL must not contain an encoded slash or backslash (%2F, %5C)');
   }
   return base;
 }
@@ -239,16 +269,13 @@ function cardText(
 }
 
 /**
- * The card's content level — FAIL CLOSED. Absent ONLY when the record carries
- * no level claim at all, which catalog.proto defines as "the source has no
- * level concept". A level claim that IS there but that this build cannot read
- * (a label-less term, a json value, an empty or non-string value, a kind it has
- * never heard of, not an object at all) reads as `unknown`, exactly as a level
- * outside CONTENT_LEVELS does: absent would render permissively, and this is
- * the content-safety field. Dated by the claim whenever it carries a time.
+ * The `contentLevel` claim as a level: absent when there is no such claim;
+ * otherwise the value when it is one of CONTENT_LEVELS exactly (no trimming, no
+ * case folding), and `unknown` for anything else this build cannot read (a
+ * label-less term, a json value, an empty or non-string value, a kind it has
+ * never heard of, not an object at all). Dated by the claim when it has a time.
  */
-function contentLevelOf(attrs: Json): CardText | undefined {
-  const facet = attrs[CARD_TEXT_ALLOWLIST.contentLevel.claim];
+function levelClaimOf(facet: unknown): CardText | undefined {
   if (facet === undefined) return undefined;
   const read = claimText(facet);
   const known = read !== null && (CONTENT_LEVELS as readonly string[]).includes(read.value);
@@ -256,6 +283,33 @@ function contentLevelOf(attrs: Json): CardText | undefined {
     value: known ? read.value : 'unknown',
     asOf: canonicalAsOf(asObject(facet)?.['asOf']),
   });
+}
+
+/**
+ * The card's content level. Absent means "the source has no level concept"
+ * (catalog.proto), which a client treats permissively, so it is absent ONLY
+ * when the claims can be read and hold neither a `contentLevel` claim nor an
+ * ADULT_FLAG_CLAIM that could be set. Every other case is `unknown`, the
+ * contract's most restrictive value, or a level at least as strict:
+ *
+ *   attrs not an object      unknown, no time: the claims cannot be seen, so
+ *                            nothing says there is no level among them.
+ *   r18 absent, or reading   the contentLevel claim as levelClaimOf reads it
+ *   exactly 'false'          (absent when there is none).
+ *   r18 any other claim      the level when it is in LEVELS_AN_ADULT_FLAG_KEEPS;
+ *   ('true', unreadable)     otherwise unknown, dated by the r18 claim.
+ *
+ * r18 'false' leaves the level as it was: whether it should read as `general`
+ * is a product call, not made here.
+ */
+function contentLevelOf(rawAttrs: unknown): CardText | undefined {
+  const attrs = asObject(rawAttrs);
+  if (attrs === null) return create(CardTextSchema, { value: 'unknown', asOf: '' });
+  const level = levelClaimOf(attrs[CARD_TEXT_ALLOWLIST.contentLevel.claim]);
+  const flag = attrs[ADULT_FLAG_CLAIM];
+  if (flag === undefined || claimText(flag)?.value === 'false') return level;
+  if (level !== undefined && LEVELS_AN_ADULT_FLAG_KEEPS.includes(level.value)) return level;
+  return create(CardTextSchema, { value: 'unknown', asOf: canonicalAsOf(asObject(flag)?.['asOf']) });
 }
 
 /** A read.v1 ref, as the spine echoes it, in coordinator.v1 spelling; null for anything else. */
@@ -307,7 +361,7 @@ export function toProductCard(record: unknown): ProductCard | null {
     scale: text('scale'),
     releaseYm: text('releaseYm'),
     gtin14s,
-    contentLevel: contentLevelOf(attrs),
+    contentLevel: contentLevelOf(r['attrs']),
     // The spine's display record carries no derivative; GetProductImages does.
     derivativeIds: [],
   });
