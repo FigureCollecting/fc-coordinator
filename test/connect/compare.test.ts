@@ -162,6 +162,13 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  // CLIENT BEFORE SERVER: drop the OpenFGA connection before its fake goes
+  // away. Closed the other way round, the fake's GOAWAY can be mid-flight when
+  // the reset aborts the session, and connect-node then emits the session's
+  // deferred error with no listener left (an uncaught "received GOAWAY without
+  // any open streams"). Which order wins was timing luck until the spine hop
+  // moved to h2c and shifted it.
+  resetEntitlementGrantsForTest();
   if (harness) {
     await harness.app.close();
     await harness.spine.close();
@@ -232,11 +239,11 @@ describe('the entitlement acceptance — both halves', () => {
       seed: { case: 'gtin14', value: GTIN },
       nowIso: NOW_ISO,
     });
+    resetEntitlementGrantsForTest();
     await harness.app.close();
     await harness.spine.close();
     if (harness.fga) await harness.fga.close();
     harness = null;
-    resetEntitlementGrantsForTest();
     resetEntitlementSigningForTest();
     for (const k of ENV_KEYS) delete process.env[k];
 
@@ -617,11 +624,11 @@ describe('a mismatched issuer fails closed, visibly', () => {
       nowIso: NOW_ISO,
     });
 
+    resetEntitlementGrantsForTest();
     await harness.app.close();
     await harness.spine.close();
     if (harness.fga) await harness.fga.close();
     harness = null;
-    resetEntitlementGrantsForTest();
     resetEntitlementSigningForTest();
     for (const k of ENV_KEYS) delete process.env[k];
 
