@@ -2,6 +2,7 @@
 // vocabulary and the payload schemas all come from fc-api-contract; nothing is restated here.
 // 0.3.0 (rule 6): the schema is picked by the parsed key's family; a server-owned key (a copy's
 // origin, the import's imp/*) and a retired 0.2.x holding/* key do not parse as user-owned.
+// Every pushed event carries its basis (SyncEvent.basis), checked last.
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { Ajv2020, type ValidateFunction } from 'ajv/dist/2020.js';
@@ -17,6 +18,7 @@ import {
   type SyncEvent,
   type UserFacetFamily,
 } from '@figurecollecting/fc-api-contract';
+import { decodeCursor } from './cursor.js';
 
 const require = createRequire(import.meta.url);
 const ajv = new Ajv2020({ strict: true, allErrors: false });
@@ -37,7 +39,8 @@ export interface EventContext {
 }
 
 export type Verdict =
-  | { ok: true }
+  /** basisSeq: the seq the event's basis names, 0 for '' (no transaction applied yet). */
+  | { ok: true; basisSeq: bigint }
   /** userOwned: the key is one of rule 6's user-owned forms, so `current` may be returned. */
   | { ok: false; reason: string; userOwned: boolean };
 
@@ -47,9 +50,21 @@ const reject = (code: PushRejectReason, detail: string, userOwned = true): Verdi
   userOwned,
 });
 
-// sync.proto: the REJECTED checks run in the listed order, all before STALE, REVIEW or APPLIED
-// routing, so a past-bound event is version_future whatever its key, device or stored version.
-export function validateEvent(event: Pick<SyncEvent, 'facetKey' | 'version' | 'op' | 'payload'>, ctx: EventContext): Verdict {
+// sync.proto: the REJECTED checks run in the listed order, all before STALE, REVIEW, HELD or
+// APPLIED routing, so a past-bound event is version_future whatever its key, device or stored version.
+export function validateEvent(event: Pick<SyncEvent, 'facetKey' | 'version' | 'op' | 'payload' | 'basis'>, ctx: EventContext): Verdict {
+  const payload = checkPayload(event, ctx);
+  if (payload !== undefined) return payload;
+  // A basis is a commit_cursor this server issued, or '' (decodeCursor reads it as 0). One past
+  // the head is still a basis: an outbox minted before a restore keeps its bases (rule 6).
+  if (event.basis === undefined) return reject('basis_missing', 'the event carries no basis');
+  const basisSeq = decodeCursor(event.basis);
+  if (basisSeq === undefined) return reject('basis_missing', 'the basis is not a cursor');
+  return { ok: true, basisSeq };
+}
+
+/** Every check before basis_missing, in the listed order; undefined when the event passes them. */
+function checkPayload(event: Pick<SyncEvent, 'facetKey' | 'version' | 'op' | 'payload'>, ctx: EventContext): Verdict | undefined {
   const key = parseUserFacetKey(event.facetKey);
   const userOwned = key !== undefined;
 
@@ -68,7 +83,7 @@ export function validateEvent(event: Pick<SyncEvent, 'facetKey' | 'version' | 'o
     return reject('payload_invalid', `payload over ${MAX_PAYLOAD_BYTES} bytes`);
   }
   if (event.op === SyncOp.DELETE) {
-    return event.payload === '' ? { ok: true } : reject('payload_invalid', 'a DELETE carries no payload');
+    return event.payload === '' ? undefined : reject('payload_invalid', 'a DELETE carries no payload');
   }
   if (event.op !== SyncOp.UPSERT) return reject('payload_invalid', 'unknown op');
   if (event.payload === '') return reject('payload_invalid', 'an UPSERT needs a payload');
@@ -84,5 +99,5 @@ export function validateEvent(event: Pick<SyncEvent, 'facetKey' | 'version' | 'o
     const error = validate.errors![0]!;
     return reject('payload_invalid', `${error.instancePath || '/'} ${error.message}`);
   }
-  return { ok: true };
+  return undefined;
 }

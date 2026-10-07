@@ -304,9 +304,16 @@ const command = fc.oneof(
   { weight: 1, arbitrary: fc.record({ kind: fc.constant('pushBoth' as const), drops: fc.tuple(fc.boolean(), fc.boolean()) }) },
   {
     weight: 2,
-    arbitrary: fc.record({ kind: fc.constant('delta' as const), d: device, limit: fc.integer({ min: 1, max: 4 }), drop: fc.boolean() }),
+    arbitrary: fc.record({
+      kind: fc.constant('delta' as const),
+      d: device,
+      limit: fc.integer({ min: 1, max: 4 }),
+      drop: fc.boolean(),
+      restart: fc.boolean(),
+    }),
   },
-  { weight: 1, arbitrary: fc.record({ kind: fc.constant('restart' as const), d: device }) },
+  // A copy filed in one go: its head, status and collection, three events of one transaction.
+  { weight: 1, arbitrary: fc.record({ kind: fc.constant('copy' as const), d: device, slot: fc.nat({ max: 11 }), n: fc.nat({ max: 1000 }) }) },
 );
 
 const sorted = (map: Map<string, Facet>) => [...map.entries()].sort(([a], [b]) => (a < b ? -1 : 1));
@@ -344,9 +351,13 @@ describe('(1) convergence', () => {
               break;
             case 'delta':
               await devices[cmd.d].delta(cmd.limit, cmd.drop);
+              if (cmd.restart) devices[cmd.d].restart();
               break;
-            case 'restart':
-              devices[cmd.d].restart();
+            case 'copy':
+              for (const family of ['occ/head', 'occ/status', 'occ/collection'] as const) {
+                t += 1;
+                devices[cmd.d].edit(keyFor(family, cmd.slot), SyncOp.UPSERT, payloadFor(family, cmd.n));
+              }
               break;
           }
         }
@@ -383,10 +394,21 @@ describe('(1) convergence', () => {
               { kind: 'edit', d: 0, slot: 0, family: 'uf/score', remove: false, bad: true, noBasis: false, n: 0, tickMs: 1 },
               { kind: 'push', d: 0, drop: true },
               { kind: 'push', d: 1, drop: false },
-              { kind: 'delta', d: 0, limit: 4, drop: false },
+              { kind: 'delta', d: 0, limit: 4, drop: false, restart: false },
               { kind: 'push', d: 0, drop: false },
             ],
             1,
+          ],
+          // A restart with a copy half fetched: the client drops what it staged and fetches it
+          // again from the last commit it applied.
+          [
+            [
+              { kind: 'copy', d: 0, slot: 1, n: 5 },
+              { kind: 'push', d: 0, drop: false },
+              { kind: 'delta', d: 1, limit: 1, drop: false, restart: true },
+              { kind: 'delta', d: 1, limit: 2, drop: false, restart: false },
+            ],
+            2,
           ],
         ],
       },
@@ -396,7 +418,7 @@ describe('(1) convergence', () => {
     expect([...appliedFamilies].sort()).toEqual([...USER_FACET_FAMILIES].sort());
     expect(refusedForeign).toBeGreaterThan(10);
     expect(basisMissing).toBeGreaterThan(10);
-    expect(stagedAcrossPages).toBeGreaterThan(10);
+    expect(stagedAcrossPages).toBeGreaterThan(50);
     expect(restartsWhileStaged).toBeGreaterThan(0);
     expect([...refusedFamilies].sort()).toEqual([...SERVER_FACET_FAMILIES, ...RETIRED].sort());
   }, 600_000);

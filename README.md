@@ -451,6 +451,7 @@ transaction control in a pending file, `6` out-of-order file.
 | `0001_identity.sql` | `app_user` (id **is** the Authentik uuid), `device` (DPoP `jkt` + public JWK, revoke-never-delete) |
 | `0002_collection.sql` | `collection`, `holding` — the HOLDING layer; spine references are TEXT, never foreign keys |
 | `0003_sync.sql` | `facet_state` (authoritative), `feed_event`, `feed_cursor`, `mutation_receipt` for SyncService; versions are `TEXT COLLATE "C"` with a grammar CHECK; the app role may not delete from any of them |
+| `0004_sync_transactions.sql` | `feed_event.opens_txn` (the first event of each server transaction, backfilled per database transaction) and `held_edit` (Push events answered HELD); the app role appends held edits and never rewrites them |
 
 ## Shared baseline
 
@@ -675,7 +676,7 @@ are in the emitted output.
 
 ## `coordinator.v1` — SyncService
 
-Delta, Push and Status over `0003_sync.sql`, behind the same DPoP guard as
+Delta, Push and Status over `0003_sync.sql` and `0004_sync_transactions.sql`, behind the same DPoP guard as
 Compare. The user is the token `sub` and the device is the DPoP binding.
 Push takes a per-user advisory lock first, so per user `seq` order is commit
 order and Delta never skips a late commit. Versions are ordered by
@@ -684,7 +685,7 @@ fc-api-contract's `compareVersion` in the handler, never by SQL `<`.
 
 A replayed `client_id` repeats each event's first outcome and reason (APPLIED
 as DUPLICATE); `current` is read at the replay. The REJECTED checks run in
-sync.proto's listed order, before any STALE or APPLIED routing, and a payload
+sync.proto's listed order, before any STALE, HELD or APPLIED routing, and a payload
 over 65,536 UTF-8 bytes is `payload_invalid`. Load bounds: a Push waits at
 most 5 s for its user's lock (then UNAVAILABLE), one user may have 8 Pushes
 running or queued per replica (then UNAVAILABLE), a queued Push whose client
@@ -698,12 +699,17 @@ schema. A server-owned key (`occ/{occ}/origin`, `imp/*`) and a retired 0.2.x
 already stored stay inert. `scripts/holding-audit.sql` counts them in one
 read-only transaction (`psql -X -A -f scripts/holding-audit.sql`).
 
-This is not yet a conformant 0.3.0 server. Delta does not set `commit_cursor`
-(sync.proto rule 7) on any event, a plain Push included, and a 0.3.0 client
-applies a server transaction only once it holds the event carrying it, so a
-0.3.0 client can apply nothing from this coordinator: do not serve one until
-rule 7 lands. Also outstanding: a pushed event with no `SyncEvent.basis` is
-APPLIED rather than REJECTED `basis_missing`, and there is no HELD outcome.
+Each Push is one server transaction (sync.proto rule 7): its written events
+are consecutive in the user's feed and Delta sets `commit_cursor` on the last
+one, so a 0.3.0 client applies a Push whole. `feed_event.opens_txn` marks each
+transaction's first event; the last is derived when Delta reads, so the feed
+stays append-only. Every pushed event needs `SyncEvent.basis`, `''` or a
+cursor: none, or one that is not a cursor, is REJECTED `basis_missing`, the
+last check. HELD is decided once per Push, before anything is applied, by a
+`HoldPolicy`; a held edit is kept in `held_edit` with its basis, not applied,
+answered with `current`, and HELD again on a replay. Until the import lands
+there is no frame, so the default policy holds nothing and every edit is
+placed by LWW whatever its basis.
 
 ## Phase-2 client (`scripts/phase2-client`)
 

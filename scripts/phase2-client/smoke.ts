@@ -47,9 +47,10 @@ export async function syncSmoke(ctx: CaseContext): Promise<CaseResult> {
 
   const occ = randomUUID();
   const display = { editedAt: new Date(ctx.now()).toISOString(), tz: Intl.DateTimeFormat().resolvedOptions().timeZone };
+  // The smoke applies no transaction from the feed, so every edit's basis is '' (sync.proto rule 6).
   const events: SyncEvent[] = [
-    create(SyncEventSchema, { facetKey: occKey(occ, 'head'), version: hlc.tick(undefined), op: SyncOp.UPSERT, payload: occPayload({ field: 'head', headId: randomUUID(), ...display }) }),
-    create(SyncEventSchema, { facetKey: occKey(occ, 'status'), version: hlc.tick(undefined), op: SyncOp.UPSERT, payload: occPayload({ field: 'status', status: 'wished', ...display }) }),
+    create(SyncEventSchema, { facetKey: occKey(occ, 'head'), version: hlc.tick(undefined), op: SyncOp.UPSERT, payload: occPayload({ field: 'head', headId: randomUUID(), ...display }), basis: '' }),
+    create(SyncEventSchema, { facetKey: occKey(occ, 'status'), version: hlc.tick(undefined), op: SyncOp.UPSERT, payload: occPayload({ field: 'status', status: 'wished', ...display }), basis: '' }),
   ];
   const keys = events.map((e) => e.facetKey).join(', ');
 
@@ -71,7 +72,7 @@ export async function syncSmoke(ctx: CaseContext): Promise<CaseResult> {
   // one is a live copy, so it is tombstoned whatever else failed.
   const statusEvent = events[1]!;
   if (push.message.results[1]?.outcome !== PushOutcome.APPLIED) return fail(problem!);
-  const tombstone = create(SyncEventSchema, { facetKey: statusEvent.facetKey, version: hlc.tick(statusEvent.version), op: SyncOp.DELETE, payload: '' });
+  const tombstone = create(SyncEventSchema, { facetKey: statusEvent.facetKey, version: hlc.tick(statusEvent.version), op: SyncOp.DELETE, payload: '', basis: '' });
   const cleanup = await session.unary(primary, `${SYNC}/Push`, PushRequestSchema, PushResponseSchema, create(PushRequestSchema, { clientId: randomUUID(), events: [tombstone] }), 'smoke:push-cleanup');
   const said = problem ?? `Status, then one Push (${keys}: APPLIED), then Delta from the Status cursor shows both`;
   if (!cleanup.ok || cleanup.message.results[0]?.outcome !== PushOutcome.APPLIED) {
