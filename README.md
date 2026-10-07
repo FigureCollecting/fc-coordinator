@@ -684,3 +684,52 @@ over 65,536 UTF-8 bytes is `payload_invalid`. Load bounds: a Push waits at
 most 5 s for its user's lock (then UNAVAILABLE), one user may have 8 Pushes
 running or queued per replica (then UNAVAILABLE), a queued Push whose client
 leaves is dropped, and a Connect request body over 16 MiB is RESOURCE_EXHAUSTED.
+
+## Phase-2 client (`scripts/phase2-client`)
+
+The DPoP client the edge runbook's Phase 2 needs (fc-infra
+`docs/EDGE-CUTOVER-RUNBOOK.md`, "The client, honestly"). It signs in once with
+authorization code + PKCE against the `fc-coordinator` provider, on a loopback
+listener at the registered `http://localhost:5173/callback`, holds an ES256 key
+in memory (never exportable), enrols it, and runs B1-B4, B5b, B6-B8 and B9b
+against a target origin, then a sync smoke: Status, one Push, Delta shows it.
+
+```
+npm run phase2                                    # --plan: prints the run, sends nothing
+npm run phase2 -- --target https://fc-api-canary.mindsignals1.com \
+                  --confirm fc-api-canary.mindsignals1.com \
+                  --b1-request '{"gtin14":"…","nowIso":"…"}' --b1-reference a7-result.json
+```
+
+- **`--plan` is the default** and sends zero requests: no discovery, no
+  listener, no key. A live run needs `--target` and a `--confirm` that repeats
+  the target's host (and port).
+- **The person.** A live run prints a sign-in URL; one person opens it and
+  signs in. The access token lives 10 minutes with no refresh grant, and the run
+  fits inside it.
+- **B1** compares `result_json` byte for byte with a reference: the in-cluster
+  A7 response, given as the exact request (`--b1-request`) and the bytes
+  (`--b1-reference`). Without both, B1 is INCONCLUSIVE, never PASS.
+- **B6** waits for the next nonce bucket (up to `--nonce-period-seconds`, 300 by
+  default). **B7** needs the operator to restart the coordinator while the
+  client polls (each second, and never into the token's last 5 s); it asserts
+  both halves (the old nonce is refused on the nonce check, and a jti the old
+  process accepted is accepted again).
+- **The smoke writes contract 0.3.0 keys**, `occ/{occ}/head` with
+  `occ/{occ}/status`, never `holding/*`. 0.3.0 is unpublished (fc-api-contract
+  PR #8), so the key shape and the two payload schemas are vendored from that
+  PR's head `555a107` under `vendor/` and pinned by sha256. A coordinator still
+  on 0.2.x rejects them `facet_key_not_user_owned` and the smoke fails, naming
+  WK-05b. Once a Push has applied the copy's status, the smoke tombstones it
+  whatever failed after, and the run revokes each device it enrolled; a cleanup
+  the coordinator refuses is a FAIL that says what is left. A run cut off
+  (exit 2) skips the cleanup still ahead of it: its devices stay enrolled but
+  inert (their keys were never exportable and die with the process), and a
+  copy pushed before the cut stays live.
+- **Nothing secret is printed**: no token, code, verifier, proof, nonce or JWK.
+  Every line also passes through a writer that scrubs any registered secret.
+- Exit 0 means every case and the smoke PASS, 1 means anything else, and 2
+  means the run could not start or was cut off.
+
+This is the client hop, the one fc-mobile makes to the public edge. It adds no
+component-to-component traffic. The image ships `dist/` (built from `src/`) only.
