@@ -690,6 +690,16 @@ most 5 s for its user's lock (then UNAVAILABLE), one user may have 8 Pushes
 running or queued per replica (then UNAVAILABLE), a queued Push whose client
 leaves is dropped, and a Connect request body over 16 MiB is RESOURCE_EXHAUSTED.
 
+Facet keys follow fc-api-contract 0.3.0 (sync.proto rule 6): Push takes the
+fourteen user-owned families (`occ/*`, `uf/*`, `coll/*/*/name`, `tag/*/name`,
+`res/*/*`, `pref/*/import`) and checks each payload against its family's
+schema. A server-owned key (`occ/{occ}/origin`, `imp/*`) and a retired 0.2.x
+`holding/*` key are REJECTED `facet_key_not_user_owned`; `holding/*` rows
+already stored stay inert. `scripts/holding-audit.sql` counts them in one
+read-only transaction (`psql -X -A -f scripts/holding-audit.sql`). Not served
+yet: `SyncEvent.basis` (and `basis_missing`), `commit_cursor` on Delta and the
+HELD outcome, which belong to the server-decided import.
+
 ## Phase-2 client (`scripts/phase2-client`)
 
 The DPoP client the edge runbook's Phase 2 needs (fc-infra
@@ -721,11 +731,9 @@ npm run phase2 -- --target https://fc-api-canary.mindsignals1.com \
   both halves (the old nonce is refused on the nonce check, and a jti the old
   process accepted is accepted again).
 - **The smoke writes contract 0.3.0 keys**, `occ/{occ}/head` with
-  `occ/{occ}/status`, never `holding/*`. 0.3.0 is unpublished (fc-api-contract
-  PR #8), so the key shape and the two payload schemas are vendored from that
-  PR's head `555a107` under `vendor/` and pinned by sha256. A coordinator still
-  on 0.2.x rejects them `facet_key_not_user_owned` and the smoke fails, naming
-  WK-05b. Once a Push has applied the copy's status, the smoke tombstones it
+  `occ/{occ}/status`, never `holding/*`, built and checked by the installed
+  fc-api-contract. A coordinator still on 0.2.x rejects them
+  `facet_key_not_user_owned` and the smoke fails, naming WK-05b. Once a Push has applied the copy's status, the smoke tombstones it
   whatever failed after, and the run revokes each device it enrolled; a cleanup
   the coordinator refuses is a FAIL that says what is left. A run cut off
   (exit 2) skips the cleanup still ahead of it: its devices stay enrolled but
