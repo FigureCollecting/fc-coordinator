@@ -136,7 +136,10 @@ export async function caseB8(ctx: CaseContext): Promise<CaseResult> {
   }
   const before = await ctx.session.callRetrying({ label: 'B8:second-before', path: SESSION_PATH, key: second });
   if (before.status !== 200 || Session.deviceOf(before) !== secondId) {
-    return result('B8', 'FAIL', `the second device did not work before its revocation: ${said(before)}`);
+    // The run enrolled it, so the run revokes it, pass or fail.
+    const cleanup = await ctx.session.revoke(ctx.primary, secondId, 'B8:cleanup');
+    const left = cleanup.status === 200 ? 'it was revoked' : `revoking it answered ${said(cleanup)}, so it may still be enrolled`;
+    return result('B8', 'FAIL', `the second device did not work before its revocation: ${said(before)}; ${left}`);
   }
   const revoke = await ctx.session.revoke(ctx.primary, secondId, 'B8:revoke');
   if (revoke.status !== 200) return result('B8', 'FAIL', `revoke of the second device answered ${said(revoke)}`);
@@ -213,14 +216,17 @@ export async function caseB7(
 
   const waitedFrom = ctx.now();
   const deadline = Math.min(waitedFrom + o.timeoutMs, ctx.tokenExpiresAt - TOKEN_MARGIN_MS);
+  if (deadline <= waitedFrom) return result('B7', 'INCONCLUSIVE', 'too little of the access token is left to wait for a restart; run again with a fresh sign-in');
+  // Never sleep past the deadline: the replay and the run's cleanup revoke need the token after it.
+  const pause = (): Promise<void> => ctx.sleep(Math.max(0, Math.min(o.pollMs, deadline - ctx.now())));
   let first: Exchange | undefined;
   while (first === undefined) {
-    if (ctx.now() > deadline) return result('B7', 'INCONCLUSIVE', `no restart observed (no new nonce epoch) within ${Math.round((deadline - waitedFrom) / 1000)} s`);
+    if (ctx.now() >= deadline) return result('B7', 'INCONCLUSIVE', `no restart observed (no new nonce epoch) within ${Math.round((deadline - waitedFrom) / 1000)} s`);
     let res: Exchange;
     try {
       res = await ctx.session.call({ label: 'B7:poll', path: SESSION_PATH, key: ctx.primary });
     } catch {
-      await ctx.sleep(o.pollMs);
+      await pause();
       continue;
     }
     const parts = nonceParts(res.nonce);
@@ -229,7 +235,7 @@ export async function caseB7(
       break;
     }
     if (parts !== undefined && res.status === 200) accepted = { jti: res.jti!, at: ctx.now() };
-    await ctx.sleep(o.pollMs);
+    await pause();
   }
 
   const onNonce = first.status === 401 && first.error === 'use_dpop_nonce';

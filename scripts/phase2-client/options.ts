@@ -116,7 +116,9 @@ export function parseOptions(argv: string[]): Options {
   if (values.target !== undefined) {
     const url = absolute(values.target, '--target');
     secure(url, '--target');
-    if (url.origin !== values.target) throw new UsageError(`--target must be a bare origin (no path or trailing slash), got '${values.target}'`);
+    if (url.origin !== values.target) {
+      throw new UsageError(`--target must be the bare origin '${url.origin}' (no path, no trailing slash, no default port), got '${values.target}'`);
+    }
     target = url.origin;
   }
 
@@ -132,12 +134,13 @@ export function parseOptions(argv: string[]): Options {
   const issuer = values.issuer ?? DEFAULT_ISSUER;
   secure(absolute(issuer, '--issuer'), '--issuer');
 
-  const redirectUri = absolute(values['redirect-uri'] ?? DEFAULT_REDIRECT_URI, '--redirect-uri');
+  const rawRedirect = values['redirect-uri'] ?? DEFAULT_REDIRECT_URI;
+  const redirectUri = absolute(rawRedirect, '--redirect-uri');
   if (redirectUri.protocol !== 'http:' || !REDIRECT_HOSTS.has(redirectUri.hostname)) {
     throw new UsageError(`--redirect-uri must be http on loopback (the listener is on this machine), got '${redirectUri.href}'`);
   }
   // The provider matches the redirect strictly, port included; an elided port is a different URI.
-  if (redirectUri.port === '') throw new UsageError(`--redirect-uri must name its port, got '${redirectUri.href}'`);
+  if (redirectUri.port === '') throw new UsageError(`--redirect-uri must name its port, and not http's default 80, which a URL drops: got '${rawRedirect}'`);
 
   let prefix: string;
   try {

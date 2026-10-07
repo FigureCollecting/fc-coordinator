@@ -66,7 +66,8 @@ export function liveDeps(): MainDeps {
     readFile: async (path) => new Uint8Array(await readFile(path)),
     now: Date.now,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-    pollMs: 5_000,
+    // B7's poll: the replayed jti's age is the restart's downtime plus at most this.
+    pollMs: 1_000,
   };
 }
 
@@ -99,7 +100,8 @@ function printPlan(o: Options, io: SafeOutput): void {
     `  B7        the OPERATOR restarts the coordinator (up to ${o.restartTimeoutSeconds} s): an old-epoch nonce gets 401 use_dpop_nonce, and a pre-restart jti is accepted`,
     '  cleanup   revoke the run\'s first device',
     '',
-    'a live run writes: two device rows (both revoked by the end), one occurrence (head + status, the status tombstoned), feed cursors',
+    'a live run writes: two device rows, one occurrence (head + status), feed cursors',
+    'a live run revokes both of its devices and tombstones the status whenever its Push applied, unless it is cut off (exit 2)',
     'the access token lives 10 minutes with no refresh: the whole run fits inside one sign-in',
     `to run it: --target ${o.target ?? '<origin>'} --confirm ${host ?? '<host>'}`,
   ];

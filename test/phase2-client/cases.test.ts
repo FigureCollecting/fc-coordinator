@@ -520,11 +520,34 @@ describe('B7: a nonce across a restart', () => {
     expect(h.transport.log.filter((e) => e.request.label === 'B7:poll')).toHaveLength(4);
   });
 
-  it('is inconclusive at once, polling nothing, when the token is inside its margin already', async () => {
-    const h = await harness({ tokenLifetimeMs: TOKEN_MARGIN_MS - 1_000 });
+  it('never asks for a negative sleep when a poll itself ends past the deadline', async () => {
+    const h = await harness({ tokenLifetimeMs: TOKEN_MARGIN_MS + 4_000 });
     const base = Date.now();
-    const ctx: CaseContext = { ...h.ctx, now: () => base, sleep: async () => {} };
-    expect(await caseB7(ctx, { ...quick, awaitRestart: async () => {} })).toMatchObject({ verdict: 'INCONCLUSIVE', detail: expect.stringMatching(/^too little of the access token is left/) });
+    let offset = 0;
+    const sleeps: number[] = [];
+    // Each poll takes 5 s of the case's clock, so the first one already ends 1 s past the deadline.
+    const slow: Transport = {
+      count: 0,
+      request: async (req) => {
+        if (req.label === 'B7:poll') offset += 5_000;
+        return h.transport.request(req);
+      },
+    };
+    const session = new Session(slow, { origin: ORIGIN, prefix: PREFIX }, h.ctx.session.accessToken, createSafeOutput({ write: () => true }, { write: () => true }));
+    const ctx: CaseContext = { ...h.ctx, session, now: () => base + offset, sleep: async (ms) => void (sleeps.push(ms), (offset += ms)) };
+    expect(await caseB7(ctx, { timeoutMs: 300_000, pollMs: 5_000, jtiWindowMs: 36_000, awaitRestart: async () => {} })).toMatchObject({ verdict: 'INCONCLUSIVE' });
+    // A negative setTimeout is a TimeoutNegativeWarning on stderr, and a case clock that runs back.
+    expect(sleeps).toEqual([0]);
+  });
+
+  it('is inconclusive at once, polling nothing, when the token is inside its margin already', async () => {
+    const h = await harness();
+    const base = Date.now();
+    // Inside the margin, and exactly at its edge, where no time at all is left to wait.
+    for (const left of [TOKEN_MARGIN_MS - 1_000, TOKEN_MARGIN_MS]) {
+      const ctx: CaseContext = { ...h.ctx, now: () => base, sleep: async () => {}, tokenExpiresAt: base + left };
+      expect(await caseB7(ctx, { ...quick, awaitRestart: async () => {} })).toMatchObject({ verdict: 'INCONCLUSIVE', detail: expect.stringMatching(/^too little of the access token is left/) });
+    }
     expect(h.transport.log.some((e) => e.request.label === 'B7:poll')).toBe(false);
   });
 
