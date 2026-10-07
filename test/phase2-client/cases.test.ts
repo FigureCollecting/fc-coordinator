@@ -534,6 +534,28 @@ describe('B7: a nonce across a restart', () => {
     expect(h.transport.log.filter((e) => e.request.label === 'B7:poll')).toHaveLength(4);
   });
 
+  it('stops at the token deadline too when every poll fails, as polls do while the coordinator is down', async () => {
+    const h = await harness({ tokenLifetimeMs: 22_000 });
+    const base = Date.now();
+    let offset = 0;
+    const sleeps: number[] = [];
+    const down: Transport = {
+      count: 0,
+      request: async (req) => {
+        if (req.label === 'B7:poll') throw new Error('connect ECONNREFUSED');
+        return h.transport.request(req);
+      },
+    };
+    const session = new Session(down, { origin: ORIGIN, prefix: PREFIX }, h.ctx.session.accessToken, createSafeOutput({ write: () => true }, { write: () => true }));
+    const ctx: CaseContext = { ...h.ctx, session, now: () => base + offset, sleep: async (ms) => void (sleeps.push(ms), (offset += ms)) };
+    const result = await caseB7(ctx, { timeoutMs: 300_000, pollMs: 5_000, jtiWindowMs: 36_000, awaitRestart: async () => {} });
+    expect(result).toMatchObject({ verdict: 'INCONCLUSIVE', detail: expect.stringMatching(/within 17 s$/) });
+    // Three full polls, then only what is left before the margin: the cleanup revoke still has it.
+    expect(sleeps.slice(0, 3)).toEqual([5_000, 5_000, 5_000]);
+    expect(sleeps).toHaveLength(4);
+    expect(ctx.now()).toBeLessThanOrEqual(h.ctx.tokenExpiresAt - TOKEN_MARGIN_MS);
+  });
+
   it('never asks for a negative sleep when a poll itself ends past the deadline', async () => {
     const h = await harness({ tokenLifetimeMs: TOKEN_MARGIN_MS + 4_000 });
     const base = Date.now();

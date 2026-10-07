@@ -161,6 +161,17 @@ describe('the smoke, when the coordinator misbehaves', () => {
     expect(result).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/did not show .*head, .*status as pushed/) });
   });
 
+  it('fails when Delta shows the head but not the status: one of the two is not both', async () => {
+    const result = await smokeAgainst(on('smoke:delta', (res) => {
+      const page = fromBinary(DeltaResponseSchema, res.body);
+      page.events = page.events.filter((event) => !event.facetKey.endsWith('/status'));
+      return { ...res, body: toBinary(DeltaResponseSchema, page) };
+    }));
+    // Only the status is named missing, so the head was on the page and was matched.
+    expect(result).toMatchObject({ verdict: 'FAIL', detail: expect.stringMatching(/^Delta from the Status cursor did not show occ\/[0-9a-f-]{36}\/status as pushed; cleanup: the copy's status tombstoned$/) });
+    expect(await statusOp(last.userId)).toBe('delete');
+  });
+
   it('fails when Delta itself fails', async () => {
     expect((await smokeAgainst(on('smoke:delta', (res) => withStatus(res, 400, '{"code":"invalid_argument"}')))).detail).toMatch(/Delta answered 400/);
   });
