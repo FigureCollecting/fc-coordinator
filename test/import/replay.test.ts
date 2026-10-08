@@ -881,6 +881,35 @@ describe('a recorded late edit is placed again only where it stood: before its o
     expect((await stateOf(a)).get(`occ/${cx}/status`)).toMatchObject({ status: 'former' });
   });
 
+  it('a revision of the import that replaced a recorded late edit places it before that import again: the revised decision no longer refiles the copy, so the filing stands', async () => {
+    const a = await SyncCaller.enrol(h);
+    const b = await SyncCaller.sibling(h, a);
+    const d = await SyncCaller.sibling(h, a);
+    const x = nextId();
+    const S = headFor(x);
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned')]);
+    const { cursor: bSaw } = await drain(b);
+    const { cursor: dSaw } = await drain(d);
+    const shelf = `owned/${randomUUID()}`;
+    await imported(a, [row(x, 'Ordered')], DATE_B);
+    // The import refiles the copy it moves to Ordered: b's filing is STALE, replaced by that import.
+    expect(outcomes(await pushed(b, [edit(b, `occ/${cx}/collection`, { collection: shelf }, bSaw, 60_000)]))).toEqual(['STALE']);
+    const { cursor: aSaw } = await drain(a);
+    // d's late ordered copy is the one MFC moved: the import, replayed with both, removes x's copy
+    // and refiles nothing, so b's filing stands on it.
+    const hand = randomUUID();
+    expect(outcomes(await pushed(d, [edit(d, `occ/${hand}/head`, { head_id: S }, dSaw), edit(d, `occ/${hand}/status`, { status: 'ordered' }, dSaw)]))).toEqual(['APPLIED', 'APPLIED']);
+    expect(shape((await drain(a, aSaw)).events, { [cx]: 'CX', [hand]: 'HAND', [S]: 'HX' })).toEqual([
+      ['occ/HAND/head', 'UPSERT'],
+      ['occ/HAND/status', 'UPSERT'],
+      ['occ/CX/status', 'DELETE'],
+      ['imp/mfc/change/HX', 'UPSERT'],
+      ['occ/CX/collection', 'UPSERT'],
+    ]);
+    expect((await stateOf(a)).get(`occ/${cx}/collection`)).toMatchObject({ collection: shelf });
+  });
+
   it('(ii) reads the revisions from the oldest basis in the push: an edit made before a revision is held beside one made after it', async () => {
     const { a, b } = await twoDevices();
     const c = await SyncCaller.sibling(h, a);
@@ -904,3 +933,4 @@ describe('a recorded late edit is placed again only where it stood: before its o
     expect(outcomes(res)).toEqual(['HELD', 'APPLIED']);
   });
 });
+

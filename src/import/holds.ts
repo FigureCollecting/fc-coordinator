@@ -373,6 +373,9 @@ async function reviseOrHold(
   const replayedHere = new Set(recorded.map((r) => `${r.facet.facetKey}\n${r.facet.version}`));
   if (since.some((e) => !isServerVersion(e.version) && !replayedHere.has(`${e.facet_key}\n${e.version}`))) return HOLD;
 
+  // Only an edit whose facet the decision writes is replaced. Marking every late edit replaced would
+  // change nothing a later replay sees (each such edit, or a value versioned above it, is on the feed
+  // before any later import), but the record would no longer say what happened.
   const written = new Set(again.writes.map((w) => w.facetKey));
   return {
     kind: 'revise',
