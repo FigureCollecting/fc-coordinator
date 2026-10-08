@@ -454,7 +454,7 @@ transaction control in a pending file, `6` out-of-order file.
 | `0003_sync.sql` | `facet_state` (authoritative), `feed_event`, `feed_cursor`, `mutation_receipt` for SyncService; versions are `TEXT COLLATE "C"` with a grammar CHECK; the app role may not delete from any of them |
 | `0004_sync_transactions.sql` | `feed_event.opens_txn` (the first event of each server transaction, backfilled per database transaction) and `held_edit` (Push events answered HELD); the app role appends held edits and never rewrites them |
 | `0005_import.sql` | the MFC import's state: `import_run` and `import_frame` (append-only), the row, copy and field bases, and `import_figure_item` (pending conflicts) |
-| `0006_import_reimport.sql` | `import_copy_base.import_removed` (a copy an import removed), `import_kept_copy` (knowing keeps), `import_export_row` (the latest export's rows, for the discrepancy report), `import_frame.before` (each figure as the import found it) and, append-only, `import_late_edit` (the late edits a Push replayed) and `import_revision` (the revisions that changed a figure) |
+| `0006_import_reimport.sql` | `import_copy_base.import_removed` (a copy an import removed), `import_kept_copy` (knowing keeps), `import_export_row` (the latest export's rows, for the discrepancy report), `import_frame.before` (each figure as the import found it) and, append-only, `import_late_edit` (the late edits a Push replayed and APPLIED) and `import_revision` (the revisions that changed a figure) |
 
 ## Shared baseline
 
@@ -766,10 +766,11 @@ is placed as it would have been: STALE where the import wrote its facet, by LWW
 otherwise. If not, the Push emits each difference between the figure replayed
 and as emitted, and moves its bases, item and knowing keeps to the replay's (a
 REVISION; `import_revision` keeps one that changed the figure's live copies or
-items). Every late edit replayed is kept (`import_late_edit`) under the earliest
-import it is late for, with the import whose replayed decision wrote its facet: a
-later replay places it before each import from the one to the other and before
-none after, so an edit answered STALE never comes back. HELD only for a reaction to the result the edit
+items). A STALE answer is final: only a late edit that stood (APPLIED) is kept
+(`import_late_edit`), under the earliest import it is late for, and a later
+replay places it before that import and each later one; one answered STALE is
+placed by no later replay or revision, and its device may edit again. HELD only
+for a reaction to the result the edit
 would withdraw: another device's edit to the figure since the import, or one in
 the same Push (HELD (i)); an answer on the figure since the edit's basis (HELD
 (iii)); an edit made after a revision's import and before the revision, which
