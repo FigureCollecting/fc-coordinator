@@ -1128,4 +1128,29 @@ describe('the replay: pins of its order and its bounds', () => {
     expect(outcomes(res)).toEqual(['STALE']);
     expect(JSON.parse(res.results[0]!.current!.payload)).toMatchObject({ status: 'owned' });
   });
+
+  it("places a kept late edit before a later import's revision too: an edit late for two imports, kept under the earlier, still stands", async () => {
+    const { a, b } = await twoDevices();
+    const d = await SyncCaller.sibling(h, a);
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    const score = edit(b, `uf/${S}/score`, { score: 7 }, bSaw, -5000);
+    await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    const { cursor: dSaw } = await drain(d);
+    await imported(a, [row(x, 'Ordered', { note: 'n2' })], '2026-09-30');
+    // The score is late for the second and third imports, and kept under the second.
+    expect(outcomes(await pushed(b, [score]))).toEqual(['APPLIED']);
+    const { rows: runs } = await db.admin.query<{ n: number }>('SELECT import_number AS n FROM import_run WHERE user_id = $1 ORDER BY import_number', [a.userId]);
+    expect(await lateRows(a.userId)).toEqual([[`uf/${S}/score`, runs[1]!.n]]);
+    // d's hand copy is late for the third import alone and revises it: the replay before the third
+    // import must place the score kept under the second, or the revision drops it.
+    const hand = randomUUID();
+    expect(outcomes(await pushed(d, [edit(d, `occ/${hand}/head`, { head_id: S }, dSaw, -4000), edit(d, `occ/${hand}/status`, { status: 'ordered' }, dSaw, -4000)]))).toEqual([
+      'APPLIED',
+      'APPLIED',
+    ]);
+    expect((await stateOf(a)).get(`uf/${S}/score`)).toMatchObject({ score: 7 });
+  });
 });
