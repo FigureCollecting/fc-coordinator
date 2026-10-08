@@ -766,8 +766,10 @@ is placed as it would have been: STALE where the import wrote its facet, by LWW
 otherwise. If not, the Push emits each difference between the figure replayed
 and as emitted, and moves its bases, item and knowing keeps to the replay's (a
 REVISION; `import_revision` keeps one that changed the figure's live copies or
-items). Every late edit replayed is kept (`import_late_edit`), so a later replay
-of that import places it again. HELD only for a reaction to the result the edit
+items). Every late edit replayed is kept (`import_late_edit`) under the earliest
+import it is late for, with the import whose replayed decision wrote its facet: a
+later replay places it before each import from the one to the other and before
+none after, so an edit answered STALE never comes back. HELD only for a reaction to the result the edit
 would withdraw: another device's edit to the figure since the import, or one in
 the same Push (HELD (i)); an answer on the figure since the edit's basis (HELD
 (iii)); an edit made after a revision's import and before the revision, which

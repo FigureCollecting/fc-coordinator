@@ -840,7 +840,7 @@ describe('a recorded late edit is placed again only where it stood: before its o
     expect(await heldCount(a.userId)).toBe(0);
   });
 
-  it('one push, two late edits with different bases: the newer is STALE where the import it is late for wrote its facet, though an earlier import wrote it too', async () => {
+  it('one push, two late edits with different bases: the newer is replayed before the import it is late for though an earlier import wrote its facet', async () => {
     const { a, b } = await twoDevices();
     const x = nextId();
     const S = headFor(x);
@@ -850,10 +850,35 @@ describe('a recorded late edit is placed again only where it stood: before its o
     const older = edit(b, `occ/${cx}/collection`, { collection: `owned/${randomUUID()}` }, '');
     const newer = edit(b, `uf/${S}/note`, { note: 'mine' }, mid);
     await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    // Replayed before the second import, the note it had not seen change raises the note conflict:
+    // a replay that changes a decision of a push late for two imports is held, not applied over MFC's note.
     const res = await pushed(b, [older, newer]);
-    expect(outcomes(res)).toEqual(['APPLIED', 'STALE']);
-    expect(JSON.parse(res.results[1]!.current!.payload)).toMatchObject({ note: 'n2' });
+    expect(outcomes(res)).toEqual(['HELD', 'HELD']);
+    expect(await heldCount(a.userId)).toBe(2);
     expect((await stateOf(a)).get(`uf/${S}/note`)).toMatchObject({ note: 'n2' });
+  });
+
+  it('a second revision whose replay raises no conflict ends the item the first raised', async () => {
+    const { a, b } = await twoDevices();
+    const d = await SyncCaller.sibling(h, a);
+    const [x, y] = [nextId(), nextId()];
+    const S = headFor(x);
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned'), row(y, 'Owned')]);
+    const { cursor: bSaw } = await drain(b);
+    const { cursor: dSaw } = await drain(d);
+    const wish = edit(b, `occ/${cx}/status`, { status: 'wished' }, bSaw, 0);
+    const sale = edit(d, `occ/${cx}/status`, { status: 'former' }, dSaw, 60_000);
+    await imported(a, [row(y, 'Owned')], DATE_B);
+    // b's late move to the wishlist, where MFC dropped the row: the replay raises the conflict.
+    expect(outcomes(await pushed(b, [wish]))).toEqual(['APPLIED']);
+    expect(await pending(a)).toBe(1n);
+    const { cursor: aSaw } = await drain(a);
+    // d's later late sale, replayed with b's move, is MFC's removal: no conflict, so the item ends.
+    expect(outcomes(await pushed(d, [sale]))).toEqual(['APPLIED']);
+    expect(shape((await drain(a, aSaw)).events, { [cx]: 'CX', [S]: 'HX' })).toContainEqual(['imp/mfc/figure/HX', 'DELETE']);
+    expect(await pending(a)).toBe(0n);
+    expect((await stateOf(a)).get(`occ/${cx}/status`)).toMatchObject({ status: 'former' });
   });
 
   it('(ii) reads the revisions from the oldest basis in the push: an edit made before a revision is held beside one made after it', async () => {

@@ -19,7 +19,9 @@
 --                      and its copies. A late edit is replayed against it (src/import/replay.ts).
 --                      NULL for a frame recorded before 0006: a late edit for it is held.
 --   import_late_edit   each late edit a Push replayed rather than held, under the earliest import
---                      it is late for: a later replay of that import places it there again.
+--                      it is late for, and the import whose replayed decision wrote its facet
+--                      (overwritten_by; NULL when none did): a later replay places it before each
+--                      import from its own to that one, and before none after.
 --   import_revision    each Push whose replay changed S's live copies or items (a REVISION): its
 --                      position on the feed and S's live copies and items either side, which
 --                      HELD (ii) reads for an edit made before it.
@@ -57,6 +59,7 @@ CREATE TABLE import_late_edit (
   version        text COLLATE "C" NOT NULL CHECK (sync_version_is_canonical(version)),
   op             text NOT NULL CHECK (op IN ('upsert', 'delete')),
   payload        text NOT NULL,
+  overwritten_by integer CHECK (overwritten_by >= import_number),
   PRIMARY KEY (user_id, import_number, head_id, facet_key, version),
   CHECK ((op = 'delete') = (payload = '')),
   FOREIGN KEY (user_id, import_number) REFERENCES import_run (user_id, import_number)

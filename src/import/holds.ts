@@ -80,16 +80,24 @@ interface FrameRow {
   before: FrameBefore | null;
 }
 
-/** A late edit replayed rather than held, under the earliest import it is late for. */
+/**
+ * A late edit replayed rather than held, under the earliest import it is late for, with the import
+ * whose replayed decision wrote its facet (null when none did): it stood just before each import
+ * from its own to that one, and before none after.
+ */
 interface Recorded {
   importNumber: number;
+  overwrittenBy: number | null;
   facet: Facet;
 }
 
+/** Each late edit (by index) the replay replaced, with the import whose decision wrote its facet. */
+type Overwritten = Map<number, number>;
+
 type Verdict =
   | { kind: 'hold' }
-  | { kind: 'unchanged'; stale: Set<number> }
-  | { kind: 'revise'; write: (feed: FeedTransaction) => Promise<Map<number, LateOutcome>> };
+  | { kind: 'unchanged'; overwritten: Overwritten }
+  | { kind: 'revise'; overwritten: Overwritten; write: (feed: FeedTransaction) => Promise<Map<number, LateOutcome>> };
 
 const HOLD: Verdict = { kind: 'hold' };
 
@@ -156,11 +164,15 @@ async function facetsNow(tx: SqlClient, userId: string, keys: readonly string[])
 }
 
 async function readLateEdits(tx: SqlClient, userId: string, S: string): Promise<Recorded[]> {
-  const { rows } = await tx.query<FacetRow & { import_number: number }>(
-    'SELECT import_number, facet_key, version, op, payload FROM import_late_edit WHERE user_id = $1 AND head_id = $2',
+  const { rows } = await tx.query<FacetRow & { import_number: number; overwritten_by: number | null }>(
+    'SELECT import_number, overwritten_by, facet_key, version, op, payload FROM import_late_edit WHERE user_id = $1 AND head_id = $2',
     [userId, S],
   );
-  return rows.map((r) => ({ importNumber: r.import_number, facet: { facetKey: r.facet_key, version: r.version, op: r.op, payload: r.payload } }));
+  return rows.map((r) => ({
+    importNumber: r.import_number,
+    overwrittenBy: r.overwritten_by,
+    facet: { facetKey: r.facet_key, version: r.version, op: r.op, payload: r.payload },
+  }));
 }
 
 async function readRevisions(tx: SqlClient, userId: string, after: bigint): Promise<Revision[]> {
@@ -239,8 +251,8 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
     }
 
     const occId: OccIdOf | null = occIdKey === null ? null : (mfcId, ordinal) => importOccId(occIdKey, userId, mfcId, ordinal);
-    const revisions: { S: string; units: string[]; write: (feed: FeedTransaction) => Promise<Map<number, LateOutcome>> }[] = [];
-    const replayed: { S: string; e: PushedEdit }[] = [];
+    const revisions: { S: string; units: string[]; overwritten: Overwritten; write: (feed: FeedTransaction) => Promise<Map<number, LateOutcome>> }[] = [];
+    const replayed: { S: string; e: PushedEdit; overwrittenBy: number | null }[] = [];
     for (const S of [...lateOn.keys()].sort(bytewise)) {
       const late = lateOn.get(S)!;
       const units = unique(late.map((t) => t.unit));
@@ -249,10 +261,10 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
       if (verdict.kind === 'hold') {
         for (const u of units) held.add(u);
       } else if (verdict.kind === 'revise') {
-        revisions.push({ S, units, write: verdict.write });
+        revisions.push({ S, units, overwritten: verdict.overwritten, write: verdict.write });
       } else {
-        for (const index of verdict.stale) out.set(index, 'stale');
-        replayed.push(...late.map((t) => ({ S, e: t.e })));
+        for (const index of verdict.overwritten.keys()) out.set(index, 'stale');
+        replayed.push(...late.map((t) => ({ S, e: t.e, overwrittenBy: verdict.overwritten.get(t.e.index) ?? null })));
       }
     }
     // A revision replays its figure's late units alone and whole: one held for another reason, or
@@ -263,18 +275,19 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
         continue;
       }
       for (const [index, outcome] of await r.write(feed)) out.set(index, outcome);
-      replayed.push(...lateOn.get(r.S)!.map((t) => ({ S: r.S, e: t.e })));
+      replayed.push(...lateOn.get(r.S)!.map((t) => ({ S: r.S, e: t.e, overwrittenBy: r.overwritten.get(t.e.index) ?? null })));
     }
 
     for (const t of placed) if (held.has(t.unit)) out.set(t.e.index, 'held');
-    // Each late edit replayed is placed again, under its earliest import, by any later replay.
-    for (const { S, e } of replayed) {
+    // Each late edit replayed is kept under its earliest import, with the import that replaced it,
+    // so a later replay places it before each import from the one to the other, and before no later one.
+    for (const { S, e, overwrittenBy } of replayed) {
       if (held.has(placed.find((t) => t.e === e)!.unit)) continue;
       const f = frames.find((x) => x.head === S && x.settled && e.basisSeq < x.marker)!;
       await tx.query(
-        `INSERT INTO import_late_edit (user_id, import_number, head_id, facet_key, version, op, payload) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `INSERT INTO import_late_edit (user_id, import_number, head_id, facet_key, version, op, payload, overwritten_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT DO NOTHING`,
-        [userId, f.importNumber, S, e.facetKey, e.version, e.op, e.payload],
+        [userId, f.importNumber, S, e.facetKey, e.version, e.op, e.payload, overwrittenBy],
       );
     }
     return out;
@@ -300,13 +313,16 @@ async function replayFigure(
   if (answers.length > 0) return HOLD;
   const recorded = await readLateEdits(tx, userId, S);
 
-  const stale = new Set<number>();
-  // The keys an earlier frame's decision wrote: a late edit there is replaced, and placed before no later import.
-  const overwritten = new Set<string>();
+  // Each late edit an earlier frame's decision replaced, by the import that wrote its facet: it is
+  // placed before no later import. Per edit: one made after that import is not replaced by it.
+  const overwritten: Overwritten = new Map();
   for (const f of settled) {
     const frame: Frame = { importNumber: f.importNumber, exportDate: f.exportDate, before: f.before! };
-    const here = late.filter((e) => e.basisSeq < f.marker && !overwritten.has(e.facetKey));
-    const placedBefore = recorded.filter((r) => r.importNumber <= f.importNumber).map((r) => r.facet);
+    const here = late.filter((e) => e.basisSeq < f.marker && !overwritten.has(e.index));
+    // A recorded late edit stands just before its own import, and before each later one until an
+    // import's replayed decision wrote its facet. An import that ran after it was applied wrote it,
+    // if at all, at a version above it (version.ts writeVersion), so placing it there is a no-op.
+    const placedBefore = recorded.filter((r) => r.importNumber <= f.importNumber && (r.overwrittenBy === null || f.importNumber <= r.overwrittenBy)).map((r) => r.facet);
     const occs = unique([...f.before!.occs, ...occsOf(here), ...occsOf(placedBefore)]);
     const pre = await facetsBefore(tx, userId, unique([...figureKeys(S, occs), ...here.map(keyOf), ...placedBefore.map(keyOf)]), f.start);
     const as = decideAgain(frame, S, pre, placedBefore, occId);
@@ -316,10 +332,10 @@ async function replayFigure(
       if (settled.length > 1 || knowing) return HOLD;
       return reviseOrHold(tx, userId, S, f, frame, late, placedBefore, recorded, pre, again);
     }
-    for (const w of again.writes) overwritten.add(w.facetKey);
-    for (const e of here) if (overwritten.has(e.facetKey)) stale.add(e.index);
+    const written = new Set(again.writes.map((w) => w.facetKey));
+    for (const e of here) if (written.has(e.facetKey)) overwritten.set(e.index, f.importNumber);
   }
-  return { kind: 'unchanged', stale };
+  return { kind: 'unchanged', overwritten };
 }
 
 /**
@@ -357,8 +373,10 @@ async function reviseOrHold(
   const replayedHere = new Set(recorded.map((r) => `${r.facet.facetKey}\n${r.facet.version}`));
   if (since.some((e) => !isServerVersion(e.version) && !replayedHere.has(`${e.facet_key}\n${e.version}`))) return HOLD;
 
+  const written = new Set(again.writes.map((w) => w.facetKey));
   return {
     kind: 'revise',
+    overwritten: new Map(late.filter((e) => written.has(e.facetKey)).map((e) => [e.index, f.importNumber])),
     write: async (feed) => {
       // S replayed: its facets just before the import, every late edit for it placed, then the import's decision.
       const replay = placeEdits(pre, [...placedBefore, ...late]);
@@ -434,6 +452,7 @@ async function moveBases(tx: SqlClient, userId: string, S: string, importNumber:
     copies,
     copiesGone: based.map((r) => r.occ_id).filter((occ) => !copies.has(occ)),
     fields: FIELDS.map((field) => ({ head: S, field, value: fields.get(field) ?? null })),
+    // A replay that raises no item ends S's: an earlier revision of the same import may have raised one.
     items: again.items.set.length > 0 ? { set: again.items.set, end: [] } : { set: [], end: [S] },
     kept: { add: kept, gone: keptNow.map((r) => r.occ_id).filter((occ) => !kept.has(occ)) },
   });
