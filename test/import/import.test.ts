@@ -669,6 +669,38 @@ describe('the pending count and the spine', () => {
     expect(second.review[0]!.items.map((i) => [i.headId, i.rev])).toEqual([[headFor(x), first.review[0]!.items[0]!.rev]]);
   });
 
+  it('counts no item whose answer has synced: the same export raises and lists nothing, a new MFC value raises again', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, y] = [nextId(), nextId()];
+    const before = (n: number) => canonicalVersion({ instant: new Date(Date.now() - 1000), counter: n, deviceId: a.deviceId });
+    const note = (id: string, n: number) => ({ facetKey: `uf/${headFor(id)}/note`, version: before(n), op: SyncOp.UPSERT, payload: JSON.stringify({ note: 'app: boxed', ...DISPLAY }), basis: '' });
+    ok(await a.push({ clientId: randomUUID(), events: [note(x, 1), note(y, 2)] }));
+    const csv = (n: string) => mfcCsv([row(x, 'Owned', { note: n })]);
+
+    const first = ok(await a.importMfcExport({ csvText: csv('mfc: loose'), exportDate: EXPORT_DATE }));
+    expect(first).toMatchObject({ conflictsRaised: 1, conflictsPending: 1 });
+    const rev = first.review[0]!.items[0]!.rev;
+    const { cursor } = await drain(a);
+
+    // The client answers the figure item, and the answer syncs.
+    const answer = { facetKey: `res/mfc/${headFor(x)}`, version: canonicalVersion({ instant: new Date(), counter: 3, deviceId: a.deviceId }), op: SyncOp.UPSERT, payload: JSON.stringify({ item: 'figure', rev, choice: 'keep', ...DISPLAY }), basis: cursor };
+    expect(ok(await a.push({ clientId: randomUUID(), events: [answer] })).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+
+    const again = ok(await a.importMfcExport({ csvText: csv('mfc: loose'), exportDate: EXPORT_DATE }));
+    expect(again).toMatchObject({ conflictsRaised: 0, conflictsPending: 0, review: [] });
+
+    // Another export frames only y: x's answered item, standing beside it, is not listed either.
+    const other = ok(await a.importMfcExport({ csvText: mfcCsv([row(y, 'Owned', { note: 'mfc: loose' })]), exportDate: EXPORT_DATE }));
+    expect(other).toMatchObject({ conflictsRaised: 1, conflictsPending: 1 });
+    expect(other.review[0]!.items.map((i) => i.headId)).toEqual([headFor(y)]);
+
+    // A new MFC value on x is a new rev, which the answer does not name: raised and pending again.
+    const changed = ok(await a.importMfcExport({ csvText: csv('mfc: repainted'), exportDate: EXPORT_DATE }));
+    expect(changed).toMatchObject({ conflictsRaised: 1, conflictsPending: 2 });
+    const relisted = changed.review[0]!.items.find((i) => i.headId === headFor(x))!;
+    expect(relisted.rev).not.toBe(rev);
+  });
+
   it('imports a header-only export with no spine configured, and answers UNAVAILABLE once there are ids to resolve', async () => {
     const bare = await startSyncApp(db.app, h.issuer, undefined, undefined, { import: { db: db.app, spineRead: null, occIdKey: KEY } });
     try {
