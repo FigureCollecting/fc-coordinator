@@ -472,6 +472,10 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
       }
       checked(await asApp(`INSERT INTO import_late_edit (user_id, import_number, head_id, facet_key, version, op, payload) VALUES ('${USER}', 1, '${HEAD}', 'k', 'v', 'upsert', '{}')`));
       checked(await asApp(`INSERT INTO import_late_edit (user_id, import_number, head_id, facet_key, version, op, payload) VALUES ('${USER}', 1, '${HEAD}', 'k', '${V}', 'delete', '{}')`));
+      // An edit is replaced by its own import or a later one, never by one before it.
+      checked(await asApp(`INSERT INTO import_late_edit (user_id, import_number, head_id, facet_key, version, op, payload, overwritten_by) VALUES ('${USER}', 1, '${HEAD}', 'k2', '${V}', 'upsert', '{}', 0)`));
+      const replaced = await asApp(`INSERT INTO import_late_edit (user_id, import_number, head_id, facet_key, version, op, payload, overwritten_by) VALUES ('${USER}', 1, '${HEAD}', 'k3', '${V}', 'upsert', '{}', 1)`);
+      expect(replaced.exitCode).toBe(0);
     });
 
     it('holds them to the import vocabulary: a kept copy is of a kind, an export row has a canonical id and a Count 0 to 99', async () => {

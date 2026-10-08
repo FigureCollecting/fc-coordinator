@@ -472,12 +472,13 @@ describe('a late edit: made before an import it had not seen, replayed just befo
     expect(late.results[0]!.current).toMatchObject({ facetKey: `occ/${copyX}/status`, payload: JSON.stringify({ status: 'owned', edited_at: `${EXPORT_DATE}T00:00:00Z`, tz: 'UTC' }) });
     expect((await db.admin.query('SELECT 1 FROM held_edit WHERE user_id = $1', [a.userId])).rows).toHaveLength(0);
     // Each late edit replayed is kept under the import it is late for, so a later replay places it there again.
-    const { rows } = await db.admin.query<{ facet_key: string; import_number: number }>(
-      'SELECT facet_key, import_number FROM import_late_edit WHERE user_id = $1 ORDER BY facet_key',
+    // The STALE one with the import that replaced it, so no later replay places it after that import.
+    const { rows } = await db.admin.query<{ facet_key: string; import_number: number; overwritten_by: number | null }>(
+      'SELECT facet_key, import_number, overwritten_by FROM import_late_edit WHERE user_id = $1 ORDER BY facet_key',
       [a.userId],
     );
-    expect(rows.map((r) => [r.facet_key, r.import_number])).toEqual(
-      [`occ/${copyX}/status`, `occ/${newCopy}/head`, `uf/${headFor(y)}/note`].sort().map((k) => [k, 1]),
+    expect(rows.map((r) => [r.facet_key, r.import_number, r.overwritten_by])).toEqual(
+      [`occ/${copyX}/status`, `occ/${newCopy}/head`, `uf/${headFor(y)}/note`].sort().map((k) => [k, 1, k === `occ/${copyX}/status` ? 1 : null]),
     );
 
     // A tag on an imported copy is its own unit, late, and left standing; a copy with no head
