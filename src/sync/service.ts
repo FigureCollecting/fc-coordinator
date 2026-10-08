@@ -3,6 +3,8 @@
 // REVIEW is never emitted: there are no policy tables yet, so every user facet is AUTO_ACCEPT.
 // Each Push is one server transaction (sync.proto rule 7), and Delta gives its last event
 // commit_cursor. HELD is decided by a HoldPolicy; until the import supplies one, nothing is held.
+// An answer to an import item (res/{site}/{head}) is the import's to accept or answer STALE
+// (ImportHooks), and StatusResponse.pending_review is the import's count of what awaits review.
 import { createHash } from 'node:crypto';
 import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
@@ -52,6 +54,7 @@ import {
   type TxClient,
 } from './store.js';
 import { validateEvent } from './validate.js';
+import type { ImportHooks } from '../import/answers.js';
 
 export const DEFAULT_PAGE = 500;
 export const MAX_PAGE = 1000;
@@ -93,6 +96,8 @@ export interface SyncRoutesDeps {
   writers?: KeyedSerialiser;
   /** Which edits a Push holds; holdNothing by default. */
   holds?: HoldPolicy;
+  /** The import's answers and review count; without them an answer is placed by LWW and nothing awaits review. */
+  imports?: ImportHooks;
 }
 
 interface Caller {
@@ -212,6 +217,7 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
 
       const feed = new FeedTransaction();
       const results: PushResult[] = [];
+      const applied: Facet[] = [];
       for (const [index, verdict] of verdicts.entries()) {
         const facet = facets[index]!;
         if (!verdict.ok) {
@@ -221,10 +227,12 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
           await keepHeld(tx, caller.userId, { ...facet, clientId: req.clientId, ordinal: index, basisSeq: verdict.basisSeq });
           results.push(result(facet.facetKey, PushOutcome.HELD, await readFacet(tx, caller.userId, facet.facetKey)));
         } else {
-          const applied = await applyEvent(tx, caller.userId, facet, feed);
-          results.push(result(facet.facetKey, applied.applied ? PushOutcome.APPLIED : PushOutcome.STALE, applied.current));
+          const placed = (await deps.imports?.answer(tx, caller.userId, facet, feed)) ?? (await applyEvent(tx, caller.userId, facet, feed));
+          if (placed.applied) applied.push(facet);
+          results.push(result(facet.facetKey, placed.applied ? PushOutcome.APPLIED : PushOutcome.STALE, placed.current));
         }
       }
+      await deps.imports?.applied(tx, caller.userId, applied);
       const response = create(PushResponseSchema, { results });
       await writeReceipt(tx, caller.userId, req.clientId, requestSha256, Buffer.from(outcomesOf(response)));
       return response;
@@ -248,7 +256,8 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
     const caller = callerOf(ctx);
     const head = await feedHead(db, caller.userId);
     const now = await serverNow(db);
-    return create(StatusResponseSchema, { cursor: encodeCursor(head), pendingReview: 0n, serverNowIso: now.iso });
+    const pendingReview = (await deps.imports?.pendingReview(db, caller.userId)) ?? 0n;
+    return create(StatusResponseSchema, { cursor: encodeCursor(head), pendingReview, serverNowIso: now.iso });
   };
 
   return (router: ConnectRouter) => {

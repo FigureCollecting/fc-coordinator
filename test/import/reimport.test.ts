@@ -324,7 +324,7 @@ describe('answers to an item, synced through Push (import.proto ITEMS AND ANSWER
   it("take: MFC's side made true on the copies MFC tracks: the sold copy is owned again, MFC's new copy made, and the disputed field takes MFC's value", async () => {
     const a = await SyncCaller.enrol(h);
     const x = nextId();
-    const [c1, c2, c3] = [1, 2, 3].map((n) => importOccId(KEY, a.userId, x, n));
+    const [c1, c2, c3] = [importOccId(KEY, a.userId, x, 1), importOccId(KEY, a.userId, x, 2), importOccId(KEY, a.userId, x, 3)];
     await imported(a, [row(x, 'Owned', { count: '2', score: '7/10' })]);
     const { cursor } = await drain(a);
     await pushed(a, [edit(a, `occ/${c2}/status`, { status: 'former' }, cursor), edit(a, `uf/${headFor(x)}/score`, { score: 9 }, cursor)]);
@@ -450,6 +450,260 @@ describe('answers to an item, synced through Push (import.proto ITEMS AND ANSWER
     const state = new Map((await drain(a)).events.map((e) => [e.facetKey, e]));
     expect(JSON.parse(state.get(`occ/${cy}/status`)!.payload)).toMatchObject({ status: 'owned' });
     expect(state.get(`imp/mfc/change/${headFor(x)}`)!.op).toBe(SyncOp.UPSERT);
+  });
+});
+
+describe('answers: the edges', () => {
+  const earlier = (c: SyncCaller) => canonicalVersion({ instant: new Date(Date.now() - 60_000), counter: (counter += 1), deviceId: c.deviceId });
+
+  it('per_copy ignores a copy of another figure, a status the copy already holds and a field the rev did not dispute, and writes no field already at MFC\'s value', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, other] = [nextId(), nextId()];
+    const [c1, c2] = [importOccId(KEY, a.userId, x, 1), importOccId(KEY, a.userId, x, 2)];
+    const elsewhere = importOccId(KEY, a.userId, other, 1);
+    await imported(a, [row(x, 'Owned', { count: '2', score: '7/10', note: 'first', wishability: '2' }), row(other, 'Owned')]);
+    const { cursor } = await drain(a);
+    // The app scores it, rates it, and removes copy 2 (MFC's Count stays: no change to the counts).
+    await pushed(a, [edit(a, `uf/${headFor(x)}/score`, { score: 9 }, cursor), edit(a, `uf/${headFor(x)}/wishability`, { wishability: 4 }, cursor), edit(a, `occ/${c2}/status`, null, cursor)]);
+    const b = await imported(a, [row(x, 'Owned', { count: '2', score: '8/10', note: 'second', wishability: '3' }), row(other, 'Owned')], DATE_B);
+    const item = b.review[0]!.items[0]!;
+    expect(JSON.parse(item.payload)).toMatchObject({ fields: { score: { status: 'conflict' }, note: { status: 'apply' }, wishability: { status: 'conflict' } } });
+    const { cursor: known } = await drain(a);
+    // A knowing edit since brings the wishability to MFC's: taking MFC's side of it writes nothing.
+    await pushed(a, [edit(a, `uf/${headFor(x)}/wishability`, { wishability: 3 }, known)]);
+    const { cursor: seen } = await drain(a, known);
+    const res = await pushed(a, [
+      answer(
+        a,
+        headFor(x),
+        {
+          item: 'figure',
+          rev: item.rev,
+          choice: 'per_copy',
+          copies: [
+            { occ: c1, status: 'removed' },
+            { occ: c2, status: 'removed' },
+            { occ: elsewhere, status: 'wished' },
+          ],
+          fields: { score: 'app', note: 'mfc', wishability: 'mfc' },
+        },
+        seen,
+      ),
+    ]);
+    expect(res.results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    const { events } = await drain(a, seen);
+    expect(shape(events, { [headFor(x)]: 'HX', [c1]: 'C1' })).toEqual([
+      ['res/mfc/HX', 'UPSERT'],
+      ['occ/C1/status', 'DELETE'],
+      ['uf/HX/note', 'UPSERT'],
+      ['imp/mfc/figure/HX', 'DELETE'],
+    ]);
+  });
+
+  it('answers STALE where the import is not configured on this replica, writing nothing', async () => {
+    const { a, x, item, seen } = await (async () => {
+      const a = await SyncCaller.enrol(h);
+      const x = nextId();
+      await pushed(a, [edit(a, `uf/${headFor(x)}/score`, { score: 9 }, '')]);
+      const b = await imported(a, [row(x, 'Owned', { score: '7/10' })]);
+      return { a, x, item: b.review[0]!.items[0]!, seen: (await drain(a)).cursor };
+    })();
+    const bare = await startSyncApp(db.app, h.issuer, undefined, undefined, { import: { db: db.app, spineRead: null, occIdKey: null } });
+    try {
+      const there = await SyncCaller.sibling(bare, a);
+      const before = await feedCount(a.userId);
+      const res = await pushed(there, [answer(there, headFor(x), { item: 'figure', rev: item.rev, choice: 'keep' }, seen)]);
+      expect(res.results[0]!.outcome).toBe(PushOutcome.STALE);
+      expect(await feedCount(a.userId)).toBe(before);
+    } finally {
+      await bare.close();
+    }
+  });
+
+  it('answers STALE, with the answer that stands, an answer whose version is below the one already stored', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, y] = [nextId(), nextId()];
+    await pushed(a, [edit(a, `uf/${headFor(x)}/score`, { score: 9 }, '')]);
+    const first = await imported(a, [row(x, 'Owned', { score: '7/10' }), row(y, 'Ordered')]);
+    const second = await imported(a, [row(x, 'Owned', { score: '7/10' }), row(y, 'Owned')], DATE_B);
+    const { cursor } = await drain(a);
+    // Accepted answers store res at a version: a keep on x's item, a dismiss of y's change entry.
+    const keptX = answer(a, headFor(x), { item: 'figure', rev: first.review[0]!.items[0]!.rev, choice: 'keep' }, cursor);
+    const dismissedY = answer(a, headFor(y), { item: 'change', rev: second.applied[0]!.rev, choice: 'dismiss' }, cursor);
+    expect((await pushed(a, [keptX, dismissedY])).results.map((r) => r.outcome)).toEqual([PushOutcome.APPLIED, PushOutcome.APPLIED]);
+    // MFC changes both again: a new item on x, a new change entry on y.
+    const third = await imported(a, [row(x, 'Owned', { score: '6/10' }), row(y, 'Wished')], DATE_B);
+    const { cursor: seen } = await drain(a);
+    const old = (head: string, body: object) => ({ ...answer(a, head, body, seen), version: earlier(a) });
+    const res = await pushed(a, [
+      old(headFor(x), { item: 'figure', rev: third.review[0]!.items[0]!.rev, choice: 'take' }),
+      old(headFor(y), { item: 'change', rev: third.applied[0]!.rev, choice: 'dismiss' }),
+    ]);
+    expect(res.results.map((r) => r.outcome)).toEqual([PushOutcome.STALE, PushOutcome.STALE]);
+    expect(res.results.map((r) => r.current?.version)).toEqual([keptX.version, dismissedY.version]);
+  });
+
+  it('undo puts back a filing, a status and a value the import wrote, removes a value it added and the status of a copy it created', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, y, z] = [nextId(), nextId(), nextId()];
+    const cx = importOccId(KEY, a.userId, x, 1);
+    const cz = importOccId(KEY, a.userId, z, 2);
+    const shelf = `ordered/${randomUUID()}`;
+    await imported(a, [row(x, 'Ordered', { note: 'n1' }), row(y, 'Wished'), row(z, 'Owned', { note: 'zn' })]);
+    const { cursor } = await drain(a);
+    await pushed(a, [edit(a, `occ/${cx}/collection`, { collection: shelf }, cursor)]);
+    // z: MFC raised its Count (a copy created) and blanked its note (a tombstone).
+    const b = await imported(a, [row(x, 'Owned', { note: 'n2' }), row(y, 'Wished', { wishability: '3' }), row(z, 'Owned', { count: '2' })], DATE_B);
+    const { cursor: seen } = await drain(a);
+    const entry = (head: string) => b.applied.find((i) => i.headId === head)!;
+    expect(JSON.parse(entry(headFor(x)).payload)).toMatchObject({
+      writes: { copies: [{ occ: cx, status: 'owned', collection: 'owned/default' }], fields: [{ head_id: headFor(x), field: 'note', note: 'n2' }] },
+      undo: { copies: [{ occ: cx, status: 'ordered', collection: shelf }], fields: [{ head_id: headFor(x), field: 'note', note: 'n1' }] },
+    });
+    const res = await pushed(a, [
+      answer(a, headFor(x), { item: 'change', rev: entry(headFor(x)).rev, choice: 'undo' }, seen),
+      answer(a, headFor(y), { item: 'change', rev: entry(headFor(y)).rev, choice: 'undo' }, seen),
+      answer(a, headFor(z), { item: 'change', rev: entry(headFor(z)).rev, choice: 'undo' }, seen),
+    ]);
+    expect(res.results.map((r) => r.outcome)).toEqual([PushOutcome.APPLIED, PushOutcome.APPLIED, PushOutcome.APPLIED]);
+    const { events } = await drain(a, seen);
+    expect(shape(events, { [headFor(x)]: 'HX', [headFor(y)]: 'HY', [headFor(z)]: 'HZ', [cx]: 'CX', [cz]: 'CZ' })).toEqual([
+      ['res/mfc/HX', 'UPSERT'],
+      ['occ/CX/collection', 'UPSERT'],
+      ['occ/CX/status', 'UPSERT'],
+      ['uf/HX/note', 'UPSERT'],
+      ['imp/mfc/change/HX', 'DELETE'],
+      ['res/mfc/HY', 'UPSERT'],
+      ['uf/HY/wishability', 'DELETE'],
+      ['imp/mfc/change/HY', 'DELETE'],
+      // A copy the import created keeps its origin and head: only its status goes.
+      ['res/mfc/HZ', 'UPSERT'],
+      ['occ/CZ/status', 'DELETE'],
+      ['uf/HZ/note', 'UPSERT'],
+      ['imp/mfc/change/HZ', 'DELETE'],
+    ]);
+    expect(payloadOf(events, `uf/${headFor(z)}/note`)).toMatchObject({ note: 'zn' });
+    expect(payloadOf(events, `occ/${cx}/collection`)).toMatchObject({ collection: shelf });
+    // An undo that restores no removed copy keeps none.
+    expect((await db.admin.query('SELECT 1 FROM import_kept_copy WHERE user_id = $1', [a.userId])).rows).toEqual([]);
+  });
+
+  it('undo is STALE once the app changed a value, a filing or a figure the import wrote', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, y, z, w] = [nextId(), nextId(), nextId(), nextId()];
+    const [cy, cz] = [importOccId(KEY, a.userId, y, 1), importOccId(KEY, a.userId, z, 2)];
+    await imported(a, [row(x, 'Owned', { note: 'n1' }), row(y, 'Ordered'), row(z, 'Owned')]);
+    const { cursor } = await drain(a);
+    await pushed(a, [edit(a, `occ/${cy}/collection`, { collection: `ordered/${randomUUID()}` }, cursor)]);
+    // MFC: x's note, y arrived, z's Count raised (a copy created, its head written with it).
+    const b = await imported(a, [row(x, 'Owned', { note: 'n2' }), row(y, 'Owned'), row(z, 'Owned', { count: '2' })], DATE_B);
+    const { cursor: seen } = await drain(a);
+    await pushed(a, [
+      edit(a, `uf/${headFor(x)}/note`, { note: 'mine' }, seen),
+      edit(a, `occ/${cy}/collection`, { collection: `owned/${randomUUID()}` }, seen),
+      edit(a, `occ/${cz}/head`, { head_id: headFor(w) }, seen),
+    ]);
+    const { cursor: after } = await drain(a, seen);
+    const undo = (id: string) => answer(a, headFor(id), { item: 'change', rev: b.applied.find((i) => i.headId === headFor(id))!.rev, choice: 'undo' }, after);
+    const res = await pushed(a, [undo(x), undo(y), undo(z)]);
+    expect(res.results.map((r) => r.outcome)).toEqual([PushOutcome.STALE, PushOutcome.STALE, PushOutcome.STALE]);
+  });
+
+  it('keep on a conflict over the counts keeps the copies MFC removed; a device edit that removes or moves a kept copy ends its keep', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, w] = [nextId(), nextId()];
+    const copies = [1, 2, 3].map((n) => importOccId(KEY, a.userId, x, n));
+    await imported(a, [row(x, 'Owned', { count: '3' })]);
+    const { cursor } = await drain(a);
+    const hand = randomUUID();
+    await pushed(a, [edit(a, `occ/${hand}/head`, { head_id: headFor(x) }, cursor), edit(a, `occ/${hand}/status`, { status: 'owned' }, cursor)]);
+    // MFC lowered 3 to 1 while the app added a copy: a conflict over the counts.
+    const b = await imported(a, [row(x, 'Owned')], DATE_B);
+    const item = b.review[0]!.items[0]!;
+    const { cursor: seen } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'keep' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    // MATERIALIZE would remove the two highest copies with an origin; REALIGN bases the lowest copy.
+    const removed = [...copies].sort().slice(1);
+    const kept = async () => (await db.admin.query<{ occ_id: string }>('SELECT occ_id FROM import_kept_copy WHERE user_id = $1 ORDER BY occ_id', [a.userId])).rows.map((r) => r.occ_id);
+    expect(await kept()).toEqual(removed);
+    expect(await readDiscrepancyReport(db.app, a.userId)).toEqual([
+      expect.objectContaining({ head: headFor(x), kind: 'owned', app: 4, mfc: 1, kept: removed }),
+    ]);
+
+    const { cursor: answered } = await drain(a, seen);
+    // One removed by hand ends its keep; the other re-stated at its kind keeps it.
+    await pushed(a, [edit(a, `occ/${removed[0]}/status`, null, answered), edit(a, `occ/${removed[1]}/status`, { status: 'owned' }, answered)]);
+    expect(await kept()).toEqual([removed[1]]);
+    await pushed(a, [edit(a, `occ/${removed[1]}/head`, { head_id: headFor(w) }, answered)]);
+    expect(await kept()).toEqual([]);
+  });
+
+  it('keep applies a removal the rev found MFC\'s alone, and keeps no copy it removed', async () => {
+    const a = await SyncCaller.enrol(h);
+    const x = nextId();
+    const copies = [importOccId(KEY, a.userId, x, 1), importOccId(KEY, a.userId, x, 2)];
+    await imported(a, [row(x, 'Owned', { count: '2', score: '7/10' })]);
+    const { cursor } = await drain(a);
+    await pushed(a, [edit(a, `uf/${headFor(x)}/score`, { score: 9 }, cursor)]);
+    const b = await imported(a, [row(x, 'Owned', { count: '1', score: '8/10' })], DATE_B);
+    const { cursor: seen } = await drain(a);
+    await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: b.review[0]!.items[0]!.rev, choice: 'keep' }, seen)]);
+    const highest = [...copies].sort()[1]!;
+    expect(shape((await drain(a, seen)).events, { [headFor(x)]: 'HX', [highest]: 'HIGH' })).toEqual([
+      ['res/mfc/HX', 'UPSERT'],
+      ['occ/HIGH/status', 'DELETE'],
+      ['imp/mfc/figure/HX', 'DELETE'],
+    ]);
+    expect((await db.admin.query('SELECT 1 FROM import_kept_copy WHERE user_id = $1', [a.userId])).rows).toEqual([]);
+    // What keep removed is the import's: MFC raising the Count again restores that copy.
+    const again = await imported(a, [row(x, 'Owned', { count: '2', score: '8/10' })], DATE_B);
+    expect(again).toMatchObject({ occurrencesAdded: 1, conflictsPending: 0 });
+    expect(JSON.parse(again.applied[0]!.payload)).toMatchObject({ writes: { copies: [{ occ: highest, status: 'owned' }] } });
+  });
+
+  it('an answer realigns the row bases to its conflict\'s export: a row that export dropped loses its base', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, y] = [nextId(), nextId()];
+    remapped.set(y, headFor(x));
+    try {
+      await imported(a, [row(x, 'Owned', { score: '7/10' }), row(y, 'Owned')]);
+      const { cursor } = await drain(a);
+      await pushed(a, [edit(a, `uf/${headFor(x)}/score`, { score: 9 }, cursor)]);
+      const b = await imported(a, [row(x, 'Owned', { score: '8/10' })], DATE_B);
+      const item = b.review[0]!.items[0]!;
+      const { cursor: seen } = await drain(a);
+      await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'per_copy', copies: [] }, seen)]);
+      const bases = await db.admin.query<{ mfc_id: string }>('SELECT mfc_id FROM import_row_base WHERE user_id = $1 ORDER BY mfc_id', [a.userId]);
+      expect(bases.rows.map((r) => r.mfc_id)).toEqual([x]);
+      expect(await imported(a, [row(x, 'Owned', { score: '8/10' })], DATE_B)).toMatchObject({ facetsWritten: 1, conflictsPending: 0 });
+    } finally {
+      remapped.delete(y);
+    }
+  });
+
+  it('an answer that moves a kept copy to another kind ends its keep', async () => {
+    const a = await SyncCaller.enrol(h);
+    const x = nextId();
+    const copies = [importOccId(KEY, a.userId, x, 1), importOccId(KEY, a.userId, x, 2)];
+    await imported(a, [row(x, 'Owned', { count: '2', score: '7/10' })]);
+    const b = await imported(a, [row(x, 'Owned', { score: '7/10' })], DATE_B);
+    const { cursor } = await drain(a);
+    await pushed(a, [answer(a, headFor(x), { item: 'change', rev: b.applied[0]!.rev, choice: 'undo' }, cursor)]);
+    const keptCopy = [...copies].sort()[1]!;
+    const kept = async () => (await db.admin.query<{ occ_id: string }>('SELECT occ_id FROM import_kept_copy WHERE user_id = $1', [a.userId])).rows.map((r) => r.occ_id);
+    expect(await kept()).toEqual([keptCopy]);
+    const { cursor: undone } = await drain(a, cursor);
+    await pushed(a, [edit(a, `uf/${headFor(x)}/score`, { score: 9 }, undone)]);
+    const c = await imported(a, [row(x, 'Owned', { score: '8/10' })], DATE_B);
+    const { cursor: seen } = await drain(a);
+    await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: c.review[0]!.items[0]!.rev, choice: 'per_copy', copies: [{ occ: keptCopy, status: 'wished' }] }, seen)]);
+    expect(await kept()).toEqual([]);
+  });
+
+  it('places a tombstone of an answer by LWW: it answers nothing', async () => {
+    const a = await SyncCaller.enrol(h);
+    const res = await pushed(a, [edit(a, `res/mfc/${headFor(nextId())}`, null, '')]);
+    expect(res.results[0]!.outcome).toBe(PushOutcome.APPLIED);
   });
 });
 

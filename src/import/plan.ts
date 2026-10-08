@@ -1,51 +1,50 @@
-// The figure decision of import.proto THE SERVER DECIDES, as far as WK-14a takes it: the ONE-TIME
-// import (MG-1). A figure no earlier import settled (it has no row base) is decided in full:
-// counts by matching MFC's transitions with the app's, MATERIALIZE, each figure value on its own,
-// one decision per figure, a conflict raised as a figure item and nothing of the figure written.
-// A figure an earlier import settled must be one the export leaves unchanged, which is the
-// idempotent re-import; any other change to it is the re-import diff of WK-14b, and the plan
-// names it in `beyond` so the import can refuse before it writes anything.
+// What one import does with every figure it decides (import.proto THE FIGURE DECISION, through
+// ./figure.ts): a figure new to the import is added; a settled figure the export changes is
+// re-decided against its bases, MFC's change alone written to the copies the app left untouched
+// and listed as a change entry with its undo (R3); a conflict is a figure item and nothing of the
+// figure is written. Not decided here (`beyond`, refused by the import before it writes): a row
+// the spine now resolves to another head than its row base names, a merge or a move. Not built
+// yet: divergence items, align-MFC entries and acknowledgements (R4, R8), settlement by a FAVOR
+// preference, and the replay of a late edit.
 //
 // A pure function of the server's state and the export: the service reads the state under the
 // user's lock, calls this, and writes the plan through the Push apply path.
 import { createHash } from 'node:crypto';
-import type { Facet } from '../sync/store.js';
-import type { Field, FieldValues, Kind } from './rows.js';
+import {
+  FIELDS,
+  KINDS,
+  OUT,
+  View,
+  byId,
+  bytewise,
+  decide,
+  emptyEffect,
+  finalKinds,
+  keepEffect,
+  lackedRows,
+  mergeEffects,
+  mfcField,
+  stable,
+  takeEffect,
+  writesAnything,
+  type Comps,
+  type CopyBase,
+  type Decision,
+  type Effect,
+  type FigureState,
+  type OccIdOf,
+  type Row,
+  type Value,
+} from './figure.js';
+import type { Field, Kind } from './rows.js';
+import { render, type Listed, type Write } from './writes.js';
 
-export const KINDS: readonly Kind[] = ['owned', 'ordered', 'wished'];
-export const FIELDS: readonly Field[] = ['score', 'note', 'wishability'];
-const OUT = 'out';
-type KindOrOut = Kind | typeof OUT;
-type Value = number | string;
-type Counts = Record<Kind, number>;
+export { FIELDS, KINDS, stable, type Comps, type CopyBase, type Row, type Write };
 
 export const FIGURE_ITEM_PREFIX = 'imp/mfc/figure/';
+export const CHANGE_ITEM_PREFIX = 'imp/mfc/change/';
 /** res/mfc/{head_id}: the user's answer to one of the figure's items, synced through Push. */
 export const ANSWER_PREFIX = 'res/mfc/';
-
-/** A resolved MFC row: its canonical id, the spine head it names, and what it states. */
-export interface Row {
-  id: string;
-  head: string;
-  kind: Kind;
-  count: number;
-  fields: FieldValues;
-}
-
-/** COPY BASE: the kind (or out) and head the last settlement gave the copy on MFC's behalf. */
-export interface CopyBase {
-  head: string;
-  kind: KindOrOut;
-}
-
-/** What a decision found, part by part, and for a value conflict both sides of it. */
-export interface Comps {
-  counts: string;
-  score: string;
-  note: string;
-  wishability: string;
-  details: Partial<Record<Field, { app: Value; mfc: Value }>>;
-}
 
 /** A pending figure item of kind conflict, as the server keeps it beside its facet. */
 export interface FigureItem {
@@ -58,14 +57,15 @@ export interface FigureItem {
   comps: Comps;
 }
 
-export interface ImportState {
-  /** The user's facets an import reads: occ/*, uf/*, imp/mfc/figure/* and res/mfc/*, tombstones included. */
-  facets: ReadonlyMap<string, Facet>;
-  rowBases: ReadonlyMap<string, Row>;
-  copyBases: ReadonlyMap<string, CopyBase>;
-  /** FIELD BASE per head and field: the value MFC last stated; null when it stated none. */
-  fieldBases: ReadonlyMap<string, ReadonlyMap<Field, Value | null>>;
+/** A KNOWING KEEP: a copy kept against MFC's removal, on its figure at its kind. */
+export interface KeptCopy {
+  head: string;
+  kind: Kind;
+}
+
+export interface ImportState extends FigureState {
   items: ReadonlyMap<string, FigureItem>;
+  kept: ReadonlyMap<string, KeptCopy>;
 }
 
 export interface PlanInput {
@@ -77,231 +77,93 @@ export interface PlanInput {
   importNumber: number;
   /** "YYYY-MM-DD": every write is displayed at its midnight UTC. */
   exportDate: string;
-  occId: (mfcId: string, ordinal: number) => string;
+  occId: OccIdOf;
 }
 
-export interface Write {
-  facetKey: string;
-  op: 'upsert' | 'delete';
-  /** JSON text; '' for a tombstone. */
+/** An item of the review set or a change entry: its figure, rev and payload. */
+export interface Entry {
+  head: string;
+  rev: string;
   payload: string;
 }
 
 export interface Plan {
   /** In feed order, the marker excluded. */
   writes: Write[];
+  /** Row bases that are new or changed. */
   rowBases: Row[];
+  /** MFC ids whose row base goes: rows the export dropped from a figure it settled. */
+  rowBasesGone: string[];
   copyBases: Map<string, CopyBase>;
   fieldBases: { head: string; field: Field; value: Value | null }[];
   items: { set: FigureItem[]; end: string[] };
+  /** Copies whose knowing keep ends. */
+  keptGone: string[];
+  /** The export's rows as this import read them, rows standing on their base included. */
+  exportRows: Row[];
   /** Every figure the import decided (its frame), in head order. */
   figures: string[];
   /** The figures it wrote to or moved a copy or field base of, in head order. */
   settled: string[];
   /** The figures whose decision is a conflict. */
   conflicted: string[];
-  /** Settled figures this export changes: WK-14b's to decide. */
+  /** Figures whose row the spine now resolves to another head: not decided, and the import refuses. */
   beyond: string[];
   /** Every figure item pending after the import, in head order, with its payload. */
-  pending: { head: string; rev: string; payload: string }[];
-  stats: { added: number; unchanged: number; occurrencesAdded: number; conflictsRaised: number };
-}
-
-type Op =
-  | { op: 'create'; occ: string; id: string; ordinal: number; head: string; kind: Kind }
-  | { op: 'cbase'; occ: string; kind: KindOrOut }
-  | { op: 'field'; field: Field; value: Value }
-  | { op: 'fbase'; field: Field; value: Value };
-
-interface Decision {
-  ops: Op[];
-  comps: Comps;
-  M: Counts;
-}
-
-const zero = (): Counts => ({ owned: 0, ordered: 0, wished: 0 });
-
-/** Canonical MFC ids have no leading zeros, so length then text is numeric order. */
-const bytewise = (a: string, b: string): number => Number(a > b) - Number(a < b);
-const byId = (a: { id: string }, b: { id: string }): number => a.id.length - b.id.length || bytewise(a.id, b.id);
-
-/** JSON with every object's keys sorted, so an unchanged value is byte-identical. */
-export function stable(v: unknown): string {
-  if (Array.isArray(v)) return `[${v.map(stable).join(',')}]`;
-  if (v !== null && typeof v === 'object') {
-    const o = v as Record<string, unknown>;
-    return `{${Object.keys(o)
-      .filter((k) => o[k] !== undefined)
-      .sort()
-      .map((k) => `${JSON.stringify(k)}:${stable(o[k])}`)
-      .join(',')}}`;
-  }
-  return JSON.stringify(v);
-}
-
-interface Copy {
-  head: string | null;
-  status: string | null;
-  origin: { id: string; ordinal: number } | null;
-}
-
-/** The user's copies and figure values, read from their facets. */
-class View {
-  readonly copies = new Map<string, Copy>();
-
-  constructor(readonly st: ImportState) {
-    for (const facet of st.facets.values()) {
-      const m = /^occ\/([^/]+)\/(head|status|origin)$/.exec(facet.facetKey);
-      if (m === null) continue;
-      const copy = this.copy(m[1]!);
-      // Payloads stored here passed their schema; a head or status tombstone is no value.
-      const value = this.json(facet) as { head_id?: string; status?: string; native_id: string; ordinal: number } | null;
-      if (m[2] === 'head') copy.head = value?.head_id ?? null;
-      else if (m[2] === 'status') copy.status = value?.status ?? null;
-      // The origin is server-owned: the import writes it once and never tombstones it.
-      else copy.origin = { id: value!.native_id, ordinal: value!.ordinal };
-    }
-    for (const occ of st.copyBases.keys()) this.copy(occ);
-  }
-
-  private copy(occ: string): Copy {
-    let c = this.copies.get(occ);
-    if (c === undefined) this.copies.set(occ, (c = { head: null, status: null, origin: null }));
-    return c;
-  }
-
-  json(facet: Facet | undefined): Record<string, unknown> | null {
-    return facet === undefined || facet.op === 'delete' ? null : (JSON.parse(facet.payload) as Record<string, unknown>);
-  }
-
-  /** The copies of S: its head is S, or its base's is. In occ-id order. */
-  copiesOf(S: string): string[] {
-    return [...this.copies]
-      .filter(([occ, c]) => c.head === S || this.st.copyBases.get(occ)?.head === S)
-      .map(([occ]) => occ)
-      .sort(bytewise);
-  }
-
-  curKind(occ: string, S: string): KindOrOut {
-    const c = this.copies.get(occ)!;
-    return c.head === S && (KINDS as readonly (string | null)[]).includes(c.status) ? (c.status as Kind) : OUT;
-  }
-
-  baseKind(occ: string, S: string): KindOrOut {
-    const b = this.st.copyBases.get(occ);
-    return b !== undefined && b.head === S ? b.kind : OUT;
-  }
-
-  /** What the app shows for S's field (sync.proto rule 6, on S's own head). */
-  field(S: string, f: Field): Value | null {
-    const value = this.json(this.st.facets.get(`uf/${S}/${f}`))?.[f];
-    return value === undefined ? null : (value as Value);
-  }
-
-  /** The lowest ordinal of row `id` that no copy holds and `taken` does not list. */
-  ordinal(id: string, taken: ReadonlySet<number>): number {
-    const used = new Set(taken);
-    for (const c of this.copies.values()) if (c.origin?.id === id) used.add(c.origin.ordinal);
-    let n = 1;
-    while (used.has(n)) n += 1;
-    return n;
-  }
-}
-
-/** MFC's value of a field: the first row, in id order, that states one. */
-const mfcField = (exp: readonly Row[], f: Field): Value | undefined => exp.find((r) => r.fields[f] !== undefined)?.fields[f];
-
-/** The copies to create, kind by kind, each for the lowest-numbered row of the kind its copies do not fill. */
-function materialize(v: View, exp: readonly Row[], cs: readonly string[], cur: Map<string, KindOrOut>, rm: Counts, occId: PlanInput['occId']): Op[] {
-  const ops: Op[] = [];
-  const made = new Map<string, Set<number>>();
-  for (const k of KINDS) {
-    const rows = exp.filter((r) => r.kind === k);
-    for (let i = 0; i < rm[k]; i += 1) {
-      const live = (id: string) => cs.filter((c) => cur.get(c) === k && v.copies.get(c)!.origin?.id === id).length;
-      // Some row always has room: the app's copies of k number fewer than MFC's Counts of k.
-      const r = rows.find((row) => row.count - live(row.id) - (made.get(row.id)?.size ?? 0) > 0)!;
-      const taken = made.get(r.id) ?? new Set<number>();
-      const ordinal = v.ordinal(r.id, taken);
-      made.set(r.id, taken.add(ordinal));
-      const occ = occId(r.id, ordinal);
-      ops.push({ op: 'create', occ, id: r.id, ordinal, head: r.head, kind: k }, { op: 'cbase', occ, kind: k });
-    }
-  }
-  return ops;
-}
-
-/**
- * A figure with no row base. B, the row-base Counts, is zero and no copy of S has a base, so
- * MFC's transitions are OUT->k, M_k of each, and the app's are one OUT->k per live copy: matching
- * pairs the app's copies of k, lowest occ id first, and what is left of MFC's is materialized.
- * The two sides never leave transitions that share a kind, so the counts never conflict here.
- */
-function decideNew(v: View, S: string, exp: readonly Row[], occId: PlanInput['occId']): Decision {
-  const M = zero();
-  for (const r of exp) M[r.kind] += r.count;
-  const cs = v.copiesOf(S);
-  const cur = new Map(cs.map((c) => [c, v.curKind(c, S)]));
-  const A = zero();
-  for (const k of cur.values()) if (k !== OUT) A[k] += 1;
-  const ops: Op[] = [];
-  const comps: Comps = { counts: 'nochange', score: 'nochange', note: 'nochange', wishability: 'nochange', details: {} };
-
-  if (KINDS.every((k) => M[k] === 0)) {
-    comps.counts = 'nochange';
-  } else if (KINDS.every((k) => A[k] === M[k])) {
-    comps.counts = 'alike';
-    for (const c of cs) ops.push({ op: 'cbase', occ: c, kind: cur.get(c)! });
-  } else {
-    const rm = zero();
-    for (const k of KINDS) {
-      const live = cs.filter((c) => cur.get(c) === k);
-      const paired = Math.min(M[k], live.length);
-      for (const c of live.slice(0, paired)) ops.push({ op: 'cbase', occ: c, kind: k });
-      rm[k] = M[k] - paired;
-    }
-    if (KINDS.every((k) => rm[k] === 0)) {
-      comps.counts = 'matched+app-only';
-    } else {
-      comps.counts = 'apply';
-      ops.push(...materialize(v, exp, cs, cur, rm, occId));
-    }
-  }
-
-  for (const f of FIELDS) {
-    const stated = exp.filter((r) => r.fields[f] !== undefined).map((r) => r.fields[f]!);
-    if (stated.length === 0) continue;
-    if (new Set(stated).size > 1) {
-      comps[f] = 'conflict';
-      continue;
-    }
-    const value = stated[0]!;
-    const app = v.field(S, f);
-    if (app === value) {
-      comps[f] = 'alike';
-      ops.push({ op: 'fbase', field: f, value });
-    } else if (app === null) {
-      comps[f] = 'apply';
-      ops.push({ op: 'field', field: f, value }, { op: 'fbase', field: f, value });
-    } else {
-      comps[f] = 'conflict';
-      comps.details[f] = { app, mfc: value };
-    }
-  }
-  return { ops, comps, M };
-}
-
-/** An answer to the item, naming its rev, has synced (import.proto ITEMS AND ANSWERS): it is not pending. */
-function answered(st: ImportState, item: FigureItem): boolean {
-  const res = st.facets.get(`${ANSWER_PREFIX}${item.head}`);
-  if (res?.op !== 'upsert') return false;
-  // Every stored res payload has passed res-answer.schema.json.
-  const answer = JSON.parse(res.payload) as { item: string; rev: string };
-  return answer.item === 'figure' && answer.rev === item.rev;
+  pending: Entry[];
+  /** The change entries this import made, in head order. */
+  applied: Entry[];
+  stats: {
+    added: number;
+    moved: number;
+    unchanged: number;
+    removed: number;
+    keptNewer: number;
+    occurrencesAdded: number;
+    occurrencesStatusChanged: number;
+    occurrencesRemoved: number;
+    conflictsRaised: number;
+  };
 }
 
 const sameRow = (a: Row | undefined, b: Row): boolean =>
   a !== undefined && a.head === b.head && a.kind === b.kind && a.count === b.count && stable(a.fields) === stable(b.fields);
+
+const group = (rows: Iterable<Row>): Map<string, Row[]> => {
+  const out = new Map<string, Row[]>();
+  for (const r of rows) out.set(r.head, [...(out.get(r.head) ?? []), r]);
+  return out;
+};
+
+const digest = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 32);
+
+/** MFC's side for a rev: the export's rows of S by id, and each row base it lacks as lacked (null). */
+export const sideOf = (exp: readonly Row[], lacked: readonly Row[]): string =>
+  stable(Object.fromEntries([...exp.map((r) => [r.id, [r.kind, r.count, r.fields]] as const), ...lacked.map((r) => [r.id, null] as const)]));
+
+/** The export's rows of S a side states, in id order: what an answer decides against. */
+export function rowsOfSide(side: string, S: string): Row[] {
+  const parsed = JSON.parse(side) as Record<string, [Kind, number, Row['fields']] | null>;
+  return Object.entries(parsed)
+    .flatMap(([id, r]) => (r === null ? [] : [{ id, head: S, kind: r[0], count: r[1], fields: r[2] }]))
+    .sort(byId);
+}
+
+/** Whether the live copies of S, as `final` has them, are MFC's Counts kind by kind. */
+const countsEqual = (final: ReadonlyMap<string, string>, exp: readonly Row[]): boolean =>
+  KINDS.every((k) => [...final.values()].filter((x) => x === k).length === exp.filter((r) => r.kind === k).reduce((n, r) => n + r.count, 0));
+
+/**
+ * The knowing keeps of S that end: every one when the counts are equal as the decision leaves
+ * them, else each copy no longer live at its kind on S, or given a live base (MFC counts it again).
+ */
+export function keptEnding(st: ImportState, S: string, exp: readonly Row[], final: ReadonlyMap<string, string>, bases: ReadonlyMap<string, CopyBase>): string[] {
+  const kept = [...st.kept].filter(([, k]) => k.head === S);
+  const equal = countsEqual(final, exp);
+  return kept
+    .filter(([occ, k]) => equal || final.get(occ) !== k.kind || (bases.get(occ)?.kind ?? OUT) !== OUT)
+    .map(([occ]) => occ);
+}
 
 export function planImport(input: PlanInput): Plan {
   const { state: st, importNumber, exportDate, occId } = input;
@@ -310,56 +172,59 @@ export function planImport(input: PlanInput): Plan {
   const plan: Plan = {
     writes: [],
     rowBases: [],
+    rowBasesGone: [],
     copyBases: new Map(),
     fieldBases: [],
     items: { set: [], end: [] },
+    keptGone: [],
+    exportRows: [],
     figures: [],
     settled: [],
     conflicted: [],
     beyond: [],
     pending: [],
-    stats: { added: 0, unchanged: 0, occurrencesAdded: 0, conflictsRaised: 0 },
+    applied: [],
+    stats: { added: 0, moved: 0, unchanged: 0, removed: 0, keptNewer: 0, occurrencesAdded: 0, occurrencesStatusChanged: 0, occurrencesRemoved: 0, conflictsRaised: 0 },
   };
-  const userWrite = (facetKey: string, body: object): void => {
-    plan.writes.push({ facetKey, op: 'upsert', payload: JSON.stringify({ ...body, ...shown }) });
-  };
-  const figureOf = (rows: readonly Row[]) => new Set(rows.map((r) => r.head));
 
   // An id unresolved for its Count or product states nothing new: its row base stands for it.
-  const kept = input.keepIds.flatMap((id) => {
+  const standing = input.keepIds.flatMap((id) => {
     const base = st.rowBases.get(id);
     return base === undefined ? [] : [base];
   });
-  const rows = [...input.rows, ...kept];
-  const heads = [...new Set([...figureOf(rows), ...figureOf([...st.rowBases.values()])])].sort(bytewise);
+  const rows = [...input.rows, ...standing];
+  plan.exportRows = [...rows].sort(byId);
+  const rowsOf = group(rows);
+  const basesOf = group(st.rowBases.values());
+  const resolvedOf = group(input.rows);
+  // A row whose base names another head was merged or moved by the spine: both figures wait.
+  const moved = new Set<string>();
+  for (const r of input.rows) {
+    const base = st.rowBases.get(r.id);
+    if (base !== undefined && base.head !== r.head) moved.add(r.head).add(base.head);
+  }
+  const heads = [...new Set([...rowsOf.keys(), ...basesOf.keys()])].sort(bytewise);
 
   for (const S of heads) {
     plan.figures.push(S);
-    const exp = rows.filter((r) => r.head === S).sort(byId);
-    const resolved = input.rows.filter((r) => r.head === S).length;
-    const baseRows = [...st.rowBases.values()].filter((r) => r.head === S);
-
-    if (baseRows.length > 0) {
-      const unchanged = exp.length === baseRows.length && exp.every((r) => sameRow(st.rowBases.get(r.id), r));
-      if (unchanged) plan.stats.unchanged += resolved;
-      else plan.beyond.push(S);
-      continue;
-    }
-    if (v.copiesOf(S).some((c) => v.baseKind(c, S) !== OUT)) {
+    if (moved.has(S)) {
       plan.beyond.push(S);
       continue;
     }
-
-    plan.stats.added += resolved;
-    const d = decideNew(v, S, exp, occId);
+    const exp = (rowsOf.get(S) ?? []).sort(byId);
+    const baseRows = basesOf.get(S) ?? [];
+    const lacked = lackedRows(exp, baseRows);
+    const resolved = resolvedOf.get(S)?.length ?? 0;
+    const isNew = baseRows.length === 0;
+    const d = decide(v, S, exp, baseRows, occId);
     const existing = st.items.get(S);
-    const conflict = FIELDS.some((f) => d.comps[f] === 'conflict');
-    if (conflict) {
-      const side = stable(Object.fromEntries(exp.map((r) => [r.id, [r.kind, r.count, r.fields]])));
+
+    if (d.conflict) {
+      if (isNew) plan.stats.added += resolved;
+      else plan.stats.keptNewer += resolved;
+      const side = sideOf(exp, lacked);
       const keep = existing !== undefined && existing.side === side;
-      const item: FigureItem = keep
-        ? existing
-        : { head: S, rev: `i${importNumber}.${createHash('sha256').update(side).digest('hex').slice(0, 32)}`, raised: importNumber, side, comps: d.comps };
+      const item: FigureItem = keep ? existing : { head: S, rev: `i${importNumber}.${digest(side)}`, raised: importNumber, side, comps: d.comps };
       if (!keep) plan.stats.conflictsRaised += 1;
       const payload = figurePayload(v, S, exp, item, d, occId);
       const facetKey = `${FIGURE_ITEM_PREFIX}${S}`;
@@ -367,6 +232,7 @@ export function planImport(input: PlanInput): Plan {
       if (stored?.op !== 'upsert' || stored.payload !== payload) plan.writes.push({ facetKey, op: 'upsert', payload });
       plan.items.set.push(item);
       plan.conflicted.push(S);
+      plan.keptGone.push(...keptEnding(st, S, exp, finalKinds(v, S, emptyEffect()), new Map()));
       continue;
     }
 
@@ -374,119 +240,87 @@ export function planImport(input: PlanInput): Plan {
       plan.writes.push({ facetKey: `${FIGURE_ITEM_PREFIX}${S}`, op: 'delete', payload: '' });
       plan.items.end.push(S);
     }
-    // Every op writes to S or moves a copy or field base of it; a row that states nothing new has none.
-    if (d.ops.length > 0) plan.settled.push(S);
-    for (const op of d.ops) {
-      if (op.op === 'create') {
-        // The origin is server-owned and carries no display time.
-        plan.writes.push({ facetKey: `occ/${op.occ}/origin`, op: 'upsert', payload: JSON.stringify({ site: 'mfc', native_id: op.id, ordinal: op.ordinal }) });
-        userWrite(`occ/${op.occ}/head`, { head_id: op.head });
-        userWrite(`occ/${op.occ}/status`, { status: op.kind });
-        plan.stats.occurrencesAdded += 1;
-      } else if (op.op === 'cbase') {
-        plan.copyBases.set(op.occ, { head: S, kind: op.kind });
-      } else if (op.op === 'field') {
-        userWrite(`uf/${S}/${op.field}`, { [op.field]: op.value });
-      } else {
-        plan.fieldBases.push({ head: S, field: op.field, value: op.value });
-      }
+    const effect = mergeEffects(d.counts, ...d.fields.values());
+    const out = render(v, S, effect, shown);
+    plan.writes.push(...out.writes);
+    plan.stats.occurrencesAdded += out.counts.added;
+    plan.stats.occurrencesStatusChanged += out.counts.statusChanged;
+    plan.stats.occurrencesRemoved += out.counts.removed;
+    if (isNew) plan.stats.added += resolved;
+    else if (effect.statuses.size > 0 || effect.created.length > 0) plan.stats.moved += resolved;
+    else plan.stats.unchanged += resolved;
+    if (out.counts.removed > 0) plan.stats.removed += lacked.length;
+    if (!isNew && writesAnything(effect)) {
+      const entry = changeEntry(S, importNumber, out.done, out.undo);
+      plan.writes.push({ facetKey: `${CHANGE_ITEM_PREFIX}${S}`, op: 'upsert', payload: entry.payload });
+      plan.applied.push(entry);
     }
-    plan.rowBases.push(...exp);
+
+    // Every op writes to S or moves a copy or field base of it; a row that states nothing new has none.
+    if (writesAnything(effect) || effect.copyBases.size > 0 || effect.fieldBases.size > 0) plan.settled.push(S);
+    for (const [occ, base] of effect.copyBases) {
+      // A copy a device moved between two figures this import decides: its base on the figure it
+      // is now on stands over an out base on the one it left.
+      const set = plan.copyBases.get(occ);
+      if (base.kind === OUT && set !== undefined && set.head !== S) continue;
+      plan.copyBases.set(occ, base);
+    }
+    for (const [field, value] of effect.fieldBases) plan.fieldBases.push({ head: S, field, value });
+    plan.rowBases.push(...exp.filter((r) => !sameRow(st.rowBases.get(r.id), r)));
+    plan.rowBasesGone.push(...lacked.map((r) => r.id));
+    plan.keptGone.push(...keptEnding(st, S, exp, finalKinds(v, S, effect), effect.copyBases));
   }
 
-  // Pending after the import: the items this import kept or raised, and every other one standing,
-  // but one whose answer has synced. The item stays, so the same export finds its rev unchanged.
+  // Pending after the import: the items this import kept or raised, and every other one standing.
   const decided = new Set(plan.figures);
   const written = new Map(plan.writes.map((w) => [w.facetKey, w.payload]));
-  const standing = [...st.items.values()].filter((i) => !decided.has(i.head));
-  for (const item of standing.concat(plan.items.set).filter((i) => !answered(st, i)).sort((a, b) => bytewise(a.head, b.head))) {
+  const others = [...st.items.values()].filter((i) => !decided.has(i.head));
+  for (const item of others.concat(plan.items.set).sort((a, b) => bytewise(a.head, b.head))) {
     const facetKey = `${FIGURE_ITEM_PREFIX}${item.head}`;
     plan.pending.push({ head: item.head, rev: item.rev, payload: written.get(facetKey) ?? st.facets.get(facetKey)!.payload });
   }
   return plan;
 }
 
+/** A change entry of kind applied (schemas/imp-change.schema.json): what the import wrote and its undo. */
+export function changeEntry(S: string, importNumber: number, done: Listed, undo: Listed, kind = 'applied'): Entry {
+  const rev = `i${importNumber}.${digest(stable({ kind, writes: done, undo }))}`;
+  return { head: S, rev, payload: stable({ rev, kind, import: importNumber, writes: done, undo }) };
+}
+
 // ---------------------------------------------------------------------------------------------
 // The figure item (schemas/imp-figure.schema.json) and the writes each answer would make now.
 // ---------------------------------------------------------------------------------------------
 
-type PreviewCopy = { occ: string; status?: string; head_id?: string; origin?: { site: string; native_id: string; ordinal: number } };
-type PreviewField = { head_id: string; field: Field } & Partial<Record<Field, Value>>;
-
-function preview(S: string, ops: readonly Op[]): { copies: PreviewCopy[]; fields: PreviewField[] } {
-  const copies: PreviewCopy[] = [];
-  const fields: PreviewField[] = [];
-  for (const op of ops) {
-    // keep and take preview only creates and figure values.
-    if (op.op === 'create') {
-      copies.push({ occ: op.occ, status: op.kind, head_id: op.head, origin: { site: 'mfc', native_id: op.id, ordinal: op.ordinal } });
-    } else {
-      const field = op as Extract<Op, { op: 'field' }>;
-      fields.push({ head_id: S, field: field.field, [field.field]: field.value });
-    }
-  }
+/** Exactly what an effect would write, as a preview lists it. */
+function preview(v: View, S: string, e: Effect): Listed {
+  const listed = render(v, S, e, { edited_at: '1970-01-01T00:00:00Z', tz: 'UTC' }).done;
   // In facet-key order, as the writes would land.
-  copies.sort((a, b) => bytewise(a.occ, b.occ));
-  fields.sort((a, b) => bytewise(a.field, b.field));
-  return { copies, fields };
+  listed.fields.sort((a, b) => bytewise(a.field, b.field));
+  return listed;
 }
 
-/**
- * keep: a disputed part stays the app's; a part the rev found only MFC changed is applied where
- * the app has not changed it since (decided again, it is still MFC's change alone).
- */
-function keepOps(item: FigureItem, d: Decision): Op[] {
-  // `d` writes a create or a field only where, decided again, that part is still MFC's alone.
-  const ops: Op[] = [];
-  if (item.comps.counts === 'apply') ops.push(...d.ops.filter((op) => op.op === 'create'));
-  for (const f of FIELDS) {
-    if (item.comps[f] === 'apply') ops.push(...d.ops.filter((op) => op.op === 'field' && op.field === f));
-  }
-  return ops;
-}
-
-/**
- * take: MFC's side made true on the copies MFC tracks. A figure with no row base has none, so it
- * is a new copy per Count, each for the lowest-numbered row of its kind, and MFC's value on every
- * field it changed or disputes.
- */
-function takeOps(v: View, exp: readonly Row[], d: Decision, occId: PlanInput['occId']): Op[] {
-  const ops: Op[] = [];
-  for (const k of KINDS) {
-    const r = exp.find((row) => row.kind === k);
-    const taken = new Set<number>();
-    for (let i = 0; i < d.M[k]; i += 1) {
-      const ordinal = v.ordinal(r!.id, taken);
-      taken.add(ordinal);
-      ops.push({ op: 'create', occ: occId(r!.id, ordinal), id: r!.id, ordinal, head: r!.head, kind: k });
-    }
-  }
-  for (const f of FIELDS) {
-    if (d.comps[f] === 'apply' || d.comps[f] === 'conflict') ops.push({ op: 'field', field: f, value: mfcField(exp, f)! });
-  }
-  return ops;
-}
-
-function figurePayload(v: View, S: string, exp: readonly Row[], item: FigureItem, d: Decision, occId: PlanInput['occId']): string {
-  const cs = v.copiesOf(S);
-  const app = zero();
-  for (const c of cs) {
-    const k = v.curKind(c, S);
-    if (k !== OUT) app[k] += 1;
-  }
-  const counts = Object.fromEntries(KINDS.map((k) => [k, { base: 0, app: app[k], mfc: d.M[k] }]));
+function figurePayload(v: View, S: string, exp: readonly Row[], item: FigureItem, d: Decision, occId: OccIdOf): string {
+  const counts = Object.fromEntries(KINDS.map((k) => [k, { base: d.B[k], app: d.A[k], mfc: d.M[k] }]));
   const fields = Object.fromEntries(
     FIELDS.map((f) => {
       const found = item.comps.details[f];
-      return [f, { status: item.comps[f], app: found?.app ?? v.field(S, f) ?? undefined, mfc: found?.mfc ?? mfcField(exp, f) }];
+      return [
+        f,
+        {
+          status: item.comps[f],
+          base: v.fieldBase(S, f) ?? undefined,
+          app: found?.app ?? v.field(S, f) ?? undefined,
+          mfc: found?.mfc ?? mfcField(exp, f) ?? undefined,
+        },
+      ];
     }),
   );
-  const copies = cs.map((c) => {
+  const copies = v.copiesOf(S).map((c) => {
     const status = v.copies.get(c)!.status;
     // A copy out of S is shown without a status, but a former one, which is kept.
     const shown = v.curKind(c, S) !== OUT || status === 'former';
-    // MFC tracks no copy of a figure with no row base: the plan refuses one whose copies carry a base.
-    return { occ: c, ...(shown ? { status } : {}), tracked: false };
+    return { occ: c, ...(shown ? { status } : {}), tracked: v.baseKind(c, S) !== OUT };
   });
   return stable({
     rev: item.rev,
@@ -496,6 +330,6 @@ function figurePayload(v: View, S: string, exp: readonly Row[], item: FigureItem
     fields,
     copies,
     mfc_rows: exp.map((r) => ({ mfc_id: r.id, kind: r.kind, count: r.count })),
-    preview: { keep: preview(S, keepOps(item, d)), take: preview(S, takeOps(v, exp, d, occId)) },
+    preview: { keep: preview(v, S, keepEffect(item.comps, d)), take: preview(v, S, takeEffect(v, S, exp, item.comps, occId)) },
   });
 }

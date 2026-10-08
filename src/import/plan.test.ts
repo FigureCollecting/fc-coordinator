@@ -6,7 +6,7 @@ import { Ajv2020 } from 'ajv/dist/2020.js';
 import { describe, expect, it } from 'vitest';
 import type { Facet } from '../sync/store.js';
 import { importOccId } from './occ.js';
-import { planImport, type ImportState, type PlanInput, type Row } from './plan.js';
+import { planImport, rowsOfSide, sideOf, type ImportState, type PlanInput, type Row } from './plan.js';
 
 const require = createRequire(import.meta.url);
 const ajv = new Ajv2020({ strict: false, allErrors: true });
@@ -92,9 +92,9 @@ describe('planImport: a figure new to the import', () => {
     expect(p.figures).toEqual([S1, S2]);
     expect(p.rowBases).toEqual([row('119', S1, 'owned', 2, { score: 8, note: 'boxed' }), row('120', S2, 'wished', 1, { wishability: 4 })]);
     expect([...p.copyBases]).toEqual([
-      [a, { head: S1, kind: 'owned' }],
-      [b, { head: S1, kind: 'owned' }],
-      [c, { head: S2, kind: 'wished' }],
+      [a, { head: S1, kind: 'owned', removed: false }],
+      [b, { head: S1, kind: 'owned', removed: false }],
+      [c, { head: S2, kind: 'wished', removed: false }],
     ]);
     expect(p.fieldBases).toEqual([
       { head: S1, field: 'score', value: 8 },
@@ -114,10 +114,8 @@ describe('planImport: a figure new to the import', () => {
   it('writes nothing for copies the app already has at MFC\'s counts, and takes them as MFC\'s', () => {
     const p = plan(state([...appCopy(APP_A, S1, 'owned'), ...appCopy(APP_B, S1, 'former')]), [row('119', S1, 'owned')]);
     expect(p.writes).toEqual([]);
-    expect([...p.copyBases]).toEqual([
-      [APP_A, { head: S1, kind: 'owned' }],
-      [APP_B, { head: S1, kind: 'out' }],
-    ]);
+    // The former copy is out, as a copy with no base is: it needs no base written.
+    expect([...p.copyBases]).toEqual([[APP_A, { head: S1, kind: 'owned', removed: false }]]);
     expect(p.rowBases).toEqual([row('119', S1, 'owned')]);
     expect(p.stats).toMatchObject({ added: 1, unchanged: 0, occurrencesAdded: 0, conflictsRaised: 0 });
   });
@@ -126,15 +124,15 @@ describe('planImport: a figure new to the import', () => {
     const p = plan(state(appCopy(APP_B, S1, 'owned')), [row('119', S1, 'owned', 2)]);
     expect(keys(p)).toEqual([`occ/${occ('119', 1)}/origin`, `occ/${occ('119', 1)}/head`, `occ/${occ('119', 1)}/status`]);
     expect([...p.copyBases]).toEqual([
-      [APP_B, { head: S1, kind: 'owned' }],
-      [occ('119', 1), { head: S1, kind: 'owned' }],
+      [APP_B, { head: S1, kind: 'owned', removed: false }],
+      [occ('119', 1), { head: S1, kind: 'owned', removed: false }],
     ]);
   });
 
   it('leaves the app\'s extra copies alone and without a base', () => {
     const p = plan(state([...appCopy(APP_B, S1, 'owned'), ...appCopy(APP_A, S1, 'owned')]), [row('119', S1, 'owned')]);
     expect(p.writes).toEqual([]);
-    expect([...p.copyBases]).toEqual([[APP_A, { head: S1, kind: 'owned' }]]);
+    expect([...p.copyBases]).toEqual([[APP_A, { head: S1, kind: 'owned', removed: false }]]);
   });
 
   it('counts a copy whose head was tombstoned as no copy of any figure', () => {
@@ -472,5 +470,65 @@ describe('planImport: what a conflict previews and lists, part by part', () => {
     expect(item.mfc_rows.map((r) => r.mfc_id)).toEqual(['3', '20']);
     // MFC's value is the first row's, in id order, that states one.
     expect(item.preview.take.fields).toEqual([{ head_id: S1, field: 'score', score: 7 }]);
+  });
+});
+
+describe('planImport: WK-14b, a settled figure', () => {
+  const settled = (rows: Row[], facets: Facet[] = [], extra: Partial<ImportState> = {}): ImportState =>
+    state(facets, { rowBases: new Map(rows.map((r) => [r.id, r])), ...extra });
+
+  it('states MFC\'s side for a rev as the export\'s rows and each row base it lacks, and reads back only the rows', () => {
+    const side = sideOf([row('120', S1, 'wished', 0, { note: 'n' })], [row('9', S1, 'owned')]);
+    expect(JSON.parse(side)).toEqual({ '9': null, '120': ['wished', 0, { note: 'n' }] });
+    expect(rowsOfSide(side, S1)).toEqual([row('120', S1, 'wished', 0, { note: 'n' })]);
+  });
+
+  it('ends a knowing keep MFC now counts, and leaves one on a figure whose counts still differ', () => {
+    const base = [row('1', S1, 'owned'), row('2', S2, 'owned', 2)];
+    const facets = [...appCopy(APP_A, S1, 'owned'), ...appCopy(APP_B, S2, 'wished')];
+    const kept = new Map([
+      [APP_A, { head: S1, kind: 'owned' as const }],
+      [APP_B, { head: S2, kind: 'owned' as const }],
+    ]);
+    const kept2 = new Map<string, { head: string; kind: Row['kind'] }>([...kept, [APP_B, { head: S2, kind: 'wished' }]]);
+    const p = plan(settled(base, facets, { kept: kept2 }), [row('1', S1, 'owned', 2), row('2', S2, 'owned', 3)], { importNumber: 2 });
+    // S1: MFC raised 1 to 2 and the app's own copy is that same change (paired): MFC counts it.
+    // S2: MFC raised 2 to 3 with no owned copy here; the wished copy stays kept, the counts differ.
+    expect(p.keptGone).toEqual([APP_A]);
+    expect(p.keptGone).not.toContain(APP_B);
+  });
+
+  it('ends a knowing keep on a conflicted figure whose counts are equal, and keeps one whose figure still differs', () => {
+    const base = [row('1', S1, 'owned', 1, { note: 'a' })];
+    const facets = [...appCopy(APP_A, S1, 'owned'), up(`uf/${S1}/note`, { note: 'app', ...SHOWN })];
+    const kept = new Map([[APP_A, { head: S1, kind: 'owned' as const }]]);
+    const equal = plan(settled(base, facets, { kept, fieldBases: new Map([[S1, new Map([['note', 'a']])]]) }), [row('1', S1, 'owned', 1, { note: 'b' })], { importNumber: 2 });
+    expect(equal.conflicted).toEqual([S1]);
+    expect(equal.keptGone).toEqual([APP_A]);
+    const differs = plan(settled(base, facets, { kept, fieldBases: new Map([[S1, new Map([['note', 'a']])]]) }), [row('1', S1, 'owned', 0, { note: 'b' })], { importNumber: 2 });
+    expect(differs.conflicted).toEqual([S1]);
+    expect(differs.keptGone).toEqual([]);
+  });
+
+  it('ends a knowing keep whose copy MFC counts again, or that left the kind it was kept at', () => {
+    const base = [row('1', S1, 'owned', 1), row('2', S1, 'owned', 0)];
+    const facets = [...appCopy(APP_A, S1, 'owned', { native_id: '1', ordinal: 1 }), ...appCopy(APP_B, S1, 'owned'), ...appCopy(occ('2', 1), S1, 'wished')];
+    const copyBases = new Map([[APP_A, { head: S1, kind: 'owned' as const, removed: false }]]);
+    const kept = new Map([
+      [APP_B, { head: S1, kind: 'owned' as const }],
+      [occ('2', 1), { head: S1, kind: 'owned' as const }],
+    ]);
+    // MFC raises row 2 to 1: the app's hand copy B fills it (it gets a live base); the wished copy left owned.
+    const p = plan(settled(base, facets, { copyBases, kept }), [row('1', S1, 'owned', 1), row('2', S1, 'owned', 1), row('3', S1, 'wished', 0)], { importNumber: 2 });
+    expect(p.keptGone.sort()).toEqual([APP_B, occ('2', 1)].sort());
+  });
+
+  it('keeps the base of a copy a device moved to another figure the same import decides, over an out base on the one it left', () => {
+    // The copy was MFC's on S3; the device moved it to S1, which sorts first. Both figures change.
+    const base = [row('1', S3, 'owned'), row('2', S1, 'owned', 0)];
+    const facets = appCopy(APP_A, S1, 'owned', { native_id: '1', ordinal: 1 });
+    const st = settled(base, facets, { copyBases: new Map([[APP_A, { head: S3, kind: 'owned' as const, removed: false }]]) });
+    const p = plan(st, [row('1', S3, 'owned', 0), row('2', S1, 'owned', 1)], { importNumber: 2 });
+    expect(p.copyBases.get(APP_A)).toEqual({ head: S1, kind: 'owned', removed: false });
   });
 });

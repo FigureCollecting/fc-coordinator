@@ -1,5 +1,6 @@
-// coordinator.v1.ImportService.ImportMfcExport, WK-14a: the ONE-TIME import of a user's MFC export
-// (MG-1). Online only: the client has pushed its outbox first (import.proto ONLINE ONLY).
+// coordinator.v1.ImportService.ImportMfcExport: import a user's MFC export, the first time or
+// again (MG-1, WK-14a and WK-14b). Online only: the client has pushed its outbox first
+// (import.proto ONLINE ONLY).
 //
 //   1. Read the export by header (./rows.ts): a missing ID or Status column, a cell that is not
 //      what its column holds, csv_text over 2 MiB or a bad export_date is INVALID_ARGUMENT.
@@ -10,10 +11,11 @@
 //      imp/mfc/import last (sync.proto rule 7), each write versioned
 //      <server instant>#<import number>#<reserved server device> and minted above the facet's own.
 //
-// What 14a does not do (WK-14b): a re-import of an export that changes a figure an earlier import
-// settled, which it refuses (FAILED_PRECONDITION) before writing anything; settling a conflict by a
-// FAVOR preference, also refused; divergence and align-MFC entries; answers; the replay of a late
-// edit, which ./holds.ts holds instead; and the full discrepancy report.
+// Refused with FAILED_PRECONDITION before anything is written: an export whose row the spine now
+// resolves to another figure than the one its row base names (a merge or a move), and a conflict a
+// FAVOR preference would settle. Not built yet: divergence items, align-MFC entries and their
+// acknowledgements, and the replay of a late edit, which ./holds.ts holds instead. The answers to
+// the items this import raises are applied in Push (./answers.ts).
 import { create } from '@bufbuild/protobuf';
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
 import {
@@ -44,10 +46,10 @@ import {
   type SyncPool,
 } from '../sync/store.js';
 import { importOccId } from './occ.js';
-import { FIGURE_ITEM_PREFIX, planImport, type Row } from './plan.js';
+import { CHANGE_ITEM_PREFIX, FIGURE_ITEM_PREFIX, planImport, type Row } from './plan.js';
 import { resolveMfcIds } from './resolve.js';
 import { readExport, type ExportError, type ExportRow } from './rows.js';
-import { lastImportNumber, readImportState, recordRun, saveBases } from './store.js';
+import { lastImportNumber, readImportState, recordRun, saveBases, saveExportRows } from './store.js';
 import { importVersion, writeVersion } from './version.js';
 
 /** import.proto ImportMfcExportRequest.csv_text: at most 2 MiB of UTF-8. */
@@ -140,7 +142,7 @@ export function createImportRoutes(deps: ImportRoutesDeps): (router: ConnectRout
       });
       if (plan.beyond.length > 0) {
         throw new ConnectError(
-          `this export changes ${plan.beyond.length} figure(s) an earlier import settled; importing a changed export arrives with WK-14b`,
+          `this export has rows the spine now resolves to another figure (a merge or a move), touching ${plan.beyond.length} figure(s); importing those is not built yet`,
           Code.FailedPrecondition,
         );
       }
@@ -148,7 +150,7 @@ export function createImportRoutes(deps: ImportRoutesDeps): (router: ConnectRout
       const policy = pref?.op === 'upsert' ? (JSON.parse(pref.payload) as { import_policy: string }).import_policy : 'ASK';
       if (policy !== 'ASK' && plan.conflicted.length > 0) {
         throw new ConnectError(
-          `import_policy ${policy} would settle ${plan.conflicted.length} conflict(s); settling by preference arrives with WK-14b`,
+          `import_policy ${policy} would settle ${plan.conflicted.length} conflict(s); settling by preference is not built yet: answer them, or set ASK`,
           Code.FailedPrecondition,
         );
       }
@@ -167,26 +169,33 @@ export function createImportRoutes(deps: ImportRoutesDeps): (router: ConnectRout
         feed,
       );
       await recordRun(tx, userId, { importNumber, exportDate: req.exportDate, version, markerSeq: await feedHead(tx, userId), figures: plan.figures, settled: plan.settled });
-      await saveBases(tx, userId, importNumber, { rows: plan.rowBases, copies: plan.copyBases, fields: plan.fieldBases, items: plan.items });
+      await saveBases(tx, userId, importNumber, {
+        rows: plan.rowBases,
+        rowsGone: plan.rowBasesGone,
+        copies: plan.copyBases,
+        fields: plan.fieldBases,
+        items: plan.items,
+        kept: { add: new Map(), gone: plan.keptGone },
+      });
+      await saveExportRows(tx, userId, plan.exportRows);
 
-      const review = plan.pending.map((item) =>
-        create(ImportReviewItemSchema, {
-          facetKey: `${FIGURE_ITEM_PREFIX}${item.head}`,
-          headId: item.head,
-          rev: item.rev,
-          answers: [ImportAnswer.KEEP, ImportAnswer.TAKE, ImportAnswer.PER_COPY],
-          payload: item.payload,
-        }),
-      );
+      const item = (prefix: string, answers: ImportAnswer[]) => (entry: { head: string; rev: string; payload: string }) =>
+        create(ImportReviewItemSchema, { facetKey: `${prefix}${entry.head}`, headId: entry.head, rev: entry.rev, answers, payload: entry.payload });
+      const review = plan.pending.map(item(FIGURE_ITEM_PREFIX, [ImportAnswer.KEEP, ImportAnswer.TAKE, ImportAnswer.PER_COPY]));
       return create(ImportMfcExportResponseSchema, {
         resolved: resolved.length,
         unresolved: unresolved.map(({ row, reason }) =>
           create(UnresolvedMfcRowSchema, { mfcId: row.rawId, status: row.rawStatus, line: row.line, reason }),
         ),
         added: plan.stats.added,
+        moved: plan.stats.moved,
         unchanged: plan.stats.unchanged,
+        removed: plan.stats.removed,
+        keptNewer: plan.stats.keptNewer,
         facetsWritten: plan.writes.length + 1,
         occurrencesAdded: plan.stats.occurrencesAdded,
+        occurrencesStatusChanged: plan.stats.occurrencesStatusChanged,
+        occurrencesRemoved: plan.stats.occurrencesRemoved,
         conflictsRaised: plan.stats.conflictsRaised,
         conflictsPending: plan.pending.length,
         importNumber,
@@ -194,6 +203,7 @@ export function createImportRoutes(deps: ImportRoutesDeps): (router: ConnectRout
           review.length === 0
             ? []
             : [create(ImportReviewGroupSchema, { kind: ImportReviewKind.CONFLICT, items: review, bulk: [ImportAnswer.KEEP, ImportAnswer.TAKE] })],
+        applied: plan.applied.map(item(CHANGE_ITEM_PREFIX, [ImportAnswer.UNDO, ImportAnswer.DISMISS])),
       });
     };
 

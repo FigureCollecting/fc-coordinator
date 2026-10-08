@@ -20,6 +20,7 @@ import {
   initOpenFgaTransport,
   setEntitlementAuditSink,
 } from '../entitlements/index.js';
+import { createImportHooks } from '../import/answers.js';
 import { holdLateForImport } from '../import/holds.js';
 import { resolveImportOccKey } from '../import/occ.js';
 import { createImportRoutes, type ImportRoutesDeps } from '../import/service.js';
@@ -129,7 +130,9 @@ export function registerConnect(app: FastifyInstance, options: ConnectOptions): 
   const resolveIdentity = options.resolveIdentity ?? decoratorIdentityResolver();
   const resolveDevice = options.resolveDevice ?? decoratorDeviceResolver();
   const compareRoutes = createCompareRoutes(options);
-  const syncRoutes = options.sync === undefined ? undefined : createSyncRoutes(options.sync);
+  // The import's answers ride Push with the import's own key: one key mints and finds every copy.
+  const imports = options.import === undefined ? undefined : createImportHooks(options.import.occIdKey);
+  const syncRoutes = options.sync === undefined ? undefined : createSyncRoutes({ ...(imports !== undefined ? { imports } : {}), ...options.sync });
   const catalogRoutes = options.catalog === undefined ? undefined : createCatalogRoutes(options.catalog);
   const importRoutes = options.import === undefined ? undefined : createImportRoutes(options.import);
 
