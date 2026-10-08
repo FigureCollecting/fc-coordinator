@@ -33,7 +33,7 @@ describe('migrations — numbered-SQL doctrine', () => {
     // refuses a back-dated prefix (exit 6), so this file can never be added
     // later to a database that has already applied 0001 — it is 0000 or it is a
     // hand-run psql nobody can prove.
-    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql', '0004_sync_transactions.sql']);
+    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql', '0004_sync_transactions.sql', '0005_import.sql']);
   });
 
   it('contains no transaction control — the runner owns the boundaries (psql -1)', () => {
@@ -101,10 +101,10 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     await pg?.stop();
   });
 
-  it('applies all five migrations in one run and records them in the ledger', async () => {
+  it('applies all six migrations in one run and records them in the ledger', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=5 skipped=0');
+    expect(run.output).toContain('applied=6 skipped=0');
 
     const ledger = await asMigratorDb('SELECT filename FROM schema_migrations ORDER BY filename');
     expect(ledger.stdout.trim().split('\n')).toEqual([
@@ -113,13 +113,14 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
       '0002_collection.sql',
       '0003_sync.sql',
       '0004_sync_transactions.sql',
+      '0005_import.sql',
     ]);
   });
 
   it('is a no-op on re-run', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=5');
+    expect(run.output).toContain('applied=0 skipped=6');
   });
 
   // ── The two-role split, proven rather than described ──────────────────────
@@ -341,6 +342,85 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     });
   });
 
+  // 0005: the import's server-internal state. Runs and frames are history (append-only); the
+  // bases and the pending figure items are the import's current state, rewritten as it decides.
+  describe('0005_import for the application role', () => {
+    const USER = '99999999-9999-4999-8999-999999999999';
+    const HEAD = '5f0c2a9e-4b7d-4e21-9c3a-8d1e6f2b7a40';
+    const V = '2026-10-07T00:00:00.000000Z#0000000001#00000000000000000000000000000000';
+    const denied = (run: ExecResult): void => {
+      expect(run.exitCode).not.toBe(0);
+      expect(run.output).toMatch(/42501|permission denied/i);
+    };
+    const checked = (run: ExecResult): void => {
+      expect(run.exitCode).not.toBe(0);
+      expect(run.output).toMatch(/check constraint|violates/i);
+    };
+    let seq = '';
+
+    beforeAll(async () => {
+      await asMigratorDb(`INSERT INTO app_user (id) VALUES ('${USER}')`);
+      const fed = await asApp(
+        `INSERT INTO feed_event (user_id, facet_key, version, op, payload) VALUES ('${USER}', 'imp/mfc/import', '${V}', 'upsert', '{}') RETURNING seq`,
+      );
+      seq = fed.stdout.trim().split('\n')[0]!;
+    });
+
+    it('lets the app record an import and its frames once, and refuses UPDATE and DELETE on them', async () => {
+      const run = await asApp(
+        `INSERT INTO import_run (user_id, import_number, export_date, version, marker_seq) VALUES ('${USER}', 1, '2026-09-09', '${V}', ${seq})`,
+      );
+      expect(run.exitCode).toBe(0);
+      expect((await asApp(`INSERT INTO import_frame (user_id, import_number, head_id, settled) VALUES ('${USER}', 1, '${HEAD}', true)`)).exitCode).toBe(0);
+      denied(await asApp('UPDATE import_run SET export_date = export_date WHERE false'));
+      denied(await asApp('DELETE FROM import_run WHERE false'));
+      denied(await asApp('UPDATE import_frame SET head_id = head_id WHERE false'));
+      denied(await asApp('DELETE FROM import_frame WHERE false'));
+    });
+
+    it('lets the app write, rewrite and drop the bases and the figure items', async () => {
+      for (const sql of [
+        `INSERT INTO import_row_base (user_id, mfc_id, head_id, kind, count, fields, import_number) VALUES ('${USER}', '119', '${HEAD}', 'owned', 2, '{"score":8}', 1)`,
+        `UPDATE import_row_base SET count = 1 WHERE user_id = '${USER}'`,
+        `DELETE FROM import_row_base WHERE user_id = '${USER}'`,
+        `INSERT INTO import_copy_base (user_id, occ_id, head_id, kind) VALUES ('${USER}', '${HEAD}', '${HEAD}', 'out')`,
+        `UPDATE import_copy_base SET kind = 'owned' WHERE user_id = '${USER}'`,
+        `DELETE FROM import_copy_base WHERE user_id = '${USER}'`,
+        `INSERT INTO import_field_base (user_id, head_id, field, value) VALUES ('${USER}', '${HEAD}', 'note', '"x"')`,
+        `UPDATE import_field_base SET value = 'null' WHERE user_id = '${USER}'`,
+        `DELETE FROM import_field_base WHERE user_id = '${USER}'`,
+        `INSERT INTO import_figure_item (user_id, head_id, rev, raised_import, side, comps) VALUES ('${USER}', '${HEAD}', 'i1.ab', 1, '{}', '{}')`,
+        `UPDATE import_figure_item SET rev = 'i2.cd' WHERE user_id = '${USER}'`,
+        `DELETE FROM import_figure_item WHERE user_id = '${USER}'`,
+      ]) {
+        const run = await asApp(sql);
+        expect([sql, run.exitCode]).toEqual([sql, 0]);
+      }
+    });
+
+    it('holds the bases to the import vocabulary: canonical MFC ids, kinds, Counts 0 to 99, figure fields', async () => {
+      const row = (id: string, kind: string, count: number) =>
+        asApp(`INSERT INTO import_row_base (user_id, mfc_id, head_id, kind, count, fields, import_number) VALUES ('${USER}', '${id}', '${HEAD}', '${kind}', ${count}, '{}', 1)`);
+      checked(await row('0119', 'owned', 1));
+      checked(await row('x', 'owned', 1));
+      checked(await row('119', 'former', 1));
+      checked(await row('119', 'owned', 100));
+      checked(await row('119', 'owned', -1));
+      checked(await asApp(`INSERT INTO import_copy_base (user_id, occ_id, head_id, kind) VALUES ('${USER}', '${HEAD}', '${HEAD}', 'former')`));
+      checked(await asApp(`INSERT INTO import_field_base (user_id, head_id, field, value) VALUES ('${USER}', '${HEAD}', 'tag', 'null')`));
+      checked(
+        await asApp(
+          `INSERT INTO import_run (user_id, import_number, export_date, version, marker_seq) VALUES ('${USER}', 0, '2026-09-09', '${V}', ${seq})`,
+        ),
+      );
+      checked(
+        await asApp(
+          `INSERT INTO import_run (user_id, import_number, export_date, version, marker_seq) VALUES ('${USER}', 2, '2026-09-09', '2026-10-07T00:00:00Z', ${seq})`,
+        ),
+      );
+    });
+  });
+
   it('refuses to run as a SUPERUSER', async () => {
     const run = await migrate({ PGUSER: 'postgres', PGPASSWORD: 'postgres' });
     expect(run.exitCode).toBe(2);
@@ -374,7 +454,7 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
   it('still exits 0 on a correctly named directory', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=5');
+    expect(run.output).toContain('applied=0 skipped=6');
   });
 
   it('refuses the whole run when an applied migration has been edited on disk', async () => {
