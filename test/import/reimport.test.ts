@@ -731,6 +731,23 @@ describe('answers: the edges', () => {
     expect(await kept()).toEqual([]);
   });
 
+  it('a device re-stating a kept copy\'s head on the same figure keeps its keep; moving it to another figure ends it', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, y, w] = [nextId(), nextId(), nextId()];
+    const cy = importOccId(KEY, a.userId, y, 1);
+    await imported(a, [row(x, 'Owned'), row(y, 'Owned')]);
+    const b = await imported(a, [row(x, 'Owned')], DATE_B);
+    const { cursor } = await drain(a);
+    await pushed(a, [answer(a, headFor(y), { item: 'change', rev: b.applied[0]!.rev, choice: 'undo' }, cursor)]);
+    const kept = async () => (await db.admin.query<{ occ_id: string }>('SELECT occ_id FROM import_kept_copy WHERE user_id = $1', [a.userId])).rows.map((r) => r.occ_id);
+    expect(await kept()).toEqual([cy]);
+    const { cursor: undone } = await drain(a, cursor);
+    expect((await pushed(a, [edit(a, `occ/${cy}/head`, { head_id: headFor(y) }, undone)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await kept()).toEqual([cy]);
+    await pushed(a, [edit(a, `occ/${cy}/head`, { head_id: headFor(w) }, undone)]);
+    expect(await kept()).toEqual([]);
+  });
+
   it('places a tombstone of an answer by LWW: it answers nothing', async () => {
     const a = await SyncCaller.enrol(h);
     const res = await pushed(a, [edit(a, `res/mfc/${headFor(nextId())}`, null, '')]);

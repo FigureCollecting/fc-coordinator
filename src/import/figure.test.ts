@@ -232,6 +232,13 @@ describe('takeEffect: which copies it changes', () => {
     expect(e.created).toEqual([]);
   });
 
+  it('restores first the tracked out copy whose base is the kind, over a lower-id one based at another kind', () => {
+    const v = view([...copy(O1, 'former', 1), ...copy(O2, 'former', 2)], [[O1, based('wished')], [O2, based('owned')]], [row(1, 'owned'), row(1, 'wished', {}, '120')]);
+    const e = takeEffect(v, S, [row(1, 'owned')], comps('conflict'), occId);
+    expect([...e.statuses]).toEqual([[O2, 'owned']]);
+    expect(e.created).toEqual([]);
+  });
+
   it('never changes a copy with no base that no import removed: a hand copy the app sold stays sold', () => {
     const v = view(copy(O1, 'former'));
     const e = takeEffect(v, S, [row(1)], comps('conflict'), occId);
