@@ -16,6 +16,7 @@ import { Ajv2020 } from 'ajv/dist/2020.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { importOccId } from '../../src/import/occ.js';
 import { SpineReadClient } from '../../src/spine/spineReadClient.js';
+import { encodeCursor } from '../../src/sync/cursor.js';
 import { startFakeSpineRead, type FakeSpineRead } from '../helpers/fakeSpineRead.js';
 import { DISPLAY, ok, startSyncApp, SyncCaller, type SyncApp } from '../helpers/syncClient.js';
 import { startSyncDatabase, type SyncDatabase } from '../helpers/syncDatabase.js';
@@ -1060,5 +1061,71 @@ describe('a STALE answer is final: no later replay or revision emits the value o
     expect((await lateRows(a.userId)).sort()).toEqual(
       [`occ/${cx}/collection`, `occ/${cx}/head`].flatMap((k) => [headFor(x), headFor(y)].map(() => [k, n])).sort(),
     );
+  });
+});
+
+describe('the replay: pins of its order and its bounds', () => {
+  it("places a push's late edits that no replay answered on the feed in push order, across figures", async () => {
+    const { a, b } = await twoDevices();
+    const [x, y] = [nextId(), nextId()];
+    await imported(a, [row(x, 'Owned', { note: 'n1' }), row(y, 'Owned', { note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    await imported(a, [row(x, 'Owned', { note: 'n2' }), row(y, 'Owned', { note: 'n2' })], DATE_B);
+    const { cursor: aSaw } = await drain(a);
+    // The replay visits the figures in id order: push them the other way round.
+    const [first, second] = [headFor(x), headFor(y)].sort().reverse() as [string, string];
+    expect(outcomes(await pushed(b, [edit(b, `uf/${first}/score`, { score: 4 }, bSaw), edit(b, `uf/${second}/score`, { score: 2 }, bSaw)]))).toEqual(['APPLIED', 'APPLIED']);
+    expect(shape((await drain(a, aSaw)).events, { [first]: 'FIRST', [second]: 'SECOND' })).toEqual([
+      ['uf/FIRST/score', 'UPSERT'],
+      ['uf/SECOND/score', 'UPSERT'],
+    ]);
+  });
+
+  it('replays a figure only before the imports its own late edits had not seen, though the push carries an older basis for another figure', async () => {
+    const { a, b } = await twoDevices();
+    const [x, y] = [nextId(), nextId()];
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned'), row(y, 'Owned')]);
+    // b saw the first import up to its marker, the last event of its transaction.
+    const { cursor: bSaw } = await drain(b);
+    await imported(a, [row(y, 'Owned')], DATE_B);
+    // The sale revises the second import alone; counted late for the first too, it would be held.
+    const res = await pushed(b, [edit(b, `uf/${headFor(y)}/score`, { score: 1 }, ''), edit(b, `occ/${cx}/status`, { status: 'former' }, bSaw, 60_000)]);
+    expect(outcomes(res)).toEqual(['APPLIED', 'APPLIED']);
+    expect(await heldCount(a.userId)).toBe(0);
+  });
+
+  it('does not hold a late edit for an answer at the very event its basis names: its device had seen it', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned')]);
+    const re = await imported(a, [row(x, 'Wished')], DATE_B);
+    const { cursor: aSaw } = await drain(a);
+    expect(outcomes(await pushed(a, [answer(a, S, { item: 'change', rev: re.applied[0]!.rev, choice: 'dismiss' }, aSaw)]))).toEqual(['APPLIED']);
+    const { rows } = await db.admin.query<{ seq: string }>('SELECT seq FROM feed_event WHERE user_id = $1 AND facet_key = $2', [a.userId, `res/mfc/${S}`]);
+    const basis = encodeCursor(BigInt(rows[0]!.seq));
+    await imported(a, [row(x, 'Wished', { note: 'n3' })], '2026-09-30');
+    expect(outcomes(await pushed(b, [edit(b, `uf/${S}/score`, { score: 2 }, basis)]))).toEqual(['APPLIED']);
+  });
+
+  it('places a kept late edit before no import earlier than its own: a late edit for the first import meets the figure that import found', async () => {
+    const { a, b } = await twoDevices();
+    const c = await SyncCaller.sibling(h, a);
+    const x = nextId();
+    const S = headFor(x);
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned')]);
+    const { cursor: bSaw } = await drain(b);
+    await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    // b's hand copy is late for the second import only, and kept under it.
+    const hand = randomUUID();
+    expect(outcomes(await pushed(b, [edit(b, `occ/${hand}/head`, { head_id: S }, bSaw), edit(b, `occ/${hand}/status`, { status: 'owned' }, bSaw)]))).toEqual(['APPLIED', 'APPLIED']);
+    const { rows: runs } = await db.admin.query<{ n: number }>('SELECT max(import_number) AS n FROM import_run WHERE user_id = $1', [a.userId]);
+    expect(await lateRows(a.userId)).toEqual([`occ/${hand}/head`, `occ/${hand}/status`].map((k) => [k, runs[0]!.n]));
+    // c never pulled either import: the first created x's copy, so c's move of it is STALE.
+    const res = await pushed(c, [edit(c, `occ/${cx}/status`, { status: 'wished' }, '')]);
+    expect(outcomes(res)).toEqual(['STALE']);
+    expect(JSON.parse(res.results[0]!.current!.payload)).toMatchObject({ status: 'owned' });
   });
 });
