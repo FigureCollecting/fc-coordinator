@@ -493,7 +493,7 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
   it('still exits 0 on a correctly named directory', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=6');
+    expect(run.output).toContain('applied=0 skipped=7');
   });
 
   it('refuses the whole run when an applied migration has been edited on disk', async () => {
