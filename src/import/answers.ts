@@ -15,14 +15,17 @@
 //                still holds what the import wrote (else STALE); a copy it removed that the undo
 //                restores is a knowing keep. Moves no base. dismiss: the entry goes.
 //
-// Not built yet: held-edit cards and align-MFC entries (an answer naming one is STALE), the
-// acknowledgement a keep or an undo records, and HELD (iii) for an edit made before an answer.
+// Not built yet: held-edit cards and align-MFC entries (an answer naming one is STALE) and the
+// acknowledgement a keep or an undo records.
 import { canonicalVersion, SERVER_DEVICE_ID } from '@figurecollecting/fc-api-contract';
 import { applyEvent, readFacet, serverNow, type Facet, type FeedTransaction, type SqlClient } from '../sync/store.js';
 import { decide, emptyEffect, finalKinds, keepEffect, keptByAnswer, keptEndedByRealign, KINDS, lackedRows, mergeEffects, mfcField, realign, takeEffect, View, type Effect } from './figure.js';
 import { importOccId } from './occ.js';
 import { CHANGE_ITEM_PREFIX, FIGURE_ITEM_PREFIX, rowsOfSide, type KeptCopy } from './plan.js';
 import type { Field, Kind } from './rows.js';
+import type { HoldPolicy } from '../sync/service.js';
+import { createLatePolicy } from './holds.js';
+import { keptEndedBy } from './replay.js';
 import { pendingReview, readFigureState, saveBases, saveKept } from './store.js';
 import { writeVersion } from './version.js';
 import { render, type Listed, type Shown, type Write } from './writes.js';
@@ -47,6 +50,8 @@ export interface ImportHooks {
   applied(tx: SqlClient, userId: string, edits: readonly Facet[]): Promise<void>;
   /** StatusResponse.pending_review. */
   pendingReview(db: SqlClient, userId: string): Promise<bigint>;
+  /** HELD and the replay of a late edit (./holds.ts), with the import's own key. */
+  late: HoldPolicy;
 }
 
 const ANSWER_KEY = /^res\/mfc\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
@@ -182,28 +187,19 @@ export function createImportHooks(occIdKey: Uint8Array | null): ImportHooks {
     },
 
     async applied(tx, userId, edits) {
-      const touched = edits.flatMap((e) => {
-        const m = /^occ\/([^/]+)\/(status|head)$/.exec(e.facetKey);
-        return m === null ? [] : [{ occ: m[1]!, field: m[2]!, e }];
-      });
-      if (touched.length === 0) return;
-      const { rows } = await tx.query<{ occ_id: string; head_id: string; kind: string }>(
+      const occs = [...new Set(edits.flatMap((e) => /^occ\/([^/]+)\/(?:status|head)$/.exec(e.facetKey)?.slice(1, 2) ?? []))];
+      if (occs.length === 0) return;
+      const { rows } = await tx.query<{ occ_id: string; head_id: string; kind: Kind }>(
         'SELECT occ_id, head_id, kind FROM import_kept_copy WHERE user_id = $1 AND occ_id = ANY($2::uuid[])',
-        [userId, [...new Set(touched.map((t) => t.occ))]],
+        [userId, occs],
       );
-      const gone = rows
-        .filter((k) =>
-          touched.some(({ occ, field, e }) => {
-            if (occ !== k.occ_id) return false;
-            const value = e.op === 'delete' ? null : (JSON.parse(e.payload) as Record<string, unknown>)[field === 'status' ? 'status' : 'head_id'];
-            return value !== (field === 'status' ? k.kind : k.head_id);
-          }),
-        )
-        .map((k) => k.occ_id);
+      const gone = keptEndedBy(new Map(rows.map((k) => [k.occ_id, { head: k.head_id, kind: k.kind }])), edits);
       if (gone.length > 0) await tx.query('DELETE FROM import_kept_copy WHERE user_id = $1 AND occ_id = ANY($2::uuid[])', [userId, gone]);
     },
 
     pendingReview,
+
+    late: createLatePolicy(occIdKey),
   };
 }
 

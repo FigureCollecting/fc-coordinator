@@ -35,8 +35,8 @@ const shown: PushedEdit[][] = [];
 const lateForFrame: HoldPolicy = async (_tx, userId, edits) => {
   shown.push([...edits]);
   const f = frame;
-  if (f === undefined || f.userId !== userId) return new Set();
-  return new Set(edits.filter((e) => e.basisSeq < f.seq && f.keys.has(e.facetKey)).map((e) => e.index));
+  if (f === undefined || f.userId !== userId) return new Map();
+  return new Map(edits.filter((e) => e.basisSeq < f.seq && f.keys.has(e.facetKey)).map((e) => [e.index, 'held' as const]));
 };
 
 beforeAll(async () => {

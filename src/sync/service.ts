@@ -2,7 +2,8 @@
 // The user is the token's `sub` and the device is the DPoP binding; the client names neither.
 // REVIEW is never emitted: there are no policy tables yet, so every user facet is AUTO_ACCEPT.
 // Each Push is one server transaction (sync.proto rule 7), and Delta gives its last event
-// commit_cursor. HELD is decided by a HoldPolicy; until the import supplies one, nothing is held.
+// commit_cursor. HELD, and the replay of a late edit, are decided by a HoldPolicy: the import's
+// (ImportHooks.late), or none, and then nothing is held.
 // An answer to an import item (res/{site}/{head}) is the import's to accept or answer STALE
 // (ImportHooks), and StatusResponse.pending_review is the import's count of what awaits review.
 import { createHash } from 'node:crypto';
@@ -81,20 +82,28 @@ export interface PushedEdit extends Facet {
 }
 
 /**
- * import.proto HELD: decided once, when a Push arrives, over its edits in push order, before
- * any of them is applied. Runs in the Push transaction under the user lock and returns the
- * indexes held.
+ * What import.proto HELD and LATE EDITS AND REPLAY make of a pushed edit: held, or placed by a
+ * replay, which has already written what it emits (APPLIED when the edit's value stands after it,
+ * STALE when it leaves another).
  */
-export type HoldPolicy = (tx: SqlClient, userId: string, edits: readonly PushedEdit[]) => Promise<ReadonlySet<number>>;
+export type LateOutcome = 'held' | 'applied' | 'stale';
+
+/**
+ * import.proto HELD and the replay of a late edit: decided once, when a Push arrives, over its
+ * edits in push order, before any other is applied. Runs in the Push transaction under the user
+ * lock, writes any replay's events in `feed`, and returns the outcome of each edit it decided;
+ * every other edit is placed by LWW.
+ */
+export type HoldPolicy = (tx: SqlClient, userId: string, edits: readonly PushedEdit[], feed: FeedTransaction) => Promise<ReadonlyMap<number, LateOutcome>>;
 
 /** No import has run, so no edit meets a frame and none is late: each is placed by LWW. */
-export const holdNothing: HoldPolicy = async () => new Set();
+export const holdNothing: HoldPolicy = async () => new Map();
 
 export interface SyncRoutesDeps {
   db: SyncPool;
   /** The per-user Push queue; tests pass one in to watch it. */
   writers?: KeyedSerialiser;
-  /** Which edits a Push holds; holdNothing by default. */
+  /** Which edits a Push holds or replays; the import's own policy, else holdNothing. */
   holds?: HoldPolicy;
   /** The import's answers and review count; without them an answer is placed by LWW and nothing awaits review. */
   imports?: ImportHooks;
@@ -159,7 +168,7 @@ async function replay(tx: SqlClient, userId: string, recorded: PushResponse): Pr
 export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) => void {
   const { db } = deps;
   const writers = deps.writers ?? new KeyedSerialiser(MAX_QUEUED_PUSHES);
-  const holds = deps.holds ?? holdNothing;
+  const holds = deps.holds ?? deps.imports?.late ?? holdNothing;
 
   const delta = async (req: DeltaRequest, ctx: HandlerContext): Promise<DeltaResponse> => {
     const caller = callerOf(ctx);
@@ -213,9 +222,9 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
       );
       // Every REJECTED check runs before HELD routing: only an edit that passed them can be held.
       const edits = verdicts.flatMap((verdict, index) => (verdict.ok ? [{ ...facets[index]!, index, basisSeq: verdict.basisSeq }] : []));
-      const held = await holds(tx, caller.userId, edits);
-
       const feed = new FeedTransaction();
+      const late = await holds(tx, caller.userId, edits, feed);
+
       const results: PushResult[] = [];
       const applied: Facet[] = [];
       for (const [index, verdict] of verdicts.entries()) {
@@ -223,9 +232,14 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
         if (!verdict.ok) {
           const current = verdict.userOwned ? await readFacet(tx, caller.userId, facet.facetKey) : undefined;
           results.push(result(facet.facetKey, PushOutcome.REJECTED, current, verdict.reason));
-        } else if (held.has(index)) {
+        } else if (late.get(index) === 'held') {
           await keepHeld(tx, caller.userId, { ...facet, clientId: req.clientId, ordinal: index, basisSeq: verdict.basisSeq });
           results.push(result(facet.facetKey, PushOutcome.HELD, await readFacet(tx, caller.userId, facet.facetKey)));
+        } else if (late.has(index)) {
+          // Placed by a replay, which wrote what it emits.
+          const stands = late.get(index) === 'applied';
+          if (stands) applied.push(facet);
+          results.push(result(facet.facetKey, stands ? PushOutcome.APPLIED : PushOutcome.STALE, await readFacet(tx, caller.userId, facet.facetKey)));
         } else {
           const placed = (await deps.imports?.answer(tx, caller.userId, facet, feed)) ?? (await applyEvent(tx, caller.userId, facet, feed));
           if (placed.applied) applied.push(facet);

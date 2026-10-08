@@ -776,13 +776,20 @@ describe('the WK-14a leftovers', () => {
   it('StatusResponse.pending_review counts the pending figure items and the held edits', async () => {
     const a = await SyncCaller.enrol(h);
     const b = await SyncCaller.sibling(h, a);
-    const [x, y] = [nextId(), nextId()];
+    const [x, y, z] = [nextId(), nextId(), nextId()];
     expect((await a.status().then(ok)).pendingReview).toBe(0n);
     await pushed(a, [edit(a, `uf/${headFor(x)}/score`, { score: 9 }, '')]);
-    await imported(a, [row(x, 'Owned', { score: '7/10' }), row(y, 'Owned')]);
+    await imported(a, [row(x, 'Owned', { score: '7/10' }), row(y, 'Owned'), row(z, 'Owned')]);
     expect((await a.status().then(ok)).pendingReview).toBe(1n);
-    // b had not pulled the import: its sale of y's copy is late and held.
-    const late = await pushed(b, [edit(b, `occ/${importOccId(KEY, a.userId, y, 1)}/status`, { status: 'former' }, '')]);
+    const { cursor: bSaw } = await drain(b);
+    // b sells y's copy offline; MFC drops y; a, who saw the removal, adds a copy of y by hand.
+    const sale = edit(b, `occ/${importOccId(KEY, a.userId, y, 1)}/status`, { status: 'former' }, bSaw);
+    await imported(a, [row(x, 'Owned', { score: '7/10' }), row(z, 'Owned')], DATE_B);
+    const { cursor: aSaw } = await drain(a);
+    const hand = randomUUID();
+    await pushed(a, [edit(a, `occ/${hand}/head`, { head_id: headFor(y) }, aSaw), edit(a, `occ/${hand}/status`, { status: 'owned' }, aSaw)]);
+    // The late sale would withdraw the removal a acted on: held (HELD (i)).
+    const late = await pushed(b, [sale]);
     expect(late.results[0]!.outcome).toBe(PushOutcome.HELD);
     expect((await b.status().then(ok)).pendingReview).toBe(2n);
   });

@@ -2,6 +2,7 @@
 // Push's transaction under lockUser.
 import type { Facet, SqlClient } from '../sync/store.js';
 import type { Comps, CopyBase, FigureItem, ImportState, KeptCopy, Row } from './plan.js';
+import type { FrameBefore } from './replay.js';
 import type { Field } from './rows.js';
 
 interface FacetRow {
@@ -53,13 +54,9 @@ export async function readImportState(tx: SqlClient, userId: string): Promise<Im
   );
 }
 
-/**
- * The state of one figure S, all an answer decides on: S's row bases, item, figure values and
- * items, and every copy whose head or base is S or whose origin is one of `ids` (the rows of S, so
- * an ordinal is never reused).
- */
-export async function readFigureState(tx: SqlClient, userId: string, S: string, ids: readonly string[]): Promise<ImportState> {
-  const { rows: occs } = await tx.query<{ occ: string }>(
+/** Every copy whose head or base is S or whose origin is one of `ids` (the rows of S). */
+export async function figureOccs(tx: SqlClient, userId: string, S: string, ids: readonly string[]): Promise<string[]> {
+  const { rows } = await tx.query<{ occ: string }>(
     `SELECT split_part(facet_key, '/', 2) AS occ FROM facet_state
       WHERE user_id = $1 AND facet_key LIKE 'occ/%/head' AND (CASE WHEN op = 'upsert' THEN payload::jsonb ->> 'head_id' END) = $2
      UNION
@@ -69,7 +66,16 @@ export async function readFigureState(tx: SqlClient, userId: string, S: string, 
      SELECT occ_id::text FROM import_copy_base WHERE user_id = $1 AND head_id::text = $2`,
     [userId, S, ids],
   );
-  const occIds = occs.map((r) => r.occ);
+  return rows.map((r) => r.occ);
+}
+
+/**
+ * The state of one figure S, all an answer decides on: S's row bases, item, figure values and
+ * items, and every copy whose head or base is S or whose origin is one of `ids` (the rows of S, so
+ * an ordinal is never reused).
+ */
+export async function readFigureState(tx: SqlClient, userId: string, S: string, ids: readonly string[]): Promise<ImportState> {
+  const occIds = await figureOccs(tx, userId, S, ids);
   const keys = [
     ...occIds.flatMap((occ) => ['head', 'status', 'origin', 'collection'].map((f) => `occ/${occ}/${f}`)),
     ...['score', 'note', 'wishability'].map((f) => `uf/${S}/${f}`),
@@ -101,6 +107,8 @@ export interface RunRecord {
   figures: readonly string[];
   /** The framed figures it wrote to or moved a base of. */
   settled: readonly string[];
+  /** Each framed figure as it stood just before the import. */
+  before: ReadonlyMap<string, FrameBefore>;
 }
 
 /** Record an import and the figures it framed, each with whether it settled it. */
@@ -113,8 +121,9 @@ export async function recordRun(tx: SqlClient, userId: string, run: RunRecord): 
     run.markerSeq.toString(),
   ]);
   await tx.query(
-    'INSERT INTO import_frame (user_id, import_number, head_id, settled) SELECT $1, $2, h, h = ANY($4::uuid[]) FROM unnest($3::uuid[]) AS h',
-    [userId, run.importNumber, run.figures, run.settled],
+    `INSERT INTO import_frame (user_id, import_number, head_id, settled, before)
+     SELECT $1, $2, f.h, f.h = ANY($4::uuid[]), f.before FROM unnest($3::uuid[], $5::jsonb[]) AS f(h, before)`,
+    [userId, run.importNumber, run.figures, run.settled, run.figures.map((S) => JSON.stringify(run.before.get(S)))],
   );
 }
 
@@ -122,6 +131,8 @@ export interface BaseMoves {
   rows: readonly Row[];
   rowsGone: readonly string[];
   copies: ReadonlyMap<string, CopyBase>;
+  /** Copies whose base goes: a copy a revision's replay never based. */
+  copiesGone?: readonly string[];
   fields: readonly { head: string; field: Field; value: number | string | null }[];
   items: { set: readonly FigureItem[]; end: readonly string[] };
   kept: { add: ReadonlyMap<string, KeptCopy>; gone: readonly string[] };
@@ -158,6 +169,9 @@ export async function saveBases(tx: SqlClient, userId: string, importNumber: num
        ON CONFLICT (user_id, occ_id) DO UPDATE SET head_id = EXCLUDED.head_id, kind = EXCLUDED.kind, import_removed = EXCLUDED.import_removed`,
       [userId, copies.map(([occ]) => occ), copies.map(([, b]) => b.head), copies.map(([, b]) => b.kind), copies.map(([, b]) => b.removed)],
     );
+  }
+  if (bases.copiesGone !== undefined && bases.copiesGone.length > 0) {
+    await tx.query('DELETE FROM import_copy_base WHERE user_id = $1 AND occ_id = ANY($2::uuid[])', [userId, bases.copiesGone]);
   }
   if (bases.fields.length > 0) {
     await tx.query(

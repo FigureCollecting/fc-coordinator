@@ -47,6 +47,7 @@ import {
 } from '../sync/store.js';
 import { importOccId } from './occ.js';
 import { CHANGE_ITEM_PREFIX, FIGURE_ITEM_PREFIX, planImport, type Row } from './plan.js';
+import { frameBefores } from './replay.js';
 import { resolveMfcIds } from './resolve.js';
 import { readExport, type ExportError, type ExportRow } from './rows.js';
 import { lastImportNumber, readImportState, recordRun, saveBases, saveExportRows } from './store.js';
@@ -168,7 +169,16 @@ export function createImportRoutes(deps: ImportRoutesDeps): (router: ConnectRout
         { facetKey: marker, op: 'upsert', payload: JSON.stringify({ import: importNumber, export_date: req.exportDate }), version: writeVersion(version, previous?.version) },
         feed,
       );
-      await recordRun(tx, userId, { importNumber, exportDate: req.exportDate, version, markerSeq: await feedHead(tx, userId), figures: plan.figures, settled: plan.settled });
+      await recordRun(tx, userId, {
+        importNumber,
+        exportDate: req.exportDate,
+        version,
+        markerSeq: await feedHead(tx, userId),
+        figures: plan.figures,
+        settled: plan.settled,
+        // Each figure as the import found it: a late edit is replayed against it (./replay.ts).
+        before: frameBefores(state, plan.figures, plan.exportRows),
+      });
       await saveBases(tx, userId, importNumber, {
         rows: plan.rowBases,
         rowsGone: plan.rowBasesGone,

@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Facet } from '../sync/store.js';
 import type { ImportState, Row } from './plan.js';
+import type { Field } from './rows.js';
 import {
   decideAgain,
   figureKeys,
@@ -63,7 +64,7 @@ describe('frameBefores: S as it stood just before the import', () => {
         [O1, { head: S, kind: 'owned', removed: false }],
         [O3, { head: T, kind: 'wished', removed: false }],
       ]),
-      fieldBases: new Map([
+      fieldBases: new Map<string, Map<Field, number | string | null>>([
         [S, new Map([['score', 7]])],
         [T, new Map([['note', 'n']])],
       ]),
@@ -114,11 +115,17 @@ describe('decideAgain and sameDecision', () => {
     const { frame: f, pre } = frame([]);
     const as = decideAgain(f, S, pre, [], occId);
     const replayed = decideAgain(f, S, pre, [up(`occ/${O1}/status`, { status: 'former', ...SHOWN }, V2)], occId);
+    // The dropped row states no note either: both decisions tombstone it.
     expect(as.writes.map((w) => [w.facetKey, w.op])).toEqual([
       [`occ/${O1}/status`, 'delete'],
+      [`uf/${S}/note`, 'delete'],
       [`imp/mfc/change/${S}`, 'upsert'],
     ]);
-    expect(replayed.writes).toEqual([]);
+    expect(replayed.writes.map((w) => [w.facetKey, w.op])).toEqual([
+      [`uf/${S}/note`, 'delete'],
+      [`imp/mfc/change/${S}`, 'upsert'],
+    ]);
+    expect(replayed.copyBases.get(O1)).toEqual({ head: S, kind: 'out', removed: false });
     expect(sameDecision(as, replayed)).toBe(false);
   });
 
@@ -190,22 +197,22 @@ describe('reacts: HELD (ii), an edit made before a revision it had not seen', ()
     after: { copies: { [O1]: 'out', [O2]: 'out' }, items: { figure: null, change: null } },
   };
   it('writes a copy whose live state the revision changed, whatever the facet', () => {
-    expect(reacts(rev, `occ/${O1}/tag/x`, false, true, null)).toBe(true);
+    expect(reacts(rev, `occ/${O1}/tag/x`, false, true, [])).toBe(true);
   });
   it('adds a copy to S: the head or status of a copy that had no head when the import ran', () => {
-    expect(reacts(rev, `occ/${O3}/head`, true, false, null)).toBe(true);
-    expect(reacts(rev, `occ/${O3}/head`, false, false, null)).toBe(false);
-    expect(reacts(rev, `occ/${O3}/tag/x`, true, false, null)).toBe(false);
+    expect(reacts(rev, `occ/${O3}/head`, true, false, [])).toBe(true);
+    expect(reacts(rev, `occ/${O3}/head`, false, false, [])).toBe(false);
+    expect(reacts(rev, `occ/${O3}/tag/x`, true, false, [])).toBe(false);
   });
   it('writes the status or head of a copy of S while it saw an item the revision withdrew', () => {
-    expect(reacts(rev, `occ/${O2}/status`, true, true, 'i2.c')).toBe(true);
-    expect(reacts(rev, `occ/${O2}/status`, true, true, null)).toBe(false);
-    expect(reacts(rev, `occ/${O2}/status`, true, true, 'i9.z')).toBe(false);
-    expect(reacts({ ...rev, after: { ...rev.after, items: { figure: 'i2.c', change: null } } }, `occ/${O2}/status`, true, true, 'i2.c')).toBe(false);
-    expect(reacts({ ...rev, before: { ...rev.before, items: { figure: 'i2.c', change: null } } }, `occ/${O2}/head`, true, true, 'i2.c')).toBe(true);
+    expect(reacts(rev, `occ/${O2}/status`, true, true, ['i1.f', 'i2.c'])).toBe(true);
+    expect(reacts(rev, `occ/${O2}/status`, true, true, [])).toBe(false);
+    expect(reacts(rev, `occ/${O2}/status`, true, true, ['i9.z'])).toBe(false);
+    expect(reacts({ ...rev, after: { ...rev.after, items: { figure: 'i2.c', change: null } } }, `occ/${O2}/status`, true, true, ['i2.c'])).toBe(false);
+    expect(reacts({ ...rev, before: { ...rev.before, items: { figure: 'i2.c', change: null } } }, `occ/${O2}/head`, true, true, ['i2.c'])).toBe(true);
   });
   it('a figure value is never a reaction', () => {
-    expect(reacts(rev, `uf/${S}/score`, true, false, 'i2.c')).toBe(false);
+    expect(reacts(rev, `uf/${S}/score`, true, false, ['i2.c'])).toBe(false);
   });
 });
 

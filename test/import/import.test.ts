@@ -439,8 +439,8 @@ describe("the app's side (GR-Q1: an import surfaces a conflict and never writes 
   });
 });
 
-describe('HELD: an edit made before an import it had not seen', () => {
-  it('holds a late edit to a figure the import decided, and applies a knowing one and one to a figure it never framed', async () => {
+describe('a late edit: made before an import it had not seen, replayed just before it', () => {
+  it('answers STALE a late edit to a facet the import wrote, and applies one the import leaves standing, a knowing one and one to a figure it never framed', async () => {
     const a = await SyncCaller.enrol(h);
     const b = await SyncCaller.sibling(h, a);
     const [x, y, outside] = [nextId(), nextId(), nextId()];
@@ -465,22 +465,23 @@ describe('HELD: an edit made before an import it had not seen', () => {
         ],
       }),
     );
-    // The new copy's head and status are one unit: the late head holds its knowing status with it.
-    expect(late.results.map((r) => r.outcome)).toEqual([PushOutcome.HELD, PushOutcome.HELD, PushOutcome.HELD, PushOutcome.HELD, PushOutcome.APPLIED]);
+    // Replayed before the import, the copy's status is the import's to write (it created the copy):
+    // STALE with the import's value. The import decides y the same with or without the note and the
+    // new copy (MFC's wish is no owned copy), so those stand.
+    expect(late.results.map((r) => r.outcome)).toEqual([PushOutcome.STALE, PushOutcome.APPLIED, PushOutcome.APPLIED, PushOutcome.APPLIED, PushOutcome.APPLIED]);
     expect(late.results[0]!.current).toMatchObject({ facetKey: `occ/${copyX}/status`, payload: JSON.stringify({ status: 'owned', edited_at: `${EXPORT_DATE}T00:00:00Z`, tz: 'UTC' }) });
-    const { rows } = await db.admin.query<{ facet_key: string; basis_seq: string }>(
-      'SELECT facet_key, basis_seq FROM held_edit WHERE user_id = $1 ORDER BY ordinal',
+    expect((await db.admin.query('SELECT 1 FROM held_edit WHERE user_id = $1', [a.userId])).rows).toHaveLength(0);
+    // Each late edit replayed is kept under the import it is late for, so a later replay places it there again.
+    const { rows } = await db.admin.query<{ facet_key: string; import_number: number }>(
+      'SELECT facet_key, import_number FROM import_late_edit WHERE user_id = $1 ORDER BY facet_key',
       [a.userId],
     );
-    expect(rows.map((r) => [r.facet_key, r.basis_seq])).toEqual([
-      [`occ/${copyX}/status`, '0'],
-      [`uf/${headFor(y)}/note`, '0'],
-      [`occ/${newCopy}/head`, '0'],
-      [`occ/${newCopy}/status`, String(decodeCursor(cursor))],
-    ]);
+    expect(rows.map((r) => [r.facet_key, r.import_number])).toEqual(
+      [`occ/${copyX}/status`, `occ/${newCopy}/head`, `uf/${headFor(y)}/note`].sort().map((k) => [k, 1]),
+    );
 
-    // A tag on an imported copy is its own unit, and late; a copy with no head anywhere and a
-    // collection name belong to no figure; a late new copy is held with its head.
+    // A tag on an imported copy is its own unit, late, and left standing; a copy with no head
+    // anywhere and a collection name belong to no figure.
     const other = randomUUID();
     const tagged = ok(
       await b.push({
@@ -492,7 +493,9 @@ describe('HELD: an edit made before an import it had not seen', () => {
         ],
       }),
     );
-    expect(tagged.results.map((r) => r.outcome)).toEqual([PushOutcome.HELD, PushOutcome.APPLIED, PushOutcome.APPLIED]);
+    expect(tagged.results.map((r) => r.outcome)).toEqual([PushOutcome.APPLIED, PushOutcome.APPLIED, PushOutcome.APPLIED]);
+    // A late owned copy on x, which MFC counts once: placed before the import it pairs with MFC's
+    // copy, and the import would not have created one. A revision: the created copy is withdrawn.
     const added = ok(
       await b.push({
         clientId: randomUUID(),
@@ -502,21 +505,32 @@ describe('HELD: an edit made before an import it had not seen', () => {
         ],
       }),
     );
-    expect(added.results.map((r) => r.outcome)).toEqual([PushOutcome.HELD, PushOutcome.HELD]);
+    expect(added.results.map((r) => r.outcome)).toEqual([PushOutcome.APPLIED, PushOutcome.APPLIED]);
+    const copies = liveCopies(replica((await drain(a)).events));
+    expect([copies.has(copyX), copies.get(other)]).toEqual([false, { head: headFor(x), status: 'owned' }]);
 
-    // Made after pulling the import: knowing, applied by LWW.
+    // Made after the import but before that revision, unseen: an edit to the copy it took out reacts to it (HELD (ii)).
+    const reacting = ok(
+      await b.push({
+        clientId: randomUUID(),
+        events: [{ facetKey: `occ/${copyX}/status`, version: version(12), op: SyncOp.UPSERT, payload: JSON.stringify({ status: 'wished', ...DISPLAY }), basis: cursor }],
+      }),
+    );
+    expect(reacting.results[0]!.outcome).toBe(PushOutcome.HELD);
+    // Made after pulling the revision: knowing, applied by LWW.
+    const { cursor: now } = await drain(b);
     const knowing = ok(
       await b.push({
         clientId: randomUUID(),
-        events: [{ facetKey: `occ/${copyX}/status`, version: version(12), op: SyncOp.UPSERT, payload: JSON.stringify({ status: 'former', ...DISPLAY }), basis: cursor }],
+        events: [{ facetKey: `occ/${other}/status`, version: version(13), op: SyncOp.UPSERT, payload: JSON.stringify({ status: 'former', ...DISPLAY }), basis: now }],
       }),
     );
     expect(knowing.results[0]!.outcome).toBe(PushOutcome.APPLIED);
   });
 });
 
-describe('HELD, across two imports', () => {
-  it('applies an edit made after one import to a figure only that import decided, though a later import has run', async () => {
+describe('a late edit, across two imports', () => {
+  it('applies an edit made after one import to a figure only that import decided, and a late one the later import decides the same either way', async () => {
     const a = await SyncCaller.enrol(h);
     const b = await SyncCaller.sibling(h, a);
     const [x, y] = [nextId(), nextId()];
@@ -536,11 +550,11 @@ describe('HELD, across two imports', () => {
         ],
       }),
     );
-    expect(res.results.map((r) => r.outcome)).toEqual([PushOutcome.APPLIED, PushOutcome.HELD]);
+    expect(res.results.map((r) => r.outcome)).toEqual([PushOutcome.APPLIED, PushOutcome.APPLIED]);
   });
 });
 
-describe('HELD only for a figure an import settled (wrote to or moved a base of)', () => {
+describe('a late edit is late only for a figure an import settled (wrote to or moved a base of)', () => {
   const at = (device: string, n: number, offsetMs: number) => canonicalVersion({ instant: new Date(Date.now() + offsetMs), counter: n, deviceId: device });
   const score = (head: string, n: number, version: string, basis: string) => ({
     facetKey: `uf/${head}/score`,
@@ -575,7 +589,7 @@ describe('HELD only for a figure an import settled (wrote to or moved a base of)
     expect(replica((await drain(a)).events).get(`uf/${headFor(x)}/score`)).toMatchObject({ score: 9 });
   });
 
-  it('applies a late edit to a figure the import only raised a conflict on, and holds one for a later import that settled it', async () => {
+  it('applies a late edit to a figure the import only raised a conflict on; one late for a later import that settled it is replayed, and raises again the conflict that import ended', async () => {
     const a = await SyncCaller.enrol(h);
     const b = await SyncCaller.sibling(h, a);
     const x = nextId();
@@ -595,13 +609,20 @@ describe('HELD only for a figure an import settled (wrote to or moved a base of)
       [2, true],
     ]);
     const late = ok(await b.push({ clientId: randomUUID(), events: [score(S, 8, at(b.deviceId, 2, 2000), bSaw)] }));
-    expect(late.results[0]!.outcome).toBe(PushOutcome.HELD);
+    expect(late.results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    // Placed before import 2, the app's 8 meets MFC's 7: a conflict, so import 2 writes nothing of
+    // the figure. The item it ended is pending again, and the copy it made is withdrawn.
+    const state = replica((await drain(a)).events);
+    expect(state.get(`uf/${S}/score`)).toMatchObject({ score: 8 });
+    expect(state.get(`imp/mfc/figure/${S}`)).toMatchObject({ kind: 'conflict' });
+    expect([...liveCopies(state).values()].filter((c) => c.head === S)).toEqual([]);
+    expect((await b.status().then(ok)).pendingReview).toBe(1n);
     const { cursor: bNow } = await drain(b);
     const knowing = ok(await b.push({ clientId: randomUUID(), events: [score(S, 8, at(b.deviceId, 3, 3000), bNow)] }));
     expect(knowing.results[0]!.outcome).toBe(PushOutcome.APPLIED);
   });
 
-  it('holds a late move of a copy out of a settled figure, as one into it', async () => {
+  it('replays a late move of a copy out of a settled figure, one back into it and a tombstone of its head, each against the figure as the import found it', async () => {
     const a = await SyncCaller.enrol(h);
     const b = await SyncCaller.sibling(h, a);
     const [x, t] = [nextId(), nextId()];
@@ -618,13 +639,26 @@ describe('HELD only for a figure an import settled (wrote to or moved a base of)
     );
     // The app's copy is MFC's one: the import pairs it and writes nothing.
     expect(ok(await a.importMfcExport({ csvText: mfcCsv([row(x, 'Owned')]), exportDate: EXPORT_DATE })).occurrencesAdded).toBe(0);
+    const cx = importOccId(KEY, a.userId, x, 1);
+    const onX = async () =>
+      [...liveCopies(replica((await drain(a)).events)).entries()]
+        .filter(([, v]) => v.head === headFor(x))
+        .map(([occ]) => (occ === cx ? 'mfc' : occ === c ? 'hand' : occ))
+        .sort();
+    expect(await onX()).toEqual(['hand']);
+    // Moved out before the import: the import finds no copy of x and makes MFC's.
     const out = ok(await b.push({ clientId: randomUUID(), events: [head(headFor(t), at(b.deviceId, 1, 2000))] }));
-    expect(out.results[0]!.outcome).toBe(PushOutcome.HELD);
+    expect(out.results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await onX()).toEqual(['mfc']);
+    // Moved back, also before the import: by LWW the copy is on x again, the import pairs it, and MFC's copy is withdrawn.
     const back = ok(await b.push({ clientId: randomUUID(), events: [head(headFor(x), at(b.deviceId, 2, 3000))] }));
-    expect(back.results[0]!.outcome).toBe(PushOutcome.HELD);
-    // A late tombstone of the head takes the copy out too: held, by the head it had.
+    expect(back.results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await onX()).toEqual(['hand']);
+    // A late tombstone of the head takes the copy out of every figure: MFC's copy is made again, under the same id.
     const removed = ok(await b.push({ clientId: randomUUID(), events: [{ facetKey: `occ/${c}/head`, version: at(b.deviceId, 3, 4000), op: SyncOp.DELETE, payload: '', basis: '' }] }));
-    expect(removed.results[0]!.outcome).toBe(PushOutcome.HELD);
+    expect(removed.results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await onX()).toEqual(['mfc']);
+    expect((await a.status().then(ok)).pendingReview).toBe(0n);
   });
 
   it('places by LWW a late edit to a copy whose head was tombstoned: it belongs to no figure', async () => {
