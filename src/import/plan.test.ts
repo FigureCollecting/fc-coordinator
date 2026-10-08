@@ -45,6 +45,7 @@ function state(facets: Facet[] = [], extra: Partial<ImportState> = {}): ImportSt
     copyBases: new Map(),
     fieldBases: new Map(),
     items: new Map(),
+    kept: new Map(),
     ...extra,
   };
 }
@@ -85,7 +86,7 @@ describe('planImport: a figure new to the import', () => {
     expect(payloads.get(`uf/${S1}/note`)).toBe(JSON.stringify({ note: 'boxed', ...AT }));
     expect(payloads.get(`uf/${S2}/wishability`)).toBe(JSON.stringify({ wishability: 4, ...AT }));
 
-    expect(p.stats).toEqual({ added: 2, unchanged: 0, occurrencesAdded: 3, conflictsRaised: 0 });
+    expect(p.stats).toMatchObject({ added: 2, unchanged: 0, occurrencesAdded: 3, conflictsRaised: 0 });
     expect(p.beyond).toEqual([]);
     expect(p.conflicted).toEqual([]);
     expect(p.figures).toEqual([S1, S2]);
@@ -118,7 +119,7 @@ describe('planImport: a figure new to the import', () => {
       [APP_B, { head: S1, kind: 'out' }],
     ]);
     expect(p.rowBases).toEqual([row('119', S1, 'owned')]);
-    expect(p.stats).toEqual({ added: 1, unchanged: 0, occurrencesAdded: 0, conflictsRaised: 0 });
+    expect(p.stats).toMatchObject({ added: 1, unchanged: 0, occurrencesAdded: 0, conflictsRaised: 0 });
   });
 
   it('pairs the app\'s copies first and creates only the rest', () => {
@@ -197,7 +198,7 @@ describe('planImport: conflicts (GR-Q1: surfaced, never written over)', () => {
     expect(p.rowBases.map((r) => r.id)).toEqual(['120']);
     expect([...p.copyBases.keys()]).toEqual([occ('120', 1)]);
     expect(p.fieldBases).toEqual([]);
-    expect(p.stats).toEqual({ added: 2, unchanged: 0, occurrencesAdded: 1, conflictsRaised: 1 });
+    expect(p.stats).toMatchObject({ added: 2, unchanged: 0, occurrencesAdded: 1, conflictsRaised: 1 });
 
     const item = JSON.parse(p.writes[0]!.payload) as Record<string, unknown>;
     expect(figureSchema(item)).toBe(true);
@@ -244,7 +245,7 @@ describe('planImport: conflicts (GR-Q1: surfaced, never written over)', () => {
     expect(p.pending[1]!.payload).toBe(earlier.writes[0]!.payload);
   });
 
-  it('lists no item whose answer naming it (res/mfc/{head}: figure, its rev) has synced, decided now or standing', () => {
+  it('lists every item the server keeps pending and reads no answer: an answer ends its item when it syncs (./answers.ts)', () => {
     const earlier = plan(state([up(`uf/${S2}/score`, { score: 9, ...SHOWN })]), [row('120', S2, 'owned', 0, { score: 7 })]);
     const standing = earlier.items.set[0]!;
     const first = plan(state([up(`uf/${S1}/score`, { score: 9, ...SHOWN })]), [row('119', S1, 'owned', 0, { score: 7 })]);
@@ -258,39 +259,11 @@ describe('planImport: conflicts (GR-Q1: surfaced, never written over)', () => {
       { facetKey: `imp/mfc/figure/${S1}`, version: V, op: 'upsert' as const, payload: first.writes[0]!.payload },
       { facetKey: `imp/mfc/figure/${S2}`, version: V, op: 'upsert' as const, payload: earlier.writes[0]!.payload },
     ];
-    const answer = (head: string, item: string, rev: string) => up(`res/mfc/${head}`, { item, rev, choice: 'keep', ...SHOWN });
+    const answer = (head: string, rev: string) => up(`res/mfc/${head}`, { item: 'figure', rev, choice: 'keep', ...SHOWN });
     const pendingWith = (answers: Facet[]) =>
       plan(state([...facets, ...answers], { items }), [row('119', S1, 'owned', 0, { score: 7 })], { importNumber: 2 }).pending.map((i) => i.head);
-
     expect(pendingWith([])).toEqual([S1, S2]);
-    expect(pendingWith([answer(S1, 'figure', raised.rev), answer(S2, 'figure', standing.rev)])).toEqual([]);
-    // Not an answer to the pending item: another rev, another item of the figure, or one taken back.
-    expect(pendingWith([answer(S1, 'figure', 'i9.other'), answer(S2, 'held', standing.rev)])).toEqual([S1, S2]);
-    expect(pendingWith([gone(`res/mfc/${S1}`), answer(`${S2}x`, 'figure', standing.rev)])).toEqual([S1, S2]);
-  });
-
-  it('counts an answer of any choice, and one naming the same MFC side from another import is not an answer to this rev', () => {
-    const earlier = plan(state([up(`uf/${S2}/score`, { score: 9, ...SHOWN })]), [row('120', S2, 'owned', 0, { score: 7 })]);
-    const standing = earlier.items.set[0]!;
-    const first = plan(state([up(`uf/${S1}/score`, { score: 9, ...SHOWN })]), [row('119', S1, 'owned', 0, { score: 7 })]);
-    const raised = first.items.set[0]!;
-    const facets = [
-      up(`uf/${S1}/score`, { score: 9, ...SHOWN }),
-      { facetKey: `imp/mfc/figure/${S1}`, version: V, op: 'upsert' as const, payload: first.writes[0]!.payload },
-      { facetKey: `imp/mfc/figure/${S2}`, version: V, op: 'upsert' as const, payload: earlier.writes[0]!.payload },
-    ];
-    const items = new Map([
-      [S1, raised],
-      [S2, standing],
-    ]);
-    const pendingWith = (answers: Facet[]) =>
-      plan(state([...facets, ...answers], { items }), [row('119', S1, 'owned', 0, { score: 7 })], { importNumber: 2 }).pending.map((i) => i.head);
-    const answer = (head: string, rev: string, body: object) => up(`res/mfc/${head}`, { item: 'figure', rev, ...body, ...SHOWN });
-
-    expect(pendingWith([answer(S1, raised.rev, { choice: 'take' }), answer(S2, standing.rev, { choice: 'per_copy', copies: [] })])).toEqual([]);
-    // The same MFC side raised by another import is another rev: the answer to it does not cover this one.
-    const sameSide = (rev: string) => `i9.${rev.split('.')[1]}`;
-    expect(pendingWith([answer(S1, sameSide(raised.rev), { choice: 'keep' }), answer(S2, sameSide(standing.rev), { choice: 'take' })])).toEqual([S1, S2]);
+    expect(pendingWith([answer(S1, raised.rev), answer(S2, standing.rev)])).toEqual([S1, S2]);
   });
 
   it('records with a conflict what it found of the counts: alike, matched with app-only copies, or MFC\'s alone', () => {
@@ -404,7 +377,7 @@ describe('planImport: conflicts (GR-Q1: surfaced, never written over)', () => {
       ...appCopy(APP_A, S1, 'former'),
       ...appCopy(APP_B, S1, null),
       up(`uf/${S1}/score`, { score: 9, ...SHOWN }),
-    ], { copyBases: new Map([[occ('1', 1), { head: S1, kind: 'out' as const }]]) });
+    ], { copyBases: new Map([[occ('1', 1), { head: S1, kind: 'out' as const, removed: false }]]) });
     const p = plan({ ...st, facets: new Map([...st.facets, [`occ/${occ('1', 1)}/head`, up(`occ/${occ('1', 1)}/head`, { head_id: S2, ...SHOWN })]]) }, [row('119', S1, 'wished', 1, { score: 7 })]);
     const item = JSON.parse(p.writes.find((w) => w.facetKey === `imp/mfc/figure/${S1}`)!.payload) as { copies: object[] };
     expect(item.copies).toEqual(
@@ -424,7 +397,7 @@ describe('planImport: what an earlier import settled', () => {
     const rows = [row('119', S1, 'owned', 2, { score: 8 }), row('120', S1, 'wished')];
     const p = plan(settled(rows), rows, { importNumber: 2 });
     expect(p.writes).toEqual([]);
-    expect(p.stats).toEqual({ added: 0, unchanged: 2, occurrencesAdded: 0, conflictsRaised: 0 });
+    expect(p.stats).toMatchObject({ added: 0, unchanged: 2, occurrencesAdded: 0, conflictsRaised: 0 });
     expect(p.figures).toEqual([S1]);
     expect(p.rowBases).toEqual([]);
     expect(p.beyond).toEqual([]);
@@ -439,7 +412,7 @@ describe('planImport: what an earlier import settled', () => {
     expect(p.figures).toEqual([S1, S2]);
   });
 
-  it('names, as beyond 14a, every settled figure the export changes', () => {
+  it('decides every settled figure the export changes, and names in beyond only a row the spine now resolves to another figure', () => {
     const base = [row('1', S1, 'owned'), row('2', S2, 'owned', 1, { note: 'x' }), row('3', S3, 'owned')];
     const cases: [string, Row[]][] = [
       ['a Count', [row('1', S1, 'owned', 2), base[1]!, base[2]!]],
@@ -448,16 +421,17 @@ describe('planImport: what an earlier import settled', () => {
       ['a dropped row', [base[0]!, base[1]!]],
       ['a new row of a settled figure', [...base, row('4', S1, 'owned')]],
     ];
-    for (const [, rows] of cases) expect(plan(settled(base), rows).beyond.length).toBeGreaterThan(0);
-    expect(plan(settled(base), cases[0]![1]).beyond).toEqual([S1]);
-    expect(plan(settled(base), cases[3]![1]).beyond).toEqual([S3]);
-    // a row the spine moved to another figure changes both
+    for (const [, rows] of cases) expect(plan(settled(base), rows).beyond).toEqual([]);
+    // A row the spine moved to another figure (or merged into it) touches both: not decided yet.
     expect(plan(settled(base), [base[0]!, base[1]!, row('3', S1, 'owned')]).beyond).toEqual([S1, S3]);
   });
 
-  it('names a new figure whose copies already carry a base as beyond 14a', () => {
-    const st = state(appCopy(APP_A, S1, 'owned'), { copyBases: new Map([[APP_A, { head: S1, kind: 'owned' as const }]]) });
-    expect(plan(st, [row('119', S1, 'owned')]).beyond).toEqual([S1]);
+  it('decides a figure with no row base whose copy already carries a base, like any other', () => {
+    const st = state(appCopy(APP_A, S1, 'owned'), { copyBases: new Map([[APP_A, { head: S1, kind: 'owned' as const, removed: false }]]) });
+    const p = plan(st, [row('119', S1, 'owned')]);
+    expect(p.beyond).toEqual([]);
+    expect(p.writes).toEqual([]);
+    expect(p.stats).toMatchObject({ added: 1 });
   });
 });
 

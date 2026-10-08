@@ -689,8 +689,8 @@ describe('the pending count and the spine', () => {
     const again = ok(await a.importMfcExport({ csvText: csv('mfc: loose'), exportDate: EXPORT_DATE }));
     expect(again).toMatchObject({ conflictsRaised: 0, conflictsPending: 0, review: [] });
 
-    // Another export frames only y: x's answered item, standing beside it, is not listed either.
-    const other = ok(await a.importMfcExport({ csvText: mfcCsv([row(y, 'Owned', { note: 'mfc: loose' })]), exportDate: EXPORT_DATE }));
+    // Another export changes only y: x, settled by its answer, raises nothing.
+    const other = ok(await a.importMfcExport({ csvText: mfcCsv([row(x, 'Owned', { note: 'mfc: loose' }), row(y, 'Owned', { note: 'mfc: loose' })]), exportDate: EXPORT_DATE }));
     expect(other).toMatchObject({ conflictsRaised: 1, conflictsPending: 1 });
     expect(other.review[0]!.items.map((i) => i.headId)).toEqual([headFor(y)]);
 
@@ -701,7 +701,7 @@ describe('the pending count and the spine', () => {
     expect(relisted.rev).not.toBe(rev);
   });
 
-  it('counts no item answered take or per_copy either, and an answer to an old rev does not cover the same MFC value returning', async () => {
+  it('counts no item answered take or per_copy either, and the old answer does not cover a new MFC value', async () => {
     const a = await SyncCaller.enrol(h);
     const s = await SyncCaller.sibling(h, a);
     const [x, y, z] = [nextId(), nextId(), nextId()];
@@ -734,13 +734,13 @@ describe('the pending count and the spine', () => {
     const again = ok(await a.importMfcExport({ csvText: csv('mfc: loose'), exportDate: EXPORT_DATE }));
     expect(again).toMatchObject({ conflictsRaised: 0, conflictsPending: 0, review: [] });
 
-    // MFC's value on z changes and then returns to the one the answer was given on: a new import's rev, not covered by the old answer.
-    const changed = ok(await a.importMfcExport({ csvText: mfcCsv([row(z, 'Owned', { note: 'mfc: repainted' })]), exportDate: EXPORT_DATE }));
+    // The keep settled z at MFC's note: MFC changing it again is a new conflict, with a new rev the
+    // old answer does not name; MFC going back to the note it was settled at ends that item.
+    const changed = ok(await a.importMfcExport({ csvText: mfcCsv([x, y].map((id) => row(id, 'Owned', { note: 'mfc: loose' })).concat(row(z, 'Owned', { note: 'mfc: repainted' }))), exportDate: EXPORT_DATE }));
     expect(changed).toMatchObject({ conflictsRaised: 1, conflictsPending: 1 });
-    const back = ok(await a.importMfcExport({ csvText: mfcCsv([row(z, 'Owned', { note: 'mfc: loose' })]), exportDate: EXPORT_DATE }));
-    expect(back).toMatchObject({ conflictsRaised: 1, conflictsPending: 1 });
-    expect(revOf(back, z)).not.toBe(revOf(first, z));
-    expect(revOf(back, z).split('.')[1]).toBe(revOf(first, z).split('.')[1]);
+    expect(revOf(changed, z)).not.toBe(revOf(first, z));
+    const back = ok(await a.importMfcExport({ csvText: csv('mfc: loose'), exportDate: EXPORT_DATE }));
+    expect(back).toMatchObject({ conflictsRaised: 0, conflictsPending: 0, review: [] });
   });
 
   it('imports a header-only export with no spine configured, and answers UNAVAILABLE once there are ids to resolve', async () => {
@@ -784,16 +784,16 @@ describe('failure, lock and configuration', () => {
     }
   });
 
-  it('refuses, writing nothing, an export that changes a figure an earlier import settled (WK-14b)', async () => {
+  it('imports an export that changes a figure an earlier import settled: the arrival is written and listed with its undo (WK-14b)', async () => {
     const a = await SyncCaller.enrol(h);
     const [p, q] = [nextId(), nextId()];
     ok(await a.importMfcExport({ csvText: mfcCsv([row(p, 'Ordered'), row(q, 'Wished')]), exportDate: EXPORT_DATE }));
     const before = await feedCount(a.userId);
-    const err = failed(await a.importMfcExport({ csvText: mfcCsv([row(p, 'Owned'), row(q, 'Wished')]), exportDate: '2026-09-20' }));
-    expect(err.code).toBe('failed_precondition');
-    expect(err.message).toMatch(/1 figure/);
-    expect(await feedCount(a.userId)).toBe(before);
-    expect(await runs(a.userId)).toBe(1);
+    const res = ok(await a.importMfcExport({ csvText: mfcCsv([row(p, 'Owned'), row(q, 'Wished')]), exportDate: '2026-09-20' }));
+    expect(res).toMatchObject({ moved: 1, unchanged: 1, occurrencesStatusChanged: 1, facetsWritten: 3 });
+    expect(res.applied.map((i) => i.headId)).toEqual([headFor(p)]);
+    expect(await feedCount(a.userId)).toBe(before + 3);
+    expect(await runs(a.userId)).toBe(2);
   });
 
   it('answers UNAVAILABLE where no import key is configured', async () => {

@@ -33,7 +33,7 @@ describe('migrations — numbered-SQL doctrine', () => {
     // refuses a back-dated prefix (exit 6), so this file can never be added
     // later to a database that has already applied 0001 — it is 0000 or it is a
     // hand-run psql nobody can prove.
-    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql', '0004_sync_transactions.sql', '0005_import.sql']);
+    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql', '0004_sync_transactions.sql', '0005_import.sql', '0006_import_reimport.sql']);
   });
 
   it('contains no transaction control — the runner owns the boundaries (psql -1)', () => {
@@ -101,10 +101,10 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     await pg?.stop();
   });
 
-  it('applies all six migrations in one run and records them in the ledger', async () => {
+  it('applies all seven migrations in one run and records them in the ledger', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=6 skipped=0');
+    expect(run.output).toContain('applied=7 skipped=0');
 
     const ledger = await asMigratorDb('SELECT filename FROM schema_migrations ORDER BY filename');
     expect(ledger.stdout.trim().split('\n')).toEqual([
@@ -114,13 +114,14 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
       '0003_sync.sql',
       '0004_sync_transactions.sql',
       '0005_import.sql',
+      '0006_import_reimport.sql',
     ]);
   });
 
   it('is a no-op on re-run', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=6');
+    expect(run.output).toContain('applied=0 skipped=7');
   });
 
   // ── The two-role split, proven rather than described ──────────────────────
@@ -418,6 +419,44 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
           `INSERT INTO import_run (user_id, import_number, export_date, version, marker_seq) VALUES ('${USER}', 2, '2026-09-09', '2026-10-07T00:00:00Z', ${seq})`,
         ),
       );
+    });
+  });
+
+  // 0006: what a re-import and an answer keep beside 0005: which copies an import removed, the
+  // copies a knowing keep kept against MFC's removal, and the latest export's rows for the report.
+  describe('0006_import_reimport for the application role', () => {
+    const USER = '99999999-9999-4999-8999-999999999999';
+    const HEAD = '5f0c2a9e-4b7d-4e21-9c3a-8d1e6f2b7a40';
+    const checked = (run: ExecResult): void => {
+      expect(run.exitCode).not.toBe(0);
+      expect(run.output).toMatch(/check constraint|violates/i);
+    };
+
+    it('lets the app mark a copy an import removed, keep a copy, and rewrite the latest export', async () => {
+      for (const sql of [
+        `INSERT INTO import_copy_base (user_id, occ_id, head_id, kind, import_removed) VALUES ('${USER}', '${HEAD}', '${HEAD}', 'out', true)`,
+        `UPDATE import_copy_base SET import_removed = false WHERE user_id = '${USER}'`,
+        `DELETE FROM import_copy_base WHERE user_id = '${USER}'`,
+        `INSERT INTO import_kept_copy (user_id, occ_id, head_id, kind) VALUES ('${USER}', '${HEAD}', '${HEAD}', 'wished')`,
+        `DELETE FROM import_kept_copy WHERE user_id = '${USER}'`,
+        `INSERT INTO import_export_row (user_id, mfc_id, head_id, kind, count) VALUES ('${USER}', '119', '${HEAD}', 'owned', 0)`,
+        `DELETE FROM import_export_row WHERE user_id = '${USER}'`,
+      ]) {
+        const run = await asApp(sql);
+        expect([sql, run.exitCode]).toEqual([sql, 0]);
+      }
+      // A copy base written before 0006 is one no import removed.
+      expect((await asApp(`INSERT INTO import_copy_base (user_id, occ_id, head_id, kind) VALUES ('${USER}', '${HEAD}', '${HEAD}', 'out') RETURNING import_removed`)).stdout.trim().split('\n')[0]).toBe('f');
+    });
+
+    it('holds them to the import vocabulary: a kept copy is of a kind, an export row has a canonical id and a Count 0 to 99', async () => {
+      checked(await asApp(`INSERT INTO import_kept_copy (user_id, occ_id, head_id, kind) VALUES ('${USER}', '${HEAD}', '${HEAD}', 'out')`));
+      checked(await asApp(`INSERT INTO import_kept_copy (user_id, occ_id, head_id, kind) VALUES ('${USER}', '${HEAD}', '${HEAD}', 'former')`));
+      const row = (id: string, kind: string, count: number) =>
+        asApp(`INSERT INTO import_export_row (user_id, mfc_id, head_id, kind, count) VALUES ('${USER}', '${id}', '${HEAD}', '${kind}', ${count})`);
+      checked(await row('0119', 'owned', 1));
+      checked(await row('119', 'former', 1));
+      checked(await row('119', 'owned', 100));
     });
   });
 
