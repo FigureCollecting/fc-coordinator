@@ -1153,4 +1153,35 @@ describe('the replay: pins of its order and its bounds', () => {
     ]);
     expect((await stateOf(a)).get(`uf/${S}/score`)).toMatchObject({ score: 7 });
   });
+
+  // STALE, as push order answers it: LWW applies the newer edit ahead of it first, so the older late
+  // edit meets a higher version (what a figure no import framed answers), and the newer value stands.
+  it('answers STALE a late edit the push carries after a newer edit to the same key that is not late, and leaves the newer value standing', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    const { cursor: bNow } = await drain(b);
+    const { cursor: aSaw } = await drain(a);
+    const res = await pushed(b, [edit(b, `uf/${S}/score`, { score: 9 }, bNow, 5000), edit(b, `uf/${S}/score`, { score: 3 }, bSaw, 1000)]);
+    expect(outcomes(res)).toEqual(['APPLIED', 'STALE']);
+    expect(JSON.parse(res.results[1]!.current!.payload)).toMatchObject({ score: 9 });
+    expect((await drain(a, aSaw)).events.map((e) => (JSON.parse(e.payload) as { score: number }).score)).toEqual([9]);
+    expect(await lateRows(a.userId)).toEqual([]);
+  });
+
+  it('control: the same two edits pushed the other way round are both APPLIED in push order, and the newer value stands', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    const { cursor: bNow } = await drain(b);
+    const res = await pushed(b, [edit(b, `uf/${S}/score`, { score: 3 }, bSaw, 1000), edit(b, `uf/${S}/score`, { score: 9 }, bNow, 5000)]);
+    expect(outcomes(res)).toEqual(['APPLIED', 'APPLIED']);
+    expect((await stateOf(a)).get(`uf/${S}/score`)).toMatchObject({ score: 9 });
+  });
 });
