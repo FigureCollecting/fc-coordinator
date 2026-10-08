@@ -727,7 +727,9 @@ displayed at the export date, UTC. A figure no import settled gets a copy
 (origin, head, status) per MFC Count beyond the app's copies of the kind, and
 MFC's score, note and wishability where the app shows none; where the app shows
 another value nothing of the figure is written and a conflict item is raised.
-The same export again writes only its marker. 14a refuses (FAILED_PRECONDITION,
+An item whose answer (`res/mfc/{head}`, naming it and its rev) has synced is
+not pending: the same export raises and lists nothing, a new MFC value raises a
+new rev. The same export again writes only its marker. 14a refuses (FAILED_PRECONDITION,
 nothing written) an export that changes a figure an earlier import settled, and
 a FAVOR preference that would settle a conflict: both are WK-14b. A Push edit
 to a figure an import settled (wrote to, or moved a copy or field base of),
