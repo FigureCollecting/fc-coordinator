@@ -132,6 +132,15 @@ const copyBase = async (userId: string, occ: string) =>
   (await db.admin.query<{ kind: string; import_removed: boolean }>('SELECT kind, import_removed FROM import_copy_base WHERE user_id = $1 AND occ_id = $2', [userId, occ]))
     .rows[0];
 
+/** The late edits kept for later replays, as [facet key, import number]. */
+const lateRows = async (userId: string) =>
+  (
+    await db.admin.query<{ facet_key: string; import_number: number }>(
+      'SELECT facet_key, import_number FROM import_late_edit WHERE user_id = $1 ORDER BY import_number, facet_key',
+      [userId],
+    )
+  ).rows.map((r) => [r.facet_key, r.import_number]);
+
 /** Device a imports; device b had pulled only what `setup` imported, and edits offline. */
 async function twoDevices(): Promise<{ a: SyncCaller; b: SyncCaller }> {
   const a = await SyncCaller.enrol(h);
@@ -728,13 +737,8 @@ describe('the replay: what each guard decides', () => {
       ['occ/CX/collection', 'UPSERT'],
       ['imp/mfc/change/HX', 'UPSERT'],
     ]);
-    // Recorded with the import whose replayed refile replaced it.
-    const { rows } = await db.admin.query<{ import_number: number; overwritten_by: number | null }>(
-      'SELECT import_number, overwritten_by FROM import_late_edit WHERE user_id = $1',
-      [a.userId],
-    );
-    const { rows: runs } = await db.admin.query<{ n: number }>('SELECT max(import_number) AS n FROM import_run WHERE user_id = $1', [a.userId]);
-    expect(rows).toEqual([{ import_number: runs[0]!.n, overwritten_by: runs[0]!.n }]);
+    // A STALE answer is final: the filing is not kept for any later replay.
+    expect(await lateRows(a.userId)).toEqual([]);
   });
 
   it('a late edit to a facet two imports wrote is STALE, and placed before neither again', async () => {
@@ -802,7 +806,7 @@ describe('a recorded late edit is placed again only where it stood: before its o
     expect(state.get(`occ/${cx}/status`)).toMatchObject({ status: 'ordered' });
   });
 
-  it('a late edit late for two imports is recorded under the earlier, with the import that replaced it', async () => {
+  it('a late edit late for two imports is recorded under the earlier, and one answered STALE is not recorded', async () => {
     const { a, b } = await twoDevices();
     const x = nextId();
     const S = headFor(x);
@@ -812,16 +816,8 @@ describe('a recorded late edit is placed again only where it stood: before its o
     // b never pulled either import: the first import wrote the status, the score neither did.
     const res = await pushed(b, [edit(b, `occ/${cx}/status`, { status: 'wished' }, ''), edit(b, `uf/${S}/score`, { score: 3 }, '')]);
     expect(outcomes(res)).toEqual(['STALE', 'APPLIED']);
-    const { rows } = await db.admin.query<{ facet_key: string; import_number: number; overwritten_by: number | null }>(
-      'SELECT facet_key, import_number, overwritten_by FROM import_late_edit WHERE user_id = $1 ORDER BY facet_key',
-      [a.userId],
-    );
     const { rows: runs } = await db.admin.query<{ n: number }>('SELECT min(import_number) AS n FROM import_run WHERE user_id = $1', [a.userId]);
-    const first = runs[0]!.n;
-    expect(rows.map((r) => [r.facet_key, r.import_number, r.overwritten_by])).toEqual([
-      [`occ/${cx}/status`, first, first],
-      [`uf/${S}/score`, first, null],
-    ]);
+    expect(await lateRows(a.userId)).toEqual([[`uf/${S}/score`, runs[0]!.n]]);
   });
 
   it('one push, two late edits with different bases: the newer is placed before only the import it is late for', async () => {
@@ -881,7 +877,7 @@ describe('a recorded late edit is placed again only where it stood: before its o
     expect((await stateOf(a)).get(`occ/${cx}/status`)).toMatchObject({ status: 'former' });
   });
 
-  it('a revision of the import that replaced a recorded late edit places it before that import again: the revised decision no longer refiles the copy, so the filing stands', async () => {
+  it('a revision of the import whose refile made a late filing STALE does not bring the filing back: the copy keeps the filing it had before that import', async () => {
     const a = await SyncCaller.enrol(h);
     const b = await SyncCaller.sibling(h, a);
     const d = await SyncCaller.sibling(h, a);
@@ -891,23 +887,21 @@ describe('a recorded late edit is placed again only where it stood: before its o
     await imported(a, [row(x, 'Owned')]);
     const { cursor: bSaw } = await drain(b);
     const { cursor: dSaw } = await drain(d);
+    const filedBefore = (await stateOf(a)).get(`occ/${cx}/collection`);
     const shelf = `owned/${randomUUID()}`;
+    const filing = edit(b, `occ/${cx}/collection`, { collection: shelf }, bSaw, 60_000);
     await imported(a, [row(x, 'Ordered')], DATE_B);
-    // The import refiles the copy it moves to Ordered: b's filing is STALE, replaced by that import.
-    expect(outcomes(await pushed(b, [edit(b, `occ/${cx}/collection`, { collection: shelf }, bSaw, 60_000)]))).toEqual(['STALE']);
+    // The import refiles the copy it moves to Ordered: b's filing is STALE, and that answer is final.
+    expect(outcomes(await pushed(b, [filing]))).toEqual(['STALE']);
     const { cursor: aSaw } = await drain(a);
-    // d's late ordered copy is the one MFC moved: the import, replayed with both, removes x's copy
-    // and refiles nothing, so b's filing stands on it.
+    // d's late ordered copy is the one MFC moved: the import, replayed with it, removes x's copy and
+    // refiles nothing. b's filing is not placed, so the copy's filing is the one before the import.
     const hand = randomUUID();
     expect(outcomes(await pushed(d, [edit(d, `occ/${hand}/head`, { head_id: S }, dSaw), edit(d, `occ/${hand}/status`, { status: 'ordered' }, dSaw)]))).toEqual(['APPLIED', 'APPLIED']);
-    expect(shape((await drain(a, aSaw)).events, { [cx]: 'CX', [hand]: 'HAND', [S]: 'HX' })).toEqual([
-      ['occ/HAND/head', 'UPSERT'],
-      ['occ/HAND/status', 'UPSERT'],
-      ['occ/CX/status', 'DELETE'],
-      ['imp/mfc/change/HX', 'UPSERT'],
-      ['occ/CX/collection', 'UPSERT'],
-    ]);
-    expect((await stateOf(a)).get(`occ/${cx}/collection`)).toMatchObject({ collection: shelf });
+    const tail = (await drain(a, aSaw)).events;
+    expect(tail.filter((e) => e.payload === filing.payload)).toEqual([]);
+    expect(shape(tail, { [cx]: 'CX', [hand]: 'HAND', [S]: 'HX' })).toContainEqual(['occ/CX/status', 'DELETE']);
+    expect((await stateOf(a)).get(`occ/${cx}/collection`)).toEqual(filedBefore);
   });
 
   it('(ii) reads the revisions from the oldest basis in the push: an edit made before a revision is held beside one made after it', async () => {
@@ -934,3 +928,137 @@ describe('a recorded late edit is placed again only where it stood: before its o
   });
 });
 
+
+describe('a STALE answer is final: no later replay or revision emits the value of an edit answered STALE', () => {
+  /** Pushes that note each edit answered STALE, with the feed cursor just after the answer. */
+  const track = () => {
+    const stale: { facetKey: string; payload: string; after: string }[] = [];
+    return {
+      async push(c: SyncCaller, watcher: SyncCaller, events: ReturnType<typeof edit>[]) {
+        const res = await pushed(c, events);
+        const { cursor } = await drain(watcher);
+        res.results.forEach((r, i) => {
+          if (r.outcome === PushOutcome.STALE) stale.push({ facetKey: events[i]!.facetKey, payload: events[i]!.payload, after: cursor });
+        });
+        return res;
+      },
+      /** Each event after a STALE answer that carries that STALE edit's value. */
+      async reEmitted(watcher: SyncCaller) {
+        const found: string[] = [];
+        for (const s of stale) for (const e of (await drain(watcher, s.after)).events) if (e.facetKey === s.facetKey && e.payload === s.payload) found.push(e.facetKey);
+        return { answered: stale.length, found };
+      },
+    };
+  };
+  const collectionOf = async (c: SyncCaller, occ: string) => ((await stateOf(c)).get(`occ/${occ}/collection`) as { collection?: string } | undefined)?.collection;
+
+  /**
+   * Devices b and d pulled the first import (x Owned); the second moves x to Ordered and refiles
+   * its copy. b's filing R (stamped later) is STALE; d's push adds an ordered hand copy, which
+   * revises the second import so it refiles nothing, with its own filing F (stamped earlier).
+   */
+  async function refiled() {
+    const a = await SyncCaller.enrol(h);
+    const [b, d, e] = [await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a)];
+    const x = nextId();
+    const S = headFor(x);
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned')]);
+    const { cursor: bSaw } = await drain(b);
+    const { cursor: dSaw } = await drain(d);
+    const [shelfR, shelfF] = [`owned/${randomUUID()}`, `owned/${randomUUID()}`];
+    const R = edit(b, `occ/${cx}/collection`, { collection: shelfR }, bSaw, 120_000);
+    const F = edit(d, `occ/${cx}/collection`, { collection: shelfF }, dSaw, 60_000);
+    const hand = randomUUID();
+    await imported(a, [row(x, 'Ordered')], DATE_B);
+    const t = track();
+    expect(outcomes(await t.push(b, a, [R]))).toEqual(['STALE']);
+    // R is not placed: F, the only filing that stands, is APPLIED by the revision.
+    expect(outcomes(await t.push(d, a, [edit(d, `occ/${hand}/head`, { head_id: S }, dSaw), edit(d, `occ/${hand}/status`, { status: 'ordered' }, dSaw), F]))).toEqual([
+      'APPLIED',
+      'APPLIED',
+      'APPLIED',
+    ]);
+    expect(await collectionOf(a, cx)).toBe(shelfF);
+    return { a, e, x, S, cx, shelfF, t };
+  }
+
+  it("a filing answered STALE comes back in neither a revision of its import nor a later import's revision", async () => {
+    const { a, e, x, S, cx, shelfF, t } = await refiled();
+    const { cursor: eSaw } = await drain(e);
+    await imported(a, [row(x, 'Ordered', { count: '2' })], '2026-09-30');
+    const hand2 = randomUUID();
+    expect(outcomes(await t.push(e, a, [edit(e, `occ/${hand2}/head`, { head_id: S }, eSaw), edit(e, `occ/${hand2}/status`, { status: 'ordered' }, eSaw)]))).toEqual([
+      'APPLIED',
+      'APPLIED',
+    ]);
+    expect(await t.reEmitted(a)).toEqual({ answered: 1, found: [] });
+    expect(await collectionOf(a, cx)).toBe(shelfF);
+  });
+
+  it('on a live copy: a late note that revises a later import (its note conflict) brings back no filing answered STALE', async () => {
+    const { a, e, x, S, cx, shelfF, t } = await refiled();
+    const { cursor: eSaw } = await drain(e);
+    await imported(a, [row(x, 'Ordered', { count: '2', note: 'n3' })], '2026-09-30');
+    expect(outcomes(await t.push(e, a, [edit(e, `uf/${S}/note`, { note: 'e-note' }, eSaw)]))).toEqual(['APPLIED']);
+    expect(await heldCount(a.userId)).toBe(0);
+    expect(await t.reEmitted(a)).toEqual({ answered: 1, found: [] });
+    expect(await collectionOf(a, cx)).toBe(shelfF);
+  });
+
+  it('a revision that drops the refile does not stand a filing answered STALE; a later late filing for the same import is placed by LWW', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [b, d, g] = [await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a)];
+    const x = nextId();
+    const S = headFor(x);
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned')]);
+    const [{ cursor: bSaw }, { cursor: dSaw }, { cursor: gSaw }] = [await drain(b), await drain(d), await drain(g)];
+    const [shelfR, shelfG] = [`owned/${randomUUID()}`, `owned/${randomUUID()}`];
+    const hand = randomUUID();
+    await imported(a, [row(x, 'Ordered')], DATE_B);
+    const t = track();
+    expect(outcomes(await t.push(b, a, [edit(b, `occ/${cx}/collection`, { collection: shelfR }, bSaw, 120_000)]))).toEqual(['STALE']);
+    expect(outcomes(await t.push(d, a, [edit(d, `occ/${hand}/head`, { head_id: S }, dSaw), edit(d, `occ/${hand}/status`, { status: 'ordered' }, dSaw)]))).toEqual(['APPLIED', 'APPLIED']);
+    expect(await collectionOf(a, cx)).not.toBe(shelfR);
+    expect(outcomes(await t.push(g, a, [edit(g, `occ/${cx}/collection`, { collection: shelfG }, gSaw, 60_000)]))).toEqual(['APPLIED']);
+    expect(await t.reEmitted(a)).toEqual({ answered: 1, found: [] });
+    expect(await collectionOf(a, cx)).toBe(shelfG);
+  });
+
+  it('a late edit LWW answers STALE (a newer value is on the copy) is not kept for later replays', async () => {
+    const { a, b } = await twoDevices();
+    const c = await SyncCaller.sibling(h, a);
+    const x = nextId();
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    const { cursor: cSaw } = await drain(c);
+    const [shelfC, shelfB] = [`owned/${randomUUID()}`, `owned/${randomUUID()}`];
+    expect(outcomes(await pushed(c, [edit(c, `occ/${cx}/collection`, { collection: shelfC }, cSaw, 120_000)]))).toEqual(['APPLIED']);
+    await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    // b's filing is late for the note change, which the replay leaves as it was; c's is stamped above it.
+    const res = await pushed(b, [edit(b, `occ/${cx}/collection`, { collection: shelfB }, bSaw, 60_000)]);
+    expect(outcomes(res)).toEqual(['STALE']);
+    expect(JSON.parse(res.results[0]!.current!.payload)).toMatchObject({ collection: shelfC });
+    expect(await lateRows(a.userId)).toEqual([]);
+  });
+
+  it('a late edit LWW applies is kept, once, though it is late on two figures (a copy moved between them)', async () => {
+    const { a, b } = await twoDevices();
+    const [x, y] = [nextId(), nextId()];
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned', { note: 'n1' }), row(y, 'Owned', { note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    await imported(a, [row(x, 'Owned', { note: 'n2' }), row(y, 'Owned', { note: 'n2' })], DATE_B);
+    const shelf = `owned/${randomUUID()}`;
+    const res = await pushed(b, [edit(b, `occ/${cx}/head`, { head_id: headFor(y) }, bSaw), edit(b, `occ/${cx}/collection`, { collection: shelf }, bSaw)]);
+    expect(outcomes(res)).toEqual(['APPLIED', 'APPLIED']);
+    expect(await collectionOf(a, cx)).toBe(shelf);
+    const { rows: runs } = await db.admin.query<{ n: number }>('SELECT max(import_number) AS n FROM import_run WHERE user_id = $1', [a.userId]);
+    const n = runs[0]!.n;
+    expect((await lateRows(a.userId)).sort()).toEqual(
+      [`occ/${cx}/collection`, `occ/${cx}/head`].flatMap((k) => [headFor(x), headFor(y)].map(() => [k, n])).sort(),
+    );
+  });
+});
