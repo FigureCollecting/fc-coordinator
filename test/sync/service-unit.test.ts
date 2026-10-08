@@ -126,6 +126,19 @@ describe('a Push whose transaction fails', () => {
   });
 });
 
+describe('Status where no import is served', () => {
+  it('counts nothing awaiting review: the count is the import\'s, and with no import there is none', async () => {
+    const pool: SyncPool = {
+      query: (async (text: string) => ({ rows: [text.includes('max(seq)') ? { head: '7' } : { now: '2026-10-08T10:00:00.000000Z' }] })) as SyncPool['query'],
+      connect: neverPool.connect,
+    };
+    const res = await call(build(pool, { sub: SUB, device: DEVICE }), 'Status');
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ serverNowIso: '2026-10-08T10:00:00.000000Z' });
+    expect(res.json()).not.toHaveProperty('pendingReview');
+  });
+});
+
 describe('the Connect options the process serves', () => {
   it('mount SyncService beside Compare', async () => {
     app = buildApp({ db: stubDb, logLevel: 'silent', compare: { ...productionConnectOptions(neverPool, {}), initSigning: false } });

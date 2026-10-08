@@ -453,6 +453,8 @@ transaction control in a pending file, `6` out-of-order file.
 | `0002_collection.sql` | `collection`, `holding` — the HOLDING layer; spine references are TEXT, never foreign keys |
 | `0003_sync.sql` | `facet_state` (authoritative), `feed_event`, `feed_cursor`, `mutation_receipt` for SyncService; versions are `TEXT COLLATE "C"` with a grammar CHECK; the app role may not delete from any of them |
 | `0004_sync_transactions.sql` | `feed_event.opens_txn` (the first event of each server transaction, backfilled per database transaction) and `held_edit` (Push events answered HELD); the app role appends held edits and never rewrites them |
+| `0005_import.sql` | the MFC import's state: `import_run` and `import_frame` (append-only), the row, copy and field bases, and `import_figure_item` (pending conflicts) |
+| `0006_import_reimport.sql` | `import_copy_base.import_removed` (a copy an import removed), `import_kept_copy` (knowing keeps), `import_export_row` (the latest export's rows, for the discrepancy report), `import_frame.before` (each figure as the import found it) and, append-only, `import_late_edit` (the late edits a Push replayed and APPLIED) and `import_revision` (the revisions that changed a figure) |
 
 ## Shared baseline
 
@@ -706,38 +708,83 @@ one, so a 0.3.0 client applies a Push whole. `feed_event.opens_txn` marks each
 transaction's first event; the last is derived when Delta reads, so the feed
 stays append-only. Every pushed event needs `SyncEvent.basis`, `''` or a
 cursor: none, or one that is not a cursor, is REJECTED `basis_missing`, the
-last check. HELD is decided once per Push, before anything is applied, by a
-`HoldPolicy`; a held edit is kept in `held_edit` with its basis, not applied,
-answered with `current`, and HELD again on a replay. Until the import lands
-there is no frame, every edit is placed by LWW whatever its basis; the
-process serves the import's policy (below). The start of a feed has one cursor, `''`:
+last check. HELD is decided once per Push, before anything else is applied, by a
+`HoldPolicy`, which also places an edit a replay decides; a held edit is kept in
+`held_edit` with its basis, not applied, answered with `current`, and HELD again
+on a replay. Until the import lands there is no frame, every edit is placed by
+LWW whatever its basis; the process serves the import's policy (below). The start of a feed has one cursor, `''`:
 Status and `next_cursor` answer it while a user's feed is empty, so a client
 that has applied nothing compares equal and is not shown as behind.
 
-## `coordinator.v1` — ImportService (WK-14a: the one-time MFC import)
+## `coordinator.v1` — ImportService (WK-14a/14b: the MFC import and re-import)
 
 `ImportMfcExport` (`src/import/`) reads the export by header (ID and Status
 required; `,` or `;`, quoted fields, Price twice, `N/10` scores), resolves the
 MFC ids through SpineRead GetProducts, 200 refs a call, and decides each figure
 under the user's lock as one server transaction, written through Push's
 `applyEvent`, marker `imp/mfc/import` last (`0005_import.sql` keeps runs,
-frames, bases and pending figure items). Each write is versioned
-`<server instant>#<import number>#<server device>` above the facet's own and
-displayed at the export date, UTC. A figure no import settled gets a copy
-(origin, head, status) per MFC Count beyond the app's copies of the kind, and
-MFC's score, note and wishability where the app shows none; where the app shows
-another value nothing of the figure is written and a conflict item is raised.
-An item whose answer (`res/mfc/{head}`, naming it and its rev) has synced is
-not pending: the same export raises and lists nothing, a new MFC value raises a
-new rev. The same export again writes only its marker. 14a refuses (FAILED_PRECONDITION,
-nothing written) an export that changes a figure an earlier import settled, and
-a FAVOR preference that would settle a conflict: both are WK-14b. A Push edit
-to a figure an import settled (wrote to, or moved a copy or field base of),
-made before its device saw that import, is HELD (`held_edit`), since 14a has no
-replay; moving a copy into or out of such a figure counts. A marker-only
-re-import or a figure the import only raised a conflict on holds nothing: LWW
-places the edit, as the replay would. Until WK-14b's cards and answers a held
-edit is invisible to its user.
+frames, bases and pending figure items; `0006_import_reimport.sql` which copies
+an import removed, the knowing keeps and the latest export's rows). Each write
+is versioned `<server instant>#<import number>#<server device>` above the
+facet's own and displayed at the export date, UTC.
+
+Every figure is decided against its bases (import.proto THE FIGURE DECISION,
+`src/import/figure.ts`): MFC's Count changes are split into transitions and
+matched with the app's, what only MFC changed is MATERIALIZEd on the copies the
+app left untouched (a placeholder first, a copy an import removed restored
+before one is created, a status of another kind resets its filing), and each
+figure value is compared with its own row's base. A figure new to the import is
+added. On a figure an earlier import settled, MFC's change is written and listed
+as a change entry `imp/mfc/change/{head}` with its undo (`applied`); where both
+sides changed differently nothing of the figure is written and a conflict item
+is raised, its rev kept while MFC's side is unchanged. The same export again
+writes only its marker. Refused (FAILED_PRECONDITION, nothing written): an
+export whose row the spine now resolves to another figure than its row base
+names (a merge or a move), and a FAVOR preference that would settle an
+unanswered conflict.
+
+Answers (`res/mfc/{head}`) are applied in Push (`src/import/answers.ts`), in the
+Push's transaction: accepted only while the named item is pending with that rev
+and the choice is one it allows, else STALE with `current` and nothing written.
+keep, take and per_copy end the figure item, write what the choice makes true
+and realign the bases to MFC's side; undo puts back what a change entry wrote
+while every write still holds, and dismiss ends the entry. A keep or per_copy
+that leaves live a copy MFC removed, and an undo that restores one, record a
+knowing keep (`import_kept_copy`), which ends when the copy leaves its kind or
+figure or MFC counts it again. `readDiscrepancyReport` (`src/import/report.ts`)
+is the server half of the FULL DISCREPANCY REPORT: every live copy the latest
+export cannot account for, knowing keeps included; contract 0.3.0 has no RPC
+for it, so nothing serves it yet. `StatusResponse.pending_review` counts the
+pending figure items and the held edits.
+
+A Push edit to a figure an import settled (wrote to, or moved a copy or field
+base of), made before its device saw that import, is LATE (`src/import/holds.ts`,
+`replay.ts`); moving a copy into or out of such a figure counts. It is replayed
+just before the earliest such import, against the figure as that import found it
+(`import_frame.before`). If the import decides the figure the same way, the edit
+is placed as it would have been: STALE where the import wrote its facet, by LWW
+otherwise. If not, the Push emits each difference between the figure replayed
+and as emitted, and moves its bases, item and knowing keeps to the replay's (a
+REVISION; `import_revision` keeps one that changed the figure's live copies or
+items). A STALE answer is final: only a late edit that stood (APPLIED) is kept
+(`import_late_edit`), under the earliest import it is late for, and a later
+replay places it before that import and each later one; one answered STALE is
+placed by no later replay or revision, and its device may edit again. HELD only
+for a reaction to the result the edit
+would withdraw: another device's edit to the figure since the import, or one in
+the same Push (HELD (i)); an answer on the figure since the edit's basis (HELD
+(iii)); an edit made after a revision's import and before the revision, which
+reacts to what it withdrew (HELD (ii)). Held too, because the replay is not
+built for them: a revision on a figure with any other activity since the import
+(reaction or not), an edit late for two settled imports whose replay changes
+one, a copy moved between two late figures, an edit whose replay changes
+nothing while an answer on the figure followed its basis, a frame recorded
+before 0006, a replica without the import key. A held edit has no card yet,
+though `pending_review` counts it. A marker-only re-import, or a figure an import
+only raised a conflict on, does not make an edit late: LWW places it, so a late
+edit that would have settled such a conflict leaves the item pending. Not built
+yet: divergence items, align-MFC entries and acknowledgements, settlement by a
+FAVOR preference and held-edit cards.
 
 ## Phase-2 client (`scripts/phase2-client`)
 

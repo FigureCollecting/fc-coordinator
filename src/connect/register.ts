@@ -20,7 +20,7 @@ import {
   initOpenFgaTransport,
   setEntitlementAuditSink,
 } from '../entitlements/index.js';
-import { holdLateForImport } from '../import/holds.js';
+import { createImportHooks } from '../import/answers.js';
 import { resolveImportOccKey } from '../import/occ.js';
 import { createImportRoutes, type ImportRoutesDeps } from '../import/service.js';
 import { createSpineReadClientFromEnv } from '../spine/spineReadClient.js';
@@ -86,7 +86,7 @@ export interface ConnectOptions extends CompareRoutesDeps {
 
 /**
  * The surface the process serves: Compare, Catalog and Import on the env's spine (null =
- * degraded), Sync and Import on the pool, Sync holding a late edit to an imported figure. ONE
+ * degraded), Sync and Import on the pool, Sync replaying or holding a late edit to an imported figure. ONE
  * spine client for all three, so they ride one HTTP/2 connection through the mesh. Here rather
  * than in server.ts, which is outside coverage, so dropping a service fails a test.
  */
@@ -94,7 +94,8 @@ export function productionConnectOptions(pool: SyncPool, env: NodeJS.ProcessEnv 
   const spineRead = createSpineReadClientFromEnv(env);
   return {
     spineRead,
-    sync: { db: pool, holds: holdLateForImport },
+    // Sync holds or replays a late edit by the import's policy (ImportHooks.late), with the import's key.
+    sync: { db: pool },
     catalog: { spineRead, mediaBaseUrl: resolveMediaBaseUrl(env) },
     import: { db: pool, spineRead, occIdKey: resolveImportOccKey(env) },
   };
@@ -129,7 +130,9 @@ export function registerConnect(app: FastifyInstance, options: ConnectOptions): 
   const resolveIdentity = options.resolveIdentity ?? decoratorIdentityResolver();
   const resolveDevice = options.resolveDevice ?? decoratorDeviceResolver();
   const compareRoutes = createCompareRoutes(options);
-  const syncRoutes = options.sync === undefined ? undefined : createSyncRoutes(options.sync);
+  // The import's answers ride Push with the import's own key: one key mints and finds every copy.
+  const imports = options.import === undefined ? undefined : createImportHooks(options.import.occIdKey);
+  const syncRoutes = options.sync === undefined ? undefined : createSyncRoutes({ ...(imports !== undefined ? { imports } : {}), ...options.sync });
   const catalogRoutes = options.catalog === undefined ? undefined : createCatalogRoutes(options.catalog);
   const importRoutes = options.import === undefined ? undefined : createImportRoutes(options.import);
 

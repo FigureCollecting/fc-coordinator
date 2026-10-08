@@ -408,10 +408,17 @@ describe('Push', () => {
     expect(new Set(edits.map(([key]) => parseUserFacetKey(key)?.family))).toEqual(new Set(USER_FACET_FAMILIES));
     const events = edits.map(([key, body], i) => upsert(key, mint(caller, i), JSON.stringify({ ...body, ...DISPLAY })));
     const res = ok(await caller.push({ clientId: randomUUID(), events }));
-    expect(res.results.map((r) => [r.facetKey, r.outcome, r.reason])).toEqual(events.map((e) => [e.facetKey, PushOutcome.APPLIED, '']));
+    // An answer is the import's to accept: naming no pending item it is STALE, and writes nothing
+    // (import.proto ITEMS AND ANSWERS; accepted answers are test/import/reimport.test.ts's).
+    const answered = (key: string) => key.startsWith('res/');
+    expect(res.results.map((r) => [r.facetKey, r.outcome, r.reason])).toEqual(
+      events.map((e) => [e.facetKey, answered(e.facetKey) ? PushOutcome.STALE : PushOutcome.APPLIED, '']),
+    );
 
     const feed = await drain(caller);
-    expect(feed.events.map((e) => [e.facetKey, e.version, e.payload])).toEqual(events.map((e) => [e.facetKey, e.version, e.payload]));
+    expect(feed.events.map((e) => [e.facetKey, e.version, e.payload])).toEqual(
+      events.filter((e) => !answered(e.facetKey)).map((e) => [e.facetKey, e.version, e.payload]),
+    );
   });
 
   it('refuses a retired holding/* key with no current, and leaves a stored 0.2.x row inert', async () => {
