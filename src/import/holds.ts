@@ -25,6 +25,10 @@
 // kept with its basis (held_edit) and answered HELD with `current`; the held-edit card that shows
 // and answers it is not built yet, though StatusResponse.pending_review counts it.
 //
+// Not late, as in WK-14a: an edit to a figure an import framed without settling it (a marker-only
+// re-import, a conflict it only raised). LWW places it, so one that would have settled the
+// conflict, replayed before that import, leaves the item pending.
+//
 // Units: one push's edits to one copy's head, status, collection and disposal are one unit; every
 // other edit is a unit with the push's other edits of its key. A unit is held or replayed whole.
 import { SERVER_DEVICE_ID, canonicalVersion, compareVersion, parseUserFacetKey } from '@figurecollecting/fc-api-contract';
@@ -297,28 +301,23 @@ async function replayFigure(
   const recorded = await readLateEdits(tx, userId, S);
 
   const stale = new Set<number>();
+  // The keys an earlier frame's decision wrote: a late edit there is replaced, and placed before no later import.
+  const overwritten = new Set<string>();
   for (const f of settled) {
     const frame: Frame = { importNumber: f.importNumber, exportDate: f.exportDate, before: f.before! };
-    const here = late.filter((e) => e.basisSeq < f.marker);
-    // A late edit an earlier import (or answer, or revision) wrote over since its basis is replaced there.
-    const { rows: over } = await tx.query<{ facet_key: string; version: string; seq: string }>(
-      'SELECT facet_key, version, seq FROM feed_event WHERE user_id = $1 AND facet_key = ANY($2::text[]) AND seq > $3 AND seq < $4',
-      [userId, unique(here.map(keyOf)), minBasis.toString(), f.start.toString()],
-    );
-    const surviving = here.filter((e) => !over.some((o) => o.facet_key === e.facetKey && BigInt(o.seq) > e.basisSeq && isServerVersion(o.version)));
+    const here = late.filter((e) => e.basisSeq < f.marker && !overwritten.has(e.facetKey));
     const placedBefore = recorded.filter((r) => r.importNumber <= f.importNumber).map((r) => r.facet);
     const occs = unique([...f.before!.occs, ...occsOf(here), ...occsOf(placedBefore)]);
     const pre = await facetsBefore(tx, userId, unique([...figureKeys(S, occs), ...here.map(keyOf), ...placedBefore.map(keyOf)]), f.start);
     const as = decideAgain(frame, S, pre, placedBefore, occId);
-    const again = decideAgain(frame, S, pre, [...placedBefore, ...surviving], occId);
+    const again = decideAgain(frame, S, pre, [...placedBefore, ...here], occId);
     if (!sameDecision(as, again)) {
       // A revision is built for one import whose figure nothing else touched since.
       if (settled.length > 1 || knowing) return HOLD;
-      return reviseOrHold(tx, userId, S, f, frame, late, surviving, placedBefore, recorded, pre, again);
+      return reviseOrHold(tx, userId, S, f, frame, late, placedBefore, recorded, pre, again);
     }
-    const written = new Set(again.writes.map((w) => w.facetKey));
-    for (const e of surviving) if (written.has(e.facetKey)) stale.add(e.index);
-    for (const e of here) if (!surviving.includes(e)) stale.add(e.index);
+    for (const w of again.writes) overwritten.add(w.facetKey);
+    for (const e of here) if (overwritten.has(e.facetKey)) stale.add(e.index);
   }
   return { kind: 'unchanged', stale };
 }
@@ -335,7 +334,6 @@ async function reviseOrHold(
   f: FrameRow,
   frame: Frame,
   late: readonly PushedEdit[],
-  surviving: readonly PushedEdit[],
   placedBefore: readonly Facet[],
   recorded: readonly Recorded[],
   pre: ReadonlyMap<string, Facet>,
@@ -363,7 +361,7 @@ async function reviseOrHold(
     kind: 'revise',
     write: async (feed) => {
       // S replayed: its facets just before the import, every late edit for it placed, then the import's decision.
-      const replay = placeEdits(pre, [...placedBefore, ...surviving]);
+      const replay = placeEdits(pre, [...placedBefore, ...late]);
       for (const w of again.writes) replay.set(w.facetKey, { facetKey: w.facetKey, version: '', op: w.op, payload: w.payload });
       const lateKeys = unique(late.map(keyOf));
       const all = unique([...lateKeys, ...again.writes.map((w) => w.facetKey), ...[...keys].sort(bytewise)]);
@@ -374,14 +372,14 @@ async function reviseOrHold(
         const now = current.get(key);
         // The origin is server-owned: never tombstoned, even for a copy the replay does not create.
         if (sameValue(value, now) || (value === undefined && key.endsWith('/origin'))) continue;
-        const mine = surviving.find((e) => e.facetKey === key && e.version === value?.version);
+        const mine = late.find((e) => e.facetKey === key && e.version === value?.version);
         if (mine !== undefined && (now === undefined || compareVersion(mine.version, now.version) > 0)) {
           await applyEvent(tx, userId, { facetKey: key, version: mine.version, op: mine.op, payload: mine.payload }, feed);
         } else {
           await applyEvent(tx, userId, { facetKey: key, op: value?.op ?? 'delete', payload: value?.payload ?? '', version: writeVersion(version, now?.version) }, feed);
         }
       }
-      await moveBases(tx, userId, S, f.importNumber, b, occs, again, [...placedBefore, ...surviving]);
+      await moveBases(tx, userId, S, f.importNumber, b, occs, again, [...placedBefore, ...late]);
 
       // What the revision changed of S's live copies and items, the late edits' own writes left out.
       const after = new Map(replay);
@@ -402,7 +400,7 @@ async function reviseOrHold(
           JSON.stringify(changed),
         ]);
       }
-      return new Map(late.map((e): [number, LateOutcome] => [e.index, surviving.includes(e) && replay.get(e.facetKey)?.version === e.version ? 'applied' : 'stale']));
+      return new Map(late.map((e): [number, LateOutcome] => [e.index, replay.get(e.facetKey)?.version === e.version ? 'applied' : 'stale']));
     },
   };
 }

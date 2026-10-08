@@ -176,13 +176,15 @@ describe('summarize: S\'s live copies and items', () => {
         ...copy(O1, 'owned'),
         ...copy(O2, 'former'),
         ...copy(O3, 'wished', undefined, T),
+        // A status pushed before its copy's head: on no figure, so out.
+        up('occ/05000000-0000-4000-8000-000000000005/status', { status: 'owned', ...SHOWN }),
         up(`imp/mfc/change/${S}`, { rev: 'i2.c' }),
         { facetKey: `imp/mfc/figure/${S}`, version: V1, op: 'delete', payload: '' },
       ),
-      [O1, O2, O3, '04000000-0000-4000-8000-000000000004'],
+      [O1, O2, O3, '04000000-0000-4000-8000-000000000004', '05000000-0000-4000-8000-000000000005'],
     );
     expect(s).toEqual({
-      copies: { [O1]: `${S}/owned`, [O2]: 'out', [O3]: `${T}/wished`, '04000000-0000-4000-8000-000000000004': 'out' },
+      copies: { [O1]: `${S}/owned`, [O2]: 'out', [O3]: `${T}/wished`, '04000000-0000-4000-8000-000000000004': 'out', '05000000-0000-4000-8000-000000000005': 'out' },
       items: { figure: null, change: 'i2.c' },
     });
   });
