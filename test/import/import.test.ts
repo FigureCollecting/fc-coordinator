@@ -701,6 +701,48 @@ describe('the pending count and the spine', () => {
     expect(relisted.rev).not.toBe(rev);
   });
 
+  it('counts no item answered take or per_copy either, and an answer to an old rev does not cover the same MFC value returning', async () => {
+    const a = await SyncCaller.enrol(h);
+    const s = await SyncCaller.sibling(h, a);
+    const [x, y, z] = [nextId(), nextId(), nextId()];
+    let n = 10;
+    const version = (c: SyncCaller) => canonicalVersion({ instant: new Date(), counter: (n += 1), deviceId: c.deviceId });
+    const before = (i: number) => canonicalVersion({ instant: new Date(Date.now() - 1000), counter: i, deviceId: a.deviceId });
+    const note = (id: string, i: number) => ({ facetKey: `uf/${headFor(id)}/note`, version: before(i), op: SyncOp.UPSERT, payload: JSON.stringify({ note: 'app: boxed', ...DISPLAY }), basis: '' });
+    ok(await a.push({ clientId: randomUUID(), events: [note(x, 1), note(y, 2), note(z, 3)] }));
+    const csv = (value: string) => mfcCsv([x, y, z].map((id) => row(id, 'Owned', { note: value })));
+
+    const first = ok(await a.importMfcExport({ csvText: csv('mfc: loose'), exportDate: EXPORT_DATE }));
+    expect(first).toMatchObject({ conflictsRaised: 3, conflictsPending: 3 });
+    const revOf = (r: ImportMfcExportResponse, id: string) => r.review.flatMap((g) => g.items).find((i) => i.headId === headFor(id))!.rev;
+    const { cursor } = await drain(s);
+
+    // x is answered take, y per_copy, from another device of the user; z is answered keep, then MFC changes and changes back.
+    const answer = (c: SyncCaller, id: string, body: object) => ({ facetKey: `res/mfc/${headFor(id)}`, version: version(c), op: SyncOp.UPSERT, payload: JSON.stringify({ ...body, ...DISPLAY }), basis: cursor });
+    const pushed = ok(
+      await s.push({
+        clientId: randomUUID(),
+        events: [
+          answer(s, x, { item: 'figure', rev: revOf(first, x), choice: 'take' }),
+          answer(s, y, { item: 'figure', rev: revOf(first, y), choice: 'per_copy', copies: [] }),
+          answer(s, z, { item: 'figure', rev: revOf(first, z), choice: 'keep' }),
+        ],
+      }),
+    );
+    expect(pushed.results.map((r) => r.outcome)).toEqual([PushOutcome.APPLIED, PushOutcome.APPLIED, PushOutcome.APPLIED]);
+
+    const again = ok(await a.importMfcExport({ csvText: csv('mfc: loose'), exportDate: EXPORT_DATE }));
+    expect(again).toMatchObject({ conflictsRaised: 0, conflictsPending: 0, review: [] });
+
+    // MFC's value on z changes and then returns to the one the answer was given on: a new import's rev, not covered by the old answer.
+    const changed = ok(await a.importMfcExport({ csvText: mfcCsv([row(z, 'Owned', { note: 'mfc: repainted' })]), exportDate: EXPORT_DATE }));
+    expect(changed).toMatchObject({ conflictsRaised: 1, conflictsPending: 1 });
+    const back = ok(await a.importMfcExport({ csvText: mfcCsv([row(z, 'Owned', { note: 'mfc: loose' })]), exportDate: EXPORT_DATE }));
+    expect(back).toMatchObject({ conflictsRaised: 1, conflictsPending: 1 });
+    expect(revOf(back, z)).not.toBe(revOf(first, z));
+    expect(revOf(back, z).split('.')[1]).toBe(revOf(first, z).split('.')[1]);
+  });
+
   it('imports a header-only export with no spine configured, and answers UNAVAILABLE once there are ids to resolve', async () => {
     const bare = await startSyncApp(db.app, h.issuer, undefined, undefined, { import: { db: db.app, spineRead: null, occIdKey: KEY } });
     try {
