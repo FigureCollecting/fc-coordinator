@@ -133,6 +133,9 @@ export function decideAgain(frame: Frame, S: string, pre: ReadonlyMap<string, Fa
 /**
  * Whether two decisions of one figure are the same: the same writes, bases and keeps, and the same
  * items by rev. A figure item that only shows the app's side anew is the same item.
+ * The replay compares two decisions of one frame and one export, which differ only in the app's
+ * side: the rows gone, the field bases and the item ended then differ only where one decision is
+ * a conflict and the other not, and so do the items set. They are compared all the same.
  */
 export function sameDecision(a: Plan, b: Plan): boolean {
   const of = (p: Plan) =>
