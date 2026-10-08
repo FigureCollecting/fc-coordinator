@@ -20,6 +20,8 @@ type Value = number | string;
 type Counts = Record<Kind, number>;
 
 export const FIGURE_ITEM_PREFIX = 'imp/mfc/figure/';
+/** res/mfc/{head_id}: the user's answer to one of the figure's items, synced through Push. */
+export const ANSWER_PREFIX = 'res/mfc/';
 
 /** A resolved MFC row: its canonical id, the spine head it names, and what it states. */
 export interface Row {
@@ -57,7 +59,7 @@ export interface FigureItem {
 }
 
 export interface ImportState {
-  /** The user's facets an import reads: occ/*, uf/* and imp/mfc/figure/*, tombstones included. */
+  /** The user's facets an import reads: occ/*, uf/*, imp/mfc/figure/* and res/mfc/*, tombstones included. */
   facets: ReadonlyMap<string, Facet>;
   rowBases: ReadonlyMap<string, Row>;
   copyBases: ReadonlyMap<string, CopyBase>;
@@ -289,6 +291,15 @@ function decideNew(v: View, S: string, exp: readonly Row[], occId: PlanInput['oc
   return { ops, comps, M };
 }
 
+/** An answer to the item, naming its rev, has synced (import.proto ITEMS AND ANSWERS): it is not pending. */
+function answered(st: ImportState, item: FigureItem): boolean {
+  const res = st.facets.get(`${ANSWER_PREFIX}${item.head}`);
+  if (res?.op !== 'upsert') return false;
+  // Every stored res payload has passed res-answer.schema.json.
+  const answer = JSON.parse(res.payload) as { item: string; rev: string };
+  return answer.item === 'figure' && answer.rev === item.rev;
+}
+
 const sameRow = (a: Row | undefined, b: Row): boolean =>
   a !== undefined && a.head === b.head && a.kind === b.kind && a.count === b.count && stable(a.fields) === stable(b.fields);
 
@@ -383,10 +394,12 @@ export function planImport(input: PlanInput): Plan {
     plan.rowBases.push(...exp);
   }
 
-  // Pending after the import: the items this import kept or raised, and every other one standing.
+  // Pending after the import: the items this import kept or raised, and every other one standing,
+  // but one whose answer has synced. The item stays, so the same export finds its rev unchanged.
   const decided = new Set(plan.figures);
   const written = new Map(plan.writes.map((w) => [w.facetKey, w.payload]));
-  for (const item of [...st.items.values()].filter((i) => !decided.has(i.head)).concat(plan.items.set).sort((a, b) => bytewise(a.head, b.head))) {
+  const standing = [...st.items.values()].filter((i) => !decided.has(i.head));
+  for (const item of standing.concat(plan.items.set).filter((i) => !answered(st, i)).sort((a, b) => bytewise(a.head, b.head))) {
     const facetKey = `${FIGURE_ITEM_PREFIX}${item.head}`;
     plan.pending.push({ head: item.head, rev: item.rev, payload: written.get(facetKey) ?? st.facets.get(facetKey)!.payload });
   }

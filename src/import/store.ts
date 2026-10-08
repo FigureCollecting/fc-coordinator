@@ -14,7 +14,7 @@ interface FacetRow {
 export async function readImportState(tx: SqlClient, userId: string): Promise<ImportState> {
   const facets = await tx.query<FacetRow>(
     `SELECT facet_key, version, op, payload FROM facet_state
-      WHERE user_id = $1 AND (facet_key LIKE 'occ/%' OR facet_key LIKE 'uf/%' OR facet_key LIKE 'imp/mfc/figure/%')`,
+      WHERE user_id = $1 AND (facet_key LIKE 'occ/%' OR facet_key LIKE 'uf/%' OR facet_key LIKE 'imp/mfc/figure/%' OR facet_key LIKE 'res/mfc/%')`,
     [userId],
   );
   const rowBases = await tx.query<{ mfc_id: string; head_id: string; kind: Row['kind']; count: number; fields: Row['fields'] }>(

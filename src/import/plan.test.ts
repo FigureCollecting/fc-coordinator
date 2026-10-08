@@ -244,6 +244,55 @@ describe('planImport: conflicts (GR-Q1: surfaced, never written over)', () => {
     expect(p.pending[1]!.payload).toBe(earlier.writes[0]!.payload);
   });
 
+  it('lists no item whose answer naming it (res/mfc/{head}: figure, its rev) has synced, decided now or standing', () => {
+    const earlier = plan(state([up(`uf/${S2}/score`, { score: 9, ...SHOWN })]), [row('120', S2, 'owned', 0, { score: 7 })]);
+    const standing = earlier.items.set[0]!;
+    const first = plan(state([up(`uf/${S1}/score`, { score: 9, ...SHOWN })]), [row('119', S1, 'owned', 0, { score: 7 })]);
+    const raised = first.items.set[0]!;
+    const items = new Map([
+      [S1, raised],
+      [S2, standing],
+    ]);
+    const facets = [
+      up(`uf/${S1}/score`, { score: 9, ...SHOWN }),
+      { facetKey: `imp/mfc/figure/${S1}`, version: V, op: 'upsert' as const, payload: first.writes[0]!.payload },
+      { facetKey: `imp/mfc/figure/${S2}`, version: V, op: 'upsert' as const, payload: earlier.writes[0]!.payload },
+    ];
+    const answer = (head: string, item: string, rev: string) => up(`res/mfc/${head}`, { item, rev, choice: 'keep', ...SHOWN });
+    const pendingWith = (answers: Facet[]) =>
+      plan(state([...facets, ...answers], { items }), [row('119', S1, 'owned', 0, { score: 7 })], { importNumber: 2 }).pending.map((i) => i.head);
+
+    expect(pendingWith([])).toEqual([S1, S2]);
+    expect(pendingWith([answer(S1, 'figure', raised.rev), answer(S2, 'figure', standing.rev)])).toEqual([]);
+    // Not an answer to the pending item: another rev, another item of the figure, or one taken back.
+    expect(pendingWith([answer(S1, 'figure', 'i9.other'), answer(S2, 'held', standing.rev)])).toEqual([S1, S2]);
+    expect(pendingWith([gone(`res/mfc/${S1}`), answer(`${S2}x`, 'figure', standing.rev)])).toEqual([S1, S2]);
+  });
+
+  it('counts an answer of any choice, and one naming the same MFC side from another import is not an answer to this rev', () => {
+    const earlier = plan(state([up(`uf/${S2}/score`, { score: 9, ...SHOWN })]), [row('120', S2, 'owned', 0, { score: 7 })]);
+    const standing = earlier.items.set[0]!;
+    const first = plan(state([up(`uf/${S1}/score`, { score: 9, ...SHOWN })]), [row('119', S1, 'owned', 0, { score: 7 })]);
+    const raised = first.items.set[0]!;
+    const facets = [
+      up(`uf/${S1}/score`, { score: 9, ...SHOWN }),
+      { facetKey: `imp/mfc/figure/${S1}`, version: V, op: 'upsert' as const, payload: first.writes[0]!.payload },
+      { facetKey: `imp/mfc/figure/${S2}`, version: V, op: 'upsert' as const, payload: earlier.writes[0]!.payload },
+    ];
+    const items = new Map([
+      [S1, raised],
+      [S2, standing],
+    ]);
+    const pendingWith = (answers: Facet[]) =>
+      plan(state([...facets, ...answers], { items }), [row('119', S1, 'owned', 0, { score: 7 })], { importNumber: 2 }).pending.map((i) => i.head);
+    const answer = (head: string, rev: string, body: object) => up(`res/mfc/${head}`, { item: 'figure', rev, ...body, ...SHOWN });
+
+    expect(pendingWith([answer(S1, raised.rev, { choice: 'take' }), answer(S2, standing.rev, { choice: 'per_copy', copies: [] })])).toEqual([]);
+    // The same MFC side raised by another import is another rev: the answer to it does not cover this one.
+    const sameSide = (rev: string) => `i9.${rev.split('.')[1]}`;
+    expect(pendingWith([answer(S1, sameSide(raised.rev), { choice: 'keep' }), answer(S2, sameSide(standing.rev), { choice: 'take' })])).toEqual([S1, S2]);
+  });
+
   it('records with a conflict what it found of the counts: alike, matched with app-only copies, or MFC\'s alone', () => {
     const disputed = (copies: Facet[], count: number) =>
       plan(state([...copies, up(`uf/${S1}/score`, { score: 9, ...SHOWN })]), [row('119', S1, 'owned', count, { score: 7 })]).items.set[0]!.comps.counts;
