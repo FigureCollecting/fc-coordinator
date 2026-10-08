@@ -439,9 +439,10 @@ describe('answers to an item, synced through Push (import.proto ITEMS AND ANSWER
 
     const res = await pushed(a, [
       answer(a, headFor(x), { item: 'change', rev: chX!.rev, choice: 'undo' }, sold),
+      answer(a, headFor(y), { item: 'change', rev: `${chY!.rev}x`, choice: 'dismiss' }, sold),
       answer(a, headFor(y), { item: 'change', rev: chY!.rev, choice: 'dismiss' }, sold),
     ]);
-    expect(res.results.map((r) => r.outcome)).toEqual([PushOutcome.STALE, PushOutcome.APPLIED]);
+    expect(res.results.map((r) => r.outcome)).toEqual([PushOutcome.STALE, PushOutcome.STALE, PushOutcome.APPLIED]);
     const { events } = await drain(a, sold);
     expect(shape(events, { [headFor(y)]: 'HY' })).toEqual([
       ['res/mfc/HY', 'UPSERT'],
@@ -496,6 +497,32 @@ describe('answers: the edges', () => {
       ['res/mfc/HX', 'UPSERT'],
       ['occ/C1/status', 'DELETE'],
       ['uf/HX/note', 'UPSERT'],
+      ['imp/mfc/figure/HX', 'DELETE'],
+    ]);
+  });
+
+  it('per_copy writes nothing for a copy now on another figure, nor for a figure value the rev did not dispute', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, w] = [nextId(), nextId()];
+    const c1 = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned', { score: '7/10', note: 'first' })]);
+    const { cursor } = await drain(a);
+    // The app scores it, rewrites its note, and moves its copy to another figure.
+    await pushed(a, [
+      edit(a, `uf/${headFor(x)}/score`, { score: 9 }, cursor),
+      edit(a, `uf/${headFor(x)}/note`, { note: 'mine' }, cursor),
+      edit(a, `occ/${c1}/head`, { head_id: headFor(w) }, cursor),
+    ]);
+    const b = await imported(a, [row(x, 'Owned', { score: '8/10', note: 'first' })], DATE_B);
+    const item = b.review[0]!.items[0]!;
+    expect(JSON.parse(item.payload)).toMatchObject({ fields: { score: { status: 'conflict' }, note: { status: 'nochange' } } });
+    const { cursor: seen } = await drain(a);
+    const res = await pushed(a, [
+      answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'per_copy', copies: [{ occ: c1, status: 'wished' }], fields: { note: 'mfc' } }, seen),
+    ]);
+    expect(res.results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(shape((await drain(a, seen)).events, { [headFor(x)]: 'HX' })).toEqual([
+      ['res/mfc/HX', 'UPSERT'],
       ['imp/mfc/figure/HX', 'DELETE'],
     ]);
   });
@@ -631,6 +658,10 @@ describe('answers: the edges', () => {
     ]);
 
     const { cursor: answered } = await drain(a, seen);
+    // An edit LWW answers STALE changes nothing, so it ends no keep.
+    const stale = { ...edit(a, `occ/${removed[0]}/status`, null, answered), version: canonicalVersion({ instant: new Date(Date.now() - 3_600_000), counter: 1, deviceId: a.deviceId }) };
+    expect((await pushed(a, [stale])).results[0]!.outcome).toBe(PushOutcome.STALE);
+    expect(await kept()).toEqual(removed);
     // One removed by hand ends its keep; the other re-stated at its kind keeps it.
     await pushed(a, [edit(a, `occ/${removed[0]}/status`, null, answered), edit(a, `occ/${removed[1]}/status`, { status: 'owned' }, answered)]);
     expect(await kept()).toEqual([removed[1]]);

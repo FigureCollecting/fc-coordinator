@@ -505,9 +505,11 @@ describe('planImport: WK-14b, a settled figure', () => {
     const equal = plan(settled(base, facets, { kept, fieldBases: new Map([[S1, new Map([['note', 'a']])]]) }), [row('1', S1, 'owned', 1, { note: 'b' })], { importNumber: 2 });
     expect(equal.conflicted).toEqual([S1]);
     expect(equal.keptGone).toEqual([APP_A]);
-    const differs = plan(settled(base, facets, { kept, fieldBases: new Map([[S1, new Map([['note', 'a']])]]) }), [row('1', S1, 'owned', 0, { note: 'b' })], { importNumber: 2 });
-    expect(differs.conflicted).toEqual([S1]);
-    expect(differs.keptGone).toEqual([]);
+    for (const count of [0, 2]) {
+      const differs = plan(settled(base, facets, { kept, fieldBases: new Map([[S1, new Map([['note', 'a']])]]) }), [row('1', S1, 'owned', count, { note: 'b' })], { importNumber: 2 });
+      expect(differs.conflicted).toEqual([S1]);
+      expect(differs.keptGone).toEqual([]);
+    }
   });
 
   it('ends a knowing keep whose copy MFC counts again, or that left the kind it was kept at', () => {
@@ -530,5 +532,18 @@ describe('planImport: WK-14b, a settled figure', () => {
     const st = settled(base, facets, { copyBases: new Map([[APP_A, { head: S3, kind: 'owned' as const, removed: false }]]) });
     const p = plan(st, [row('1', S3, 'owned', 0), row('2', S1, 'owned', 1)], { importNumber: 2 });
     expect(p.copyBases.get(APP_A)).toEqual({ head: S1, kind: 'owned', removed: false });
+  });
+
+  it('counts as moved a figure whose decision only created copies, and as removed only a dropped row whose figure lost a copy', () => {
+    const base = [row('1', S1, 'owned'), row('2', S1, 'owned', 0), row('3', S2, 'owned')];
+    const facets = [...appCopy(occ('1', 1), S1, 'owned', { native_id: '1', ordinal: 1 }), ...appCopy(occ('3', 1), S2, 'owned', { native_id: '3', ordinal: 1 })];
+    const copyBases = new Map([
+      [occ('1', 1), { head: S1, kind: 'owned' as const, removed: false }],
+      [occ('3', 1), { head: S2, kind: 'owned' as const, removed: false }],
+    ]);
+    // S1: row 2 (at Count 0) dropped, no copy written; S2: its Count raised, one copy created.
+    const p = plan(settled(base, facets, { copyBases }), [row('1', S1, 'owned'), row('3', S2, 'owned', 2)], { importNumber: 2 });
+    expect(p.stats).toMatchObject({ moved: 1, unchanged: 1, removed: 0, occurrencesAdded: 1 });
+    expect(p.rowBasesGone).toEqual(['2']);
   });
 });

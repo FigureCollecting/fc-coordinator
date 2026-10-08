@@ -4,7 +4,8 @@
 // and holds it only in the cases HELD (i) to (iv) list; 14a has no replay, so it holds every late
 // edit instead of letting LWW drop it as STALE or write it over the import's decision. A held
 // edit is kept with its basis (held_edit) and answered HELD with `current`; the held-edit card,
-// its answers and the replay are WK-14b's. Until then a held edit is invisible to its user.
+// its answers and the replay are not built yet (WK-14b left them out). Until then a held edit is
+// invisible to its user, though StatusResponse.pending_review counts it.
 //
 // Held only for a SETTLED frame: one whose import wrote to the figure or moved a copy or field
 // base of it. Where an import did neither (a marker-only re-import, a figure it only raised a

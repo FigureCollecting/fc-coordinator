@@ -3,7 +3,7 @@
 // figure (import.proto MATERIALIZE, ITEMS AND ANSWERS).
 import { describe, expect, it } from 'vitest';
 import type { Facet } from '../sync/store.js';
-import { decide, emptyEffect, finalKinds, keepEffect, realign, takeEffect, transitionsOf, View, type CopyBase, type FigureState, type Row } from './figure.js';
+import { decide, emptyEffect, finalKinds, keepEffect, keptByAnswer, keptEndedByRealign, realign, takeEffect, transitionsOf, View, type Comps, type CopyBase, type FigureState, type Row } from './figure.js';
 
 const S = '10000000-0000-4000-8000-000000000001';
 const O1 = '01000000-0000-4000-8000-000000000001';
@@ -46,6 +46,11 @@ describe('transitionsOf', () => {
     expect(transitionsOf({ owned: 0, ordered: 1, wished: 0 }, { owned: 1, ordered: 0, wished: 1 })).toEqual([
       ['wished', 'ordered'],
       ['owned', 'out'],
+    ]);
+    // A wished copy goes to ordered before one goes to owned.
+    expect(transitionsOf({ owned: 1, ordered: 1, wished: 0 }, { owned: 0, ordered: 0, wished: 1 })).toEqual([
+      ['wished', 'ordered'],
+      ['out', 'owned'],
     ]);
     expect(transitionsOf({ owned: 0, ordered: 0, wished: 2 }, { owned: 1, ordered: 0, wished: 0 })).toEqual([
       ['owned', 'out'],
@@ -170,5 +175,95 @@ describe('realign and finalKinds', () => {
       ['note', 'n'],
       ['wishability', null],
     ]);
+  });
+});
+
+const comps = (counts: string, fields: Partial<Comps> = {}): Comps => ({ counts, score: 'nochange', note: 'nochange', wishability: 'nochange', details: {}, ...fields });
+const O4 = '04000000-0000-4000-8000-000000000004';
+
+describe('decide: which copy MATERIALIZE takes', () => {
+  it('removes a copy with an origin before a higher one without', () => {
+    const v = view([...copy(O1, 'owned', 1), ...copy(O3, 'owned')], [[O1, based('owned')], [O3, based('owned')]], [row(2)]);
+    expect([...decide(v, S, [row(1)], [row(2)], occId).counts.statuses]).toEqual([[O1, null]]);
+  });
+
+  it('pairs an app change only with an MFC change of the same from and to: a wished copy sold is no owned one removed', () => {
+    const v = view([...copy(O1, 'owned', 1), ...copy(O2, null)], [[O1, based('owned')], [O2, based('wished')]], [row(1), row(1, 'wished', {}, '120')]);
+    const d = decide(v, S, [row(0), row(1, 'wished', {}, '120')], [row(1), row(1, 'wished', {}, '120')], occId);
+    expect(d.comps.counts).toBe('apply');
+    expect([...d.counts.statuses]).toEqual([[O1, null]]);
+  });
+
+  it('restores no copy an import removed that the app has changed since, nor one the app moved to another figure', () => {
+    const elsewhere = '20000000-0000-4000-8000-000000000002';
+    // O1: removed by an import, re-added and removed again by the app (its base is wished now);
+    // O2: removed by an import, then moved by the app to another figure. MFC raises the Count.
+    const v = view([...copy(O1, null, 1), ...copy(O2, null, 2, elsewhere)], [[O1, based('wished', true)], [O2, based('out', true)]], [row(0), row(1, 'wished', {}, '120')]);
+    const d = decide(v, S, [row(1), row(1, 'wished', {}, '120')], [row(0), row(1, 'wished', {}, '120')], occId);
+    expect(d.comps.counts).toBe('apply');
+    expect([...d.counts.statuses]).toEqual([]);
+    expect(d.counts.created.map((c) => c.ordinal)).toEqual([3]);
+  });
+
+  it('names for a keep only the removals to out, not a copy the same decision would restore at another kind', () => {
+    // MFC moved its row from owned to wished; the app added an owned copy of its own: a conflict.
+    const v = view([...copy(O1, 'owned', 1), ...copy(O4, 'owned')], [[O1, based('owned')]], [row(1)]);
+    const d = decide(v, S, [row(1, 'wished')], [row(1)], occId);
+    expect(d.comps.counts).toBe('conflict');
+    expect(d.removals).toEqual([O1]);
+  });
+});
+
+describe('takeEffect: which copies it changes', () => {
+  it('converts no copy into a kind MFC already has enough of: it removes the extra one instead', () => {
+    const v = view([...copy(O1, 'ordered', 1), ...copy(O2, 'owned', 2)], [[O1, based('ordered')], [O2, based('owned')]], [row(1, 'ordered'), row(1, 'owned', {}, '120')]);
+    expect([...takeEffect(v, S, [row(0, 'ordered'), row(1, 'owned', {}, '120')], comps('conflict'), occId).statuses]).toEqual([[O1, null]]);
+  });
+
+  it('removes the highest tracked copy with an origin', () => {
+    const v = view([...copy(O1, 'owned', 1), ...copy(O2, 'owned', 2)], [[O1, based('owned')], [O2, based('owned')]], [row(2)]);
+    expect([...takeEffect(v, S, [row(1)], comps('conflict'), occId).statuses]).toEqual([[O2, null]]);
+  });
+
+  it('restores a tracked copy whose base is another kind before it makes a new one', () => {
+    const v = view(copy(O1, 'former', 1), [[O1, based('ordered')]], [row(1, 'ordered')]);
+    const e = takeEffect(v, S, [row(1)], comps('conflict'), occId);
+    expect([...e.statuses]).toEqual([[O1, 'owned']]);
+    expect(e.created).toEqual([]);
+  });
+
+  it('never changes a copy with no base that no import removed: a hand copy the app sold stays sold', () => {
+    const v = view(copy(O1, 'former'));
+    const e = takeEffect(v, S, [row(1)], comps('conflict'), occId);
+    expect([...e.statuses]).toEqual([]);
+    expect(e.created.map((c) => c.ordinal)).toEqual([1]);
+  });
+});
+
+describe('the knowing keeps an answer adds and ends', () => {
+  const final = new Map<string, 'owned' | 'out'>([
+    [O1, 'owned'],
+    [O2, 'out'],
+  ]);
+
+  it('keep and per_copy on a rev that found the counts disputed or MFC\'s alone keep each removal they leave live; take keeps none', () => {
+    expect([...keptByAnswer('keep', comps('conflict'), [O1, O2], final)]).toEqual([[O1, 'owned']]);
+    expect([...keptByAnswer('per_copy', comps('apply'), [O1], final)]).toEqual([[O1, 'owned']]);
+    expect([...keptByAnswer('take', comps('conflict'), [O1], final)]).toEqual([]);
+    expect([...keptByAnswer('keep', comps('nochange'), [O1], final)]).toEqual([]);
+    expect([...keptByAnswer('keep', comps('alike'), [O1], final)]).toEqual([]);
+  });
+
+  it('ends a keep whose copy left its kind, or that REALIGN gives a live base', () => {
+    const kept = new Map([
+      [O1, { kind: 'owned' as const }],
+      [O2, { kind: 'owned' as const }],
+      [O3, { kind: 'owned' as const }],
+    ]);
+    const bases = new Map([
+      [O1, based('out')],
+      [O3, based('owned')],
+    ]);
+    expect(keptEndedByRealign(kept, new Map([...final, [O3, 'owned']]), bases)).toEqual([O2, O3]);
   });
 });

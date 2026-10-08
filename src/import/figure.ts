@@ -300,9 +300,10 @@ function materialize(v: View, S: string, exp: readonly Row[], B: Counts, Lm: rea
 
   for (const [x, y] of Lm) {
     if (x !== OUT && y !== OUT) {
+      // A placeholder of x becomes one of y: nothing is written, and nothing is recorded, since
+      // placeholders are the row bases' Counts beyond the copies based on them.
       if (P[x] > 0) {
         P[x] -= 1;
-        P[y] += 1;
         continue;
       }
       // MATCHING leaves one: every copy based x that the app changed is paired (an unpaired one
@@ -466,10 +467,33 @@ export function decide(v: View, S: string, exp: readonly Row[], baseRows: readon
  * MFC changed is applied where, decided again now (`d`), it is still MFC's change alone.
  */
 export function keepEffect(found: Comps, d: Decision): Effect {
+  // A part decided again writes only where it is still MFC's alone: the counts write only when
+  // they apply, a field only when the app still holds its base (alike moves the base alone).
   const parts: Effect[] = [];
-  if (found.counts === 'apply' && d.comps.counts === 'apply') parts.push(d.counts);
-  for (const f of FIELDS) if (found[f] === 'apply' && d.comps[f] === 'apply') parts.push(d.fields.get(f)!);
+  if (found.counts === 'apply') parts.push(d.counts);
+  for (const f of FIELDS) if (found[f] === 'apply' && d.fields.has(f)) parts.push(d.fields.get(f)!);
   return mergeEffects(...parts);
+}
+
+/**
+ * A KNOWING KEEP by an answer (import.proto A COPY KEPT AGAINST MFC'S REMOVAL): a keep or per_copy
+ * on a rev that found the counts disputed or changed by MFC alone keeps each copy MATERIALIZE would
+ * remove for MFC's unmatched transitions to out (`removals`) that the answer leaves live, at the
+ * kind it leaves it. A take keeps none.
+ */
+export function keptByAnswer(choice: string, found: Comps, removals: readonly string[], final: ReadonlyMap<string, KindOrOut>): Map<string, Kind> {
+  const kept = new Map<string, Kind>();
+  if (choice === 'take' || (found.counts !== 'conflict' && found.counts !== 'apply')) return kept;
+  for (const c of removals) {
+    const k = final.get(c);
+    if (k !== undefined && k !== OUT) kept.set(c, k);
+  }
+  return kept;
+}
+
+/** The knowing keeps an answer's REALIGN ends: a copy no longer live at its kind, or one MFC counts again (a live base). */
+export function keptEndedByRealign(kept: ReadonlyMap<string, { kind: Kind }>, final: ReadonlyMap<string, KindOrOut>, bases: ReadonlyMap<string, CopyBase>): string[] {
+  return [...kept].filter(([c, k]) => final.get(c) !== k.kind || bases.get(c)?.kind !== OUT).map(([c]) => c);
 }
 
 /** The conversions take makes, arrivals first. */

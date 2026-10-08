@@ -19,7 +19,7 @@
 // acknowledgement a keep or an undo records, and HELD (iii) for an edit made before an answer.
 import { canonicalVersion, SERVER_DEVICE_ID } from '@figurecollecting/fc-api-contract';
 import { applyEvent, readFacet, serverNow, type Facet, type FeedTransaction, type SqlClient } from '../sync/store.js';
-import { decide, emptyEffect, finalKinds, keepEffect, KINDS, lackedRows, mergeEffects, mfcField, OUT, realign, takeEffect, View, type Effect } from './figure.js';
+import { decide, emptyEffect, finalKinds, keepEffect, keptByAnswer, keptEndedByRealign, KINDS, lackedRows, mergeEffects, mfcField, realign, takeEffect, View, type Effect } from './figure.js';
 import { importOccId } from './occ.js';
 import { CHANGE_ITEM_PREFIX, FIGURE_ITEM_PREFIX, rowsOfSide, type KeptCopy } from './plan.js';
 import type { Field, Kind } from './rows.js';
@@ -141,15 +141,8 @@ export function createImportHooks(occIdKey: Uint8Array | null): ImportHooks {
         // REALIGN, and the knowing keeps: added by keep or per_copy, dropped once MFC counts them.
         const final = finalKinds(v, S, effect);
         const bases = realign(S, exp, final, (c) => effect.copyBases.get(c)?.removed ?? v.removedByImport(c));
-        const add = new Map<string, KeptCopy>();
-        if (ans.choice !== 'take' && (item.comps.counts === 'conflict' || item.comps.counts === 'apply')) {
-          for (const c of d.removals) {
-            const k = final.get(c);
-            if (isKind(k)) add.set(c, { head: S, kind: k });
-          }
-        }
-        const kept = new Map([...st.kept, ...add]);
-        const gone = [...kept].filter(([c, k]) => final.get(c) !== k.kind || bases.copyBases.get(c)?.kind !== OUT).map(([c]) => c);
+        const add = new Map<string, KeptCopy>([...keptByAnswer(ans.choice, item.comps, d.removals, final)].map(([c, kind]) => [c, { head: S, kind }]));
+        const gone = keptEndedByRealign(new Map([...st.kept, ...add]), final, bases.copyBases);
         await saveBases(tx, userId, item.raised, {
           rows: exp,
           rowsGone: lackedRows(exp, baseRows).map((r) => r.id),
