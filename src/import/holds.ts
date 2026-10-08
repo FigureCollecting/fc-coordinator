@@ -122,6 +122,11 @@ async function placeOnFigures(tx: SqlClient, userId: string, edits: readonly Pus
   });
 }
 
+/**
+ * The frames of `heads` whose import marker is after `after` (the push's oldest basis). A frame whose
+ * marker is the basis itself was seen; reading it too would change nothing, since an edit is late
+ * only before a marker above its basis and replayFigure counts only those.
+ */
 async function readFrames(tx: SqlClient, userId: string, heads: readonly string[], after: bigint): Promise<FrameRow[]> {
   const { rows } = await tx.query<{ head_id: string; import_number: number; export_date: string; marker: string; start: string; settled: boolean; before: FrameBefore | null }>(
     `SELECT f.head_id, f.import_number, to_char(r.export_date, 'YYYY-MM-DD') AS export_date, r.marker_seq AS marker, f.settled, f.before,
@@ -203,7 +208,10 @@ async function reactions(tx: SqlClient, userId: string, placed: readonly Placed[
   return units;
 }
 
-/** Whether the server had emitted a head of the copy by `seq` (the import's marker). */
+/**
+ * Whether the server had emitted a head of the copy by `seq` (the import's marker). The event at the
+ * marker is the import's marker facet, never a head, so `<=` and `<` read the same.
+ */
 async function hadHeadBy(tx: SqlClient, userId: string, occ: string, seq: bigint): Promise<boolean> {
   const { rows } = await tx.query("SELECT 1 FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND op = 'upsert' AND seq <= $3 LIMIT 1", [userId, `occ/${occ}/head`, seq.toString()]);
   return rows.length > 0;
@@ -273,9 +281,9 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
 
     for (const t of placed) if (held.has(t.unit)) out.set(t.e.index, 'held');
     // A late edit no replay answered (a decision left as it was, its facet not written) is placed
-    // here by LWW, once though it is late on two figures, in push order: its outcome is known before
-    // it is kept.
-    for (const e of unique(replayed.map((r) => r.e)).sort((p, q) => p.index - q.index)) {
+    // here by LWW, in push order, and once though it is late on two figures (the outcome set the
+    // first time skips it): its outcome is known before it is kept.
+    for (const e of replayed.map((r) => r.e).sort((p, q) => p.index - q.index)) {
       if (!out.has(e.index)) out.set(e.index, (await applyEvent(tx, userId, e, feed)).applied ? 'applied' : 'stale');
     }
     // A STALE answer is final: only a late edit that stood is kept, under its earliest import, so a
@@ -331,6 +339,8 @@ async function replayFigure(
       if (settled.length > 1 || knowing) return HOLD;
       return reviseOrHold(tx, userId, S, f, frame, late, placedBefore, recorded, pre, again);
     }
+    // The same decision: `as` writes these keys too (sameDecision leaves out only item upserts, and
+    // a late edit is never to an item).
     const written = new Set(again.writes.map((w) => w.facetKey));
     for (const e of here) if (written.has(e.facetKey)) stale.add(e.index);
   }
@@ -388,6 +398,7 @@ async function reviseOrHold(
         // The origin is server-owned: never tombstoned, even for a copy the replay does not create.
         if (sameValue(value, now) || (value === undefined && key.endsWith('/origin'))) continue;
         const mine = late.find((e) => e.facetKey === key && e.version === value?.version);
+        // A version names one edit: `now` at mine's version is mine, which sameValue skipped above.
         if (mine !== undefined && (now === undefined || compareVersion(mine.version, now.version) > 0)) {
           await applyEvent(tx, userId, { facetKey: key, version: mine.version, op: mine.op, payload: mine.payload }, feed);
         } else {
