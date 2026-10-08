@@ -449,6 +449,31 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
       expect((await asApp(`INSERT INTO import_copy_base (user_id, occ_id, head_id, kind) VALUES ('${USER}', '${HEAD}', '${HEAD}', 'out') RETURNING import_removed`)).stdout.trim().split('\n')[0]).toBe('f');
     });
 
+    it('lets the app record a frame with its figure as it stood before, a replayed late edit and a revision once, and refuses UPDATE and DELETE on the last two', async () => {
+      const V = '2026-10-07T00:00:00.000000Z#0000000001#0123456789abcdef0123456789abcdef';
+      const OTHER = '6f0c2a9e-4b7d-4e21-9c3a-8d1e6f2b7a41';
+      for (const sql of [
+        `INSERT INTO import_frame (user_id, import_number, head_id, settled, before) VALUES ('${USER}', 1, '${OTHER}', true, '{"rows": []}')`,
+        `INSERT INTO import_late_edit (user_id, import_number, head_id, facet_key, version, op, payload) VALUES ('${USER}', 1, '${HEAD}', 'occ/${HEAD}/status', '${V}', 'upsert', '{}')`,
+        `INSERT INTO import_revision (user_id, import_number, head_id, seq, before, after) SELECT '${USER}', 1, '${HEAD}', max(seq), '{}', '{}' FROM feed_event WHERE user_id = '${USER}'`,
+      ]) {
+        const run = await asApp(sql);
+        expect([sql, run.exitCode]).toEqual([sql, 0]);
+      }
+      for (const sql of [
+        'UPDATE import_late_edit SET payload = payload WHERE false',
+        'DELETE FROM import_late_edit WHERE false',
+        'UPDATE import_revision SET before = before WHERE false',
+        'DELETE FROM import_revision WHERE false',
+      ]) {
+        const run = await asApp(sql);
+        expect([sql, run.exitCode]).not.toEqual([sql, 0]);
+        expect(run.output).toMatch(/42501|permission denied/i);
+      }
+      checked(await asApp(`INSERT INTO import_late_edit (user_id, import_number, head_id, facet_key, version, op, payload) VALUES ('${USER}', 1, '${HEAD}', 'k', 'v', 'upsert', '{}')`));
+      checked(await asApp(`INSERT INTO import_late_edit (user_id, import_number, head_id, facet_key, version, op, payload) VALUES ('${USER}', 1, '${HEAD}', 'k', '${V}', 'delete', '{}')`));
+    });
+
     it('holds them to the import vocabulary: a kept copy is of a kind, an export row has a canonical id and a Count 0 to 99', async () => {
       checked(await asApp(`INSERT INTO import_kept_copy (user_id, occ_id, head_id, kind) VALUES ('${USER}', '${HEAD}', '${HEAD}', 'out')`));
       checked(await asApp(`INSERT INTO import_kept_copy (user_id, occ_id, head_id, kind) VALUES ('${USER}', '${HEAD}', '${HEAD}', 'former')`));
