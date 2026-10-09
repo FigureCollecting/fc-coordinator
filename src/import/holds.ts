@@ -1,10 +1,15 @@
 // import.proto HELD and LATE EDITS AND REPLAY, in Push. A LATE EDIT is a pushed edit to a copy or a
 // figure value of a figure S whose basis is before the marker of an import that settled S (wrote
 // to it or moved a base of it): its device made it without having seen that import. It is
-// replayed just before the earliest such import, against S as that import found it (./replay.ts):
+// replayed just before the earliest such import, against S as that import found it (./replay.ts).
+// One whose key a server write other than a replayed import's own followed since its basis (a
+// revision's write, of any import) is STALE first: it neither stands nor changes a decision.
+// The rest:
 //
 //   * the import decides S the same way: the edit is placed as it would have been. It is STALE
-//     where the import (placed after it) wrote its facet, and placed by LWW otherwise;
+//     where the import (placed after it) wrote its facet, or where any server write to the facet
+//     followed its basis; else placed by LWW at its own version against the device edits it races
+//     (placeLate);
 //   * the import decides S otherwise: a REVISION. The server emits, in the Push's transaction, each
 //     difference between S replayed and S as it has emitted it, moves S's bases, item and keeps to
 //     the replay's, and records the revision when S's live copies or items change.
@@ -29,9 +34,11 @@
 // kept with its basis (held_edit) and answered HELD with `current`; the held-edit card that shows
 // and answers it is not built yet, though StatusResponse.pending_review counts it.
 //
-// Not late, as in WK-14a: an edit to a figure an import framed without settling it (a marker-only
-// re-import, a conflict it only raised). LWW places it, so one that would have settled the
-// conflict, replayed before that import, leaves the item pending.
+// Not late, as in WK-14a: an edit to a figure an import framed without settling it. An import
+// settles S when its decision of S is not a conflict and writes a facet of S's copies or values,
+// or moves a copy or field base of S (plan.ts `settled`); the figure item it raises, keeps,
+// rewrites or ends, and the row bases it moves, settle nothing. LWW places such an edit, so one
+// that would have settled the conflict, replayed before that import, leaves the item pending.
 //
 // Units: one push's edits to one copy's head, status, collection and disposal are one unit; every
 // other edit is a unit with the push's other edits of its key. A unit is held or replayed whole.
@@ -92,7 +99,7 @@ interface Recorded {
 
 type Verdict =
   | { kind: 'hold' }
-  /** `stale`: the late edits (by index) a replayed decision wrote over; LWW places the rest. */
+  /** `stale`: the late edits (by index) a replayed decision wrote over or a server write since their basis met; LWW places the rest. */
   | { kind: 'unchanged'; stale: Set<number> }
   | { kind: 'revise'; write: (feed: FeedTransaction) => Promise<Map<number, LateOutcome>> };
 
@@ -198,6 +205,7 @@ async function reactions(tx: SqlClient, userId: string, placed: readonly Placed[
       if (t.e.basisSeq < r.marker || t.e.basisSeq >= r.seq) continue;
       const onFigure = t.heads.includes(r.head);
       // A copy the revision summarised is S's whatever its head is now: the revision may have taken it out.
+      // Both summaries are taken over the same copies (reviseOrHold), so either side names it; both are read.
       if (!onFigure && !(t.occ !== null && (t.occ in r.before.copies || t.occ in r.after.copies))) continue;
       const headOrStatus = /^occ\/[^/]+\/(head|status)$/.test(t.e.facetKey);
       const hadHead = !(onFigure && headOrStatus) || (await hadHeadBy(tx, userId, t.occ!, r.marker));
@@ -281,14 +289,21 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
 
     for (const t of placed) if (held.has(t.unit)) out.set(t.e.index, 'held');
     // A late edit no replay answered (a decision left as it was, its facet not written) is placed
-    // here by LWW, in push order, and once though it is late on two figures (the outcome set the
-    // first time skips it): its outcome is known before it is kept. The service places the push's
-    // other edits after these, so one ahead of a late edit in the push, to its key at a higher
-    // version, makes it STALE here, as push order would.
-    const lateIndex = new Set(replayed.map((r) => r.e.index));
-    const newerAhead = (e: PushedEdit) => edits.some((o) => o.index < e.index && !lateIndex.has(o.index) && o.facetKey === e.facetKey && compareVersion(o.version, e.version) > 0);
-    for (const e of replayed.map((r) => r.e).sort((p, q) => p.index - q.index)) {
-      if (!out.has(e.index)) out.set(e.index, newerAhead(e) || !(await applyEvent(tx, userId, e, feed)).applied ? 'stale' : 'applied');
+    // here by LWW (placeLate), once though it is late on two figures: its outcome is known before
+    // it is kept. The service places the push's other edits after these, so each one ahead of a
+    // late edit in the push, to its key, is placed here too, before it: every edit to that key
+    // lands in push order, as on a figure no import framed.
+    const byIndex = (p: PushedEdit, q: PushedEdit) => p.index - q.index;
+    const toPlace = new Map<number, PushedEdit>();
+    for (const { e } of replayed) if (!out.has(e.index)) toPlace.set(e.index, e);
+    const lateHere = new Set(toPlace.keys());
+    const lastLate = new Map([...toPlace.values()].sort(byIndex).map((e) => [e.facetKey, e.index]));
+    // One with an outcome is skipped: a late edit a replay answered STALE stays STALE.
+    for (const o of edits) if (o.index < (lastLate.get(o.facetKey) ?? -1) && !out.has(o.index)) toPlace.set(o.index, o);
+    for (const e of [...toPlace.values()].sort(byIndex)) {
+      // An edit that is not late is placed as the service places it: LWW against the facet as it is.
+      const applied = lateHere.has(e.index) ? await placeLate(tx, userId, e, feed) : (await applyEvent(tx, userId, e, feed)).applied;
+      out.set(e.index, applied ? 'applied' : 'stale');
     }
     // A STALE answer is final: only a late edit that stood is kept, under its earliest import, so a
     // later replay places it before that import and each later one.
@@ -303,6 +318,22 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
     }
     return out;
   };
+}
+
+/**
+ * A late edit the replay leaves standing. A server write to its facet since its basis, an import's
+ * or a revision's re-emission, is one its device had not seen: the edit is STALE, never emitted
+ * above it. Otherwise every write since its basis is a device edit it races, and LWW places it at
+ * its own version against the facet as it is: the value its device saw, those device edits, and
+ * the late edits kept or placed before it, each on the feed at or below that facet's version.
+ */
+async function placeLate(tx: SqlClient, userId: string, e: PushedEdit, feed: FeedTransaction): Promise<boolean> {
+  const { rows } = await tx.query<{ version: string }>(
+    'SELECT version FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND seq > $3',
+    [userId, e.facetKey, e.basisSeq.toString()],
+  );
+  if (rows.some((r) => isServerVersion(r.version))) return false;
+  return (await applyEvent(tx, userId, e, feed)).applied;
 }
 
 /** The replay of S's late edits in one Push: held, the decision as it was, or a revision. */
@@ -324,9 +355,24 @@ async function replayFigure(
   if (answers.length > 0) return HOLD;
   const recorded = await readLateEdits(tx, userId, S);
 
+  // Each late edit a server write to its key followed since its basis, other than one of an import
+  // replayed here (from its transaction's start to its marker), such as a revision's re-emission:
+  // its device had not seen it. STALE before the replay, so it neither stands nor changes a decision;
+  // a revision leaves it out, and placeLate answers it STALE, as it meets that write. The event at a
+  // marker is the import's marker facet, never a late edit's key, so `<=` and `<` read the same.
+  const stale = new Set<number>();
+  const replayedImport = (seq: bigint) => settled.some((f) => seq >= f.start && seq <= f.marker);
+  for (const e of late) {
+    const { rows } = await tx.query<{ seq: string; version: string }>('SELECT seq, version FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND seq > $3', [
+      userId,
+      e.facetKey,
+      e.basisSeq.toString(),
+    ]);
+    if (rows.some((r) => isServerVersion(r.version) && !replayedImport(BigInt(r.seq)))) stale.add(e.index);
+  }
+
   // Each late edit an earlier frame's decision wrote over: STALE, and placed before no later import.
   // Per edit: one made after that import is not written over by it.
-  const stale = new Set<number>();
   for (const f of settled) {
     const frame: Frame = { importNumber: f.importNumber, exportDate: f.exportDate, before: f.before! };
     const here = late.filter((e) => e.basisSeq < f.marker && !stale.has(e.index));
@@ -341,7 +387,7 @@ async function replayFigure(
     if (!sameDecision(as, again)) {
       // A revision is built for one import whose figure nothing else touched since.
       if (settled.length > 1 || knowing) return HOLD;
-      return reviseOrHold(tx, userId, S, f, frame, late, placedBefore, recorded, pre, again);
+      return reviseOrHold(tx, userId, S, f, frame, late.filter((e) => !stale.has(e.index)), placedBefore, recorded, pre, again);
     }
     // The same decision: `as` writes these keys too (sameDecision leaves out only item upserts, and
     // a late edit is never to an item).
