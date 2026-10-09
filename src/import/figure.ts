@@ -509,10 +509,13 @@ const CONVERSIONS: readonly (readonly [Kind, Kind])[] = [
 /**
  * take: MFC's side made true on the copies MFC tracks (a live base): conversions first, arrivals
  * first, lowest occ id; then removals (an origin before none, then the highest occ id); then
- * restoring a copy that is out, a tracked one first and one whose base is the kind first, then one
- * an import removed, lowest occ id; then new copies, each for the lowest-numbered row of the kind
- * at its lowest unused ordinal. A copy with no base is never changed, but for one an import
- * removed. Each field the rev found changed by MFC or disputed takes MFC's value.
+ * every live copy counts toward MFC's Count of its kind, one MFC does not track (no base, or base
+ * out) included and left as it is (REALIGN bases it), so an answer never duplicates a copy the
+ * user already holds (WK-14d); then restoring a copy that is out, a tracked
+ * one first and one whose base is the kind first, then one an import removed, lowest occ id; then
+ * new copies, each for the lowest-numbered row of the kind at its lowest unused ordinal. A copy
+ * with no base is never changed, but for one an import removed. Each field the rev found changed
+ * by MFC or disputed takes MFC's value.
  */
 export function takeEffect(v: View, S: string, exp: readonly Row[], found: Comps, occId: OccIdOf): Effect {
   const cs = v.copiesOf(S);
@@ -527,6 +530,8 @@ export function takeEffect(v: View, S: string, exp: readonly Row[], found: Comps
   for (const x of KINDS) {
     while (count(x) > M[x]) w.remove(tracked.filter((c) => w.cur.get(c) === x).sort(removalOrder(v))[0]!);
   }
+  // The user's own live copies count toward MFC's Count before any copy is restored or made.
+  for (const c of cs) if (!tracked.includes(c) && w.cur.get(c) !== OUT) tracked.push(c);
   for (const y of KINDS) {
     while (count(y) < M[y]) {
       const out = cs.filter((c) => w.cur.get(c) === OUT && v.copies.get(c)!.head === S);

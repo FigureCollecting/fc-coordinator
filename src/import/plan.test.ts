@@ -210,12 +210,12 @@ describe('planImport: conflicts (GR-Q1: surfaced, never written over)', () => {
     });
     expect(item['rev']).toMatch(/^i1\.[0-9a-f]{32}$/);
     const created = { occ: occ('119', 1), status: 'owned', head_id: S1, origin: { site: 'mfc', native_id: '119', ordinal: 1 } };
-    const second = { ...created, occ: occ('119', 2), origin: { ...created.origin, ordinal: 2 } };
-    // Each list in facet-key order, as the server would write it.
+    // Each list in facet-key order, as the server would write it. take binds the app's own owned
+    // copy as one of MFC's two and makes only the other (WK-14d), as keep does.
     expect(item['preview']).toEqual({
       keep: { copies: [created], fields: [{ head_id: S1, field: 'note', note: 'mfc' }] },
       take: {
-        copies: [created, second].sort((a, b) => (a.occ < b.occ ? -1 : 1)),
+        copies: [created],
         fields: [
           { head_id: S1, field: 'note', note: 'mfc' },
           { head_id: S1, field: 'score', score: 7 },
