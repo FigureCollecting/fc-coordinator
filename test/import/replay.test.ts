@@ -1605,6 +1605,31 @@ describe('a late edit competes by LWW only with the device writes it races: a se
     expect((await drain(a, aSaw)).events).toEqual([]);
     expect(await lateRows(a.userId)).toEqual([]);
   });
+
+  it('the same late filing, stamped above a device filing made after the refile, meets the refile still and is STALE', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [b, c] = [await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a)];
+    const [x, y] = [nextId(), nextId()];
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned'), row(y, 'Owned', { note: 'n1' })]);
+    const { cursor: aSaw0 } = await drain(a);
+    expect(outcomes(await pushed(a, [edit(a, `occ/${cx}/collection`, { collection: `owned/${randomUUID()}` }, aSaw0, 0)]))).toEqual(['APPLIED']);
+    const { cursor: bSaw } = await drain(b);
+    const F = edit(b, `occ/${cx}/collection`, { collection: `owned/${randomUUID()}` }, bSaw, 60_000);
+    await imported(a, [row(x, 'Ordered'), row(y, 'Owned', { note: 'n1' })], DATE_B);
+    const refile = await db.admin.query<{ version: string }>('SELECT version FROM feed_event WHERE user_id = $1 AND facet_key = $2 ORDER BY seq DESC LIMIT 1', [a.userId, `occ/${cx}/collection`]);
+    expect(refile.rows[0]!.version).toMatch(/#0{32}$/);
+    const { cursor: cSaw } = await drain(c);
+    const shelfC = `ordered/${randomUUID()}`;
+    expect(outcomes(await pushed(c, [edit(c, `occ/${cx}/head`, { head_id: headFor(y) }, cSaw), edit(c, `occ/${cx}/collection`, { collection: shelfC }, cSaw)]))).toEqual([
+      'APPLIED',
+      'APPLIED',
+    ]);
+    await imported(a, [row(x, 'Ordered'), row(y, 'Owned', { note: 'n2' })], '2026-09-30');
+    const res = await pushed(b, [F]);
+    expect(outcomes(res)).toEqual(['STALE']);
+    expect(JSON.parse(res.results[0]!.current!.payload)).toMatchObject({ collection: shelfC });
+  });
 });
 
 describe('a late edit the replay leaves standing still meets, at its version, what its device saw', () => {
