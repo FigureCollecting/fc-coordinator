@@ -528,15 +528,30 @@ function relay(err: unknown): ConnectError {
   return new ConnectError('spine read is unavailable', Code.Unavailable, undefined, undefined, err);
 }
 
-/** Leading and trailing Unicode White_Space: String.prototype.trim also strips U+FEFF and keeps U+0085. */
-const EDGE_WHITE_SPACE = /^\p{White_Space}+|\p{White_Space}+$/gu;
+/** One Unicode White_Space character: String.prototype.trim also strips U+FEFF and keeps U+0085. */
+const WHITE_SPACE = /^\p{White_Space}$/u;
+
+/**
+ * Leading and trailing White_Space removed by walking in from each end, so the
+ * cost is linear in the query. A regex anchored at both ends backtracks
+ * quadratically over an interior run, and this runs before the 256 bound on
+ * the one event loop every service shares. Every White_Space character is a
+ * single UTF-16 unit, so stepping by unit is stepping by character.
+ */
+function trimWhiteSpace(text: string): string {
+  let start = 0;
+  let end = text.length;
+  while (start < end && WHITE_SPACE.test(text[start]!)) start += 1;
+  while (end > start && WHITE_SPACE.test(text[end - 1]!)) end -= 1;
+  return text.slice(start, end);
+}
 
 /**
  * The query, checked in the form read.proto 0.9.0 counts it in (NFKC, then
  * White_Space trimmed) and returned AS TYPED: that form is the spine's to make.
  */
 function searchQuery(query: string): string {
-  const form = query.normalize('NFKC').replace(EDGE_WHITE_SPACE, '');
+  const form = trimWhiteSpace(query.normalize('NFKC'));
   if (form === '') throw invalid('query must not be empty or only whitespace');
   if ([...form].length > MAX_SEARCH_QUERY_CHARS) {
     throw invalid(`query must not exceed ${MAX_SEARCH_QUERY_CHARS} characters`);
@@ -573,13 +588,14 @@ const isStaleSearchToken = (err: ConnectError): boolean =>
 /**
  * A spine failure on SearchProducts, as the client may see it. The stale-token
  * refusal keeps its (domain, reason) pair, rebuilt from the constant so none of
- * the spine's ErrorInfo metadata rides along; any other INVALID_ARGUMENT is
- * relayed as GetProducts relays it; everything else is UNAVAILABLE.
+ * the spine's ErrorInfo metadata rides along; any other INVALID_ARGUMENT stays
+ * INVALID_ARGUMENT under a neutral message (it may come on page one, where no
+ * token was sent, so it names none); everything else is UNAVAILABLE.
  */
 function relaySearch(err: unknown): ConnectError {
   if (err instanceof ConnectError && err.code === Code.InvalidArgument) {
     if (!isStaleSearchToken(err)) {
-      return invalid('the spine refused the search: send a page_token only with the query it was issued for');
+      return invalid('the spine refused the search request');
     }
     const stale = invalid('the page_token is stale: restart the search from page one');
     stale.details.push({
