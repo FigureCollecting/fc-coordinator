@@ -1348,3 +1348,52 @@ describe('HELD (ii) and sameDecision: the reaction checks at their bounds', () =
     expect(await keptOf(a.userId)).toEqual([removed]);
   });
 });
+
+describe('a late edit meets the push and the device edits around it in push order and by their own versions', () => {
+  it('an older edit that is not late, then a newer late edit, to the same key: both APPLIED in push order, both on the feed, and the late one kept', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    const { cursor: bNow } = await drain(b);
+    const { cursor: aSaw } = await drain(a);
+    const res = await pushed(b, [edit(b, `uf/${S}/score`, { score: 3 }, bNow, 1000), edit(b, `uf/${S}/score`, { score: 9 }, bSaw, 5000)]);
+    expect(outcomes(res)).toEqual(['APPLIED', 'APPLIED']);
+    expect((await drain(a, aSaw)).events.map((e) => (JSON.parse(e.payload) as { score: number }).score)).toEqual([3, 9]);
+    const { rows: runs } = await db.admin.query<{ n: number }>('SELECT max(import_number) AS n FROM import_run WHERE user_id = $1', [a.userId]);
+    expect(await lateRows(a.userId)).toEqual([[`uf/${S}/score`, runs[0]!.n]]);
+  });
+
+  it('an edit that is not late, between two late edits to the same key, each newer than the one before: all three APPLIED in push order', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    const { cursor: bNow } = await drain(b);
+    const { cursor: aSaw } = await drain(a);
+    const res = await pushed(b, [
+      edit(b, `uf/${S}/score`, { score: 1 }, bSaw, 1000),
+      edit(b, `uf/${S}/score`, { score: 2 }, bNow, 2000),
+      edit(b, `uf/${S}/score`, { score: 3 }, bSaw, 3000),
+    ]);
+    expect(outcomes(res)).toEqual(['APPLIED', 'APPLIED', 'APPLIED']);
+    expect((await drain(a, aSaw)).events.map((e) => (JSON.parse(e.payload) as { score: number }).score)).toEqual([1, 2, 3]);
+  });
+
+  it('control: an edit that is not late and comes after the late one in the push is still placed after it, by LWW', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    const { cursor: bNow } = await drain(b);
+    const res = await pushed(b, [edit(b, `uf/${S}/score`, { score: 9 }, bSaw, 5000), edit(b, `uf/${S}/score`, { score: 3 }, bNow, 1000), edit(b, `uf/${S}/note`, { note: 'm' }, bNow, 1000)]);
+    expect(outcomes(res)).toEqual(['APPLIED', 'STALE', 'APPLIED']);
+    expect((await stateOf(a)).get(`uf/${S}/score`)).toMatchObject({ score: 9 });
+  });
+});
