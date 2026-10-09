@@ -1466,7 +1466,7 @@ describe('a late edit meets the push and the device edits around it in push orde
   });
 });
 
-describe('a late edit competes by LWW with the device edits placed before its import at their own versions, never with the server version a revision re-emitted one under', () => {
+describe('a late edit competes by LWW only with the device writes it races: a server write to its key since its basis, an import\'s or a revision\'s, makes it STALE', () => {
   const collectionOf = async (c: SyncCaller, occ: string) => ((await stateOf(c)).get(`occ/${occ}/collection`) as { collection?: string } | undefined)?.collection;
 
   /**
@@ -1474,7 +1474,7 @@ describe('a late edit competes by LWW with the device edits placed before its im
    * refiles cx. d's filing F and g's filing G of cx are made after a's and before that import (F
    * before G, or G before F; g's filing `mid` between the two), and pushed after it. d's push also adds an ordered hand copy, which
    * MFC's move pairs with: the revision refiles nothing, and F stands, re-emitted at a server
-   * version above the import's refile.
+   * version above the import's refile. G is late for that import too, and meets both server writes.
    */
   async function reEmitted(gFirst: boolean) {
     const a = await SyncCaller.enrol(h);
@@ -1503,34 +1503,37 @@ describe('a late edit competes by LWW with the device edits placed before its im
     const refiled = (await drain(a, aSaw)).events.filter((e) => e.facetKey === `occ/${cx}/collection`);
     expect(refiled.map((e) => e.payload)).toEqual([F.payload]);
     expect(refiled[0]!.version).toMatch(/#0{32}$/);
-    return { a, g, cx, G, mid, shelfF, shelfG };
+    return { a, g, cx, G, mid, shelfF, shelfG, kept: await lateRows(a.userId) };
   }
 
-  it('a late filing stamped above the filing a revision re-emitted is APPLIED, and stands', async () => {
-    const { a, g, cx, G, shelfG } = await reEmitted(false);
+  it('a late filing stamped above the filing a revision re-emitted is STALE, with that filing, and is not kept', async () => {
+    const { a, g, cx, G, shelfF, kept } = await reEmitted(false);
+    const { cursor: aSaw } = await drain(a);
     const res = await pushed(g, [G]);
-    expect(outcomes(res)).toEqual(['APPLIED']);
-    expect(await collectionOf(a, cx)).toBe(shelfG);
-    expect(await lateRows(a.userId)).toContainEqual([`occ/${cx}/collection`, expect.any(Number)]);
+    expect(outcomes(res)).toEqual(['STALE']);
+    expect(JSON.parse(res.results[0]!.current!.payload)).toMatchObject({ collection: shelfF });
+    expect((await drain(a, aSaw)).events).toEqual([]);
+    expect(await collectionOf(a, cx)).toBe(shelfF);
+    expect(await lateRows(a.userId)).toEqual(kept);
   });
 
-  it('two late filings in one push, the first stamped above the re-emitted filing and the second between the two: the second is STALE', async () => {
-    const { a, g, cx, G, mid, shelfG } = await reEmitted(false);
+  it('two late filings in one push, the first stamped above the re-emitted filing and the second between the two: both STALE', async () => {
+    const { a, g, cx, G, mid, shelfF } = await reEmitted(false);
     const res = await pushed(g, [G, mid]);
-    expect(outcomes(res)).toEqual(['APPLIED', 'STALE']);
-    expect(await collectionOf(a, cx)).toBe(shelfG);
+    expect(outcomes(res)).toEqual(['STALE', 'STALE']);
+    expect(await collectionOf(a, cx)).toBe(shelfF);
   });
 
-  it('a late filing that stands with the value the revision re-emitted writes nothing; the same filing pushed again is STALE', async () => {
-    const { a, g, cx, G, shelfF } = await reEmitted(false);
+  it('a late filing with the value the revision re-emitted is STALE too, and writes nothing', async () => {
+    const { a, g, G, shelfF, kept } = await reEmitted(false);
     const same = { ...G, payload: JSON.stringify({ collection: shelfF, ...DISPLAY }) };
     const { cursor: aSaw } = await drain(a);
-    expect(outcomes(await pushed(g, [same]))).toEqual(['APPLIED']);
-    expect((await drain(a, aSaw)).events).toEqual([]);
     expect(outcomes(await pushed(g, [same]))).toEqual(['STALE']);
+    expect((await drain(a, aSaw)).events).toEqual([]);
+    expect(await lateRows(a.userId)).toEqual(kept);
   });
 
-  it('a late filing that stands below a re-emitted filing minted ahead of the server clock is emitted above it', async () => {
+  it('a late filing stamped above the filing it raced, below a re-emitted filing minted ahead of the server clock: STALE, nothing emitted', async () => {
     const a = await SyncCaller.enrol(h);
     const [p, q, g] = [await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a)];
     const x = nextId();
@@ -1562,10 +1565,9 @@ describe('a late edit competes by LWW with the device edits placed before its im
       'APPLIED',
     ]);
     const { cursor: aSaw } = await drain(a);
-    expect(outcomes(await pushed(g, [G]))).toEqual(['APPLIED']);
-    const tail = (await drain(a, aSaw)).events;
-    expect(tail.map((e) => e.payload)).toEqual([G.payload]);
-    expect(compareVersion(tail[0]!.version, at(g, 3))).toBeGreaterThan(0);
+    expect(compareVersion(G.version, F.version)).toBeGreaterThan(0);
+    expect(outcomes(await pushed(g, [G]))).toEqual(['STALE']);
+    expect((await drain(a, aSaw)).events).toEqual([]);
   });
 
   it('a late filing stamped below the filing a revision re-emitted is STALE, with that filing', async () => {
@@ -1574,6 +1576,32 @@ describe('a late edit competes by LWW with the device edits placed before its im
     expect(outcomes(res)).toEqual(['STALE']);
     expect(JSON.parse(res.results[0]!.current!.payload)).toMatchObject({ collection: shelfF });
     expect(await collectionOf(a, cx)).toBe(shelfF);
+  });
+
+  it('an import refiles a copy on figure X, a device moves the copy to Y, a later import settles Y: an older filing late on Y meets the refile and is STALE', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [b, c] = [await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a)];
+    const [x, y] = [nextId(), nextId()];
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned'), row(y, 'Owned', { note: 'n1' })]);
+    const { cursor: aSaw0 } = await drain(a);
+    expect(outcomes(await pushed(a, [edit(a, `occ/${cx}/collection`, { collection: `owned/${randomUUID()}` }, aSaw0, 0)]))).toEqual(['APPLIED']);
+    const { cursor: bSaw } = await drain(b);
+    const F = edit(b, `occ/${cx}/collection`, { collection: `owned/${randomUUID()}` }, bSaw, 0);
+    await sleep(5);
+    // The second import moves x to Ordered and refiles cx, at a server version above F.
+    await imported(a, [row(x, 'Ordered'), row(y, 'Owned', { note: 'n1' })], DATE_B);
+    const refiled = (await stateOf(a)).get(`occ/${cx}/collection`);
+    const { cursor: cSaw } = await drain(c);
+    expect(outcomes(await pushed(c, [edit(c, `occ/${cx}/head`, { head_id: headFor(y) }, cSaw)]))).toEqual(['APPLIED']);
+    // The third changes y's note: it settles Y and writes nothing of cx. F is late on Y only.
+    await imported(a, [row(x, 'Ordered'), row(y, 'Owned', { note: 'n2' })], '2026-09-30');
+    const { cursor: aSaw } = await drain(a);
+    const res = await pushed(b, [F]);
+    expect(outcomes(res)).toEqual(['STALE']);
+    expect(JSON.parse(res.results[0]!.current!.payload)).toEqual(refiled);
+    expect((await drain(a, aSaw)).events).toEqual([]);
+    expect(await lateRows(a.userId)).toEqual([]);
   });
 });
 
