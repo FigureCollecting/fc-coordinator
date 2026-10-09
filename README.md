@@ -766,17 +766,17 @@ conflict and writes a facet of the figure's copies or values, or moves a copy or
 field base of it (`import_frame.settled`); the figure item it raises, keeps,
 rewrites or ends, and the row bases it moves, settle nothing. If the import
 decides the figure the same way, the edit is placed as it would have been: STALE
-where the import wrote its facet, else by LWW at the edit's own version against
-what it competes with there: its facet as its device saw it, each device edit
-to it since and each late edit kept for a replay. A server write since its basis
-is none of these (an import's would have made it STALE, an answer's holds it):
-it is a revision's, which emits one of them, or the value before the import, at
-a server version. An edit that stands below such a write is emitted above it at
-a server version and answered APPLIED; one that loses is STALE. Each edit of the
-Push ahead of a late edit, to its key, is placed before it, so every key lands
-in push order. If not, the Push emits each difference between the figure replayed
-and as emitted, and moves its bases, item and knowing keeps to the replay's (a
-REVISION; `import_revision` keeps one that changed the figure's live copies or
+where the import wrote its facet, or where any server write to the facet (an
+import's, or a revision's re-emission) followed the edit's basis, since its
+device had not seen it; else by LWW at the edit's own version against the device
+writes it races there: its facet as its device saw it, each device edit to it
+since and each late edit kept for a replay. A late edit is never emitted above
+a server write. Each edit of the Push ahead of a late edit, to its key, is
+placed before it, so every key lands in push order; one that is not late is
+placed by plain LWW against the facet as it is, so it can lose to a revision's
+server-version write it had not seen. If not, the Push emits each difference
+between the figure replayed and as emitted, and moves its bases, item and
+knowing keeps to the replay's (a REVISION; `import_revision` keeps one that changed the figure's live copies or
 items). A STALE answer is final: only a late edit that stood (APPLIED) is kept
 (`import_late_edit`), under the earliest import it is late for, and a later
 replay places it before that import and each later one; one answered STALE is

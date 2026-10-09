@@ -4,8 +4,9 @@
 // replayed just before the earliest such import, against S as that import found it (./replay.ts):
 //
 //   * the import decides S the same way: the edit is placed as it would have been. It is STALE
-//     where the import (placed after it) wrote its facet, and placed by LWW otherwise, at its own
-//     version against the device edits it competes with (placeLate);
+//     where the import (placed after it) wrote its facet, or where any server write to the facet
+//     followed its basis; else placed by LWW at its own version against the device edits it races
+//     (placeLate);
 //   * the import decides S otherwise: a REVISION. The server emits, in the Push's transaction, each
 //     difference between S replayed and S as it has emitted it, moves S's bases, item and keeps to
 //     the replay's, and records the revision when S's live copies or items change.
@@ -323,32 +324,24 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
 }
 
 /**
- * A late edit the replay leaves standing, placed by LWW against what it competes with at its own
- * version: its facet as its device saw it (the latest event at or before its basis), each device
- * edit to it since, each late edit kept for later replays, and the late edits to it this push
- * placed before it (`placedHere`). A server write since its basis is none of these: an import's
- * would have made it STALE in its replay and an answer's holds it, so it is a revision's, which
- * emits a device edit's value, or the value before the import, at a server version. One that
- * stands below such a write is emitted above it, at a server version, and is APPLIED.
+ * A late edit the replay leaves standing, placed by LWW at its own version against the device
+ * writes it races: its facet as its device saw it (the latest event at or before its basis), each
+ * device edit to it since, each late edit kept for later replays, and the late edits to it this push
+ * placed before it (`placedHere`). A server write to it since its basis, an import's or a
+ * revision's re-emission, is one its device had not seen: the edit is STALE, never emitted above it.
  */
 async function placeLate(tx: SqlClient, userId: string, e: PushedEdit, placedHere: readonly string[], feed: FeedTransaction): Promise<boolean> {
-  const { rows } = await tx.query<{ seen: boolean; version: string }>(
-    `(SELECT true AS seen, version FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND seq <= $3 ORDER BY seq DESC LIMIT 1)
-     UNION ALL SELECT false, version FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND seq > $3
+  const { rows } = await tx.query<{ since: boolean; version: string }>(
+    `(SELECT false AS since, version FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND seq <= $3 ORDER BY seq DESC LIMIT 1)
+     UNION ALL SELECT true, version FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND seq > $3
      UNION ALL SELECT false, version FROM import_late_edit WHERE user_id = $1 AND facet_key = $2`,
     [userId, e.facetKey, e.basisSeq.toString()],
   );
   // The event at the basis is in the first part only: `>` and `>=` read the same in the second.
-  const rivals = [...rows.filter((r) => r.seen || !isServerVersion(r.version)).map((r) => r.version), ...placedHere];
-  if (rivals.some((v) => compareVersion(e.version, v) <= 0)) return false;
-  // `now` is a rival, which the edit is above, or a server write, which no device version equals.
-  const now = (await facetsNow(tx, userId, [e.facetKey])).get(e.facetKey);
-  if (now === undefined || compareVersion(e.version, now.version) > 0) return (await applyEvent(tx, userId, e, feed)).applied;
-  if (!sameValue(e, now)) {
-    const version = canonicalVersion({ instant: (await serverNow(tx)).iso, counter: 0, deviceId: SERVER_DEVICE_ID });
-    await applyEvent(tx, userId, { facetKey: e.facetKey, op: e.op, payload: e.payload, version: writeVersion(version, now.version) }, feed);
-  }
-  return true;
+  if (rows.some((r) => r.since && isServerVersion(r.version))) return false;
+  if ([...rows.map((r) => r.version), ...placedHere].some((v) => compareVersion(e.version, v) <= 0)) return false;
+  // Every feed event since the basis is a device edit the edit is above, so LWW applies it.
+  return (await applyEvent(tx, userId, e, feed)).applied;
 }
 
 /** The replay of S's late edits in one Push: held, the decision as it was, or a revision. */
