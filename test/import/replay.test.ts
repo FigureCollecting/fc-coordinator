@@ -1688,6 +1688,80 @@ describe('a late edit competes by LWW only with the device writes it races: a se
   });
 });
 
+describe("the STALE guard reads each late edit's own basis, and leaves out the writes of every import the edit is replayed for, from its transaction's start", () => {
+  const revisions = async (userId: string) => (await db.admin.query('SELECT 1 FROM import_revision WHERE user_id = $1', [userId])).rows.length;
+  const noteKey = (S: string) => `uf/${S}/note`;
+
+  it("a late note meets a revision's note write that came before the import it is replayed for: STALE, with no revision of that import, so nothing is emitted above that write", async () => {
+    const a = await SyncCaller.enrol(h);
+    const [d, g] = [await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a)];
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: dSaw } = await drain(d);
+    // d's offline note agrees with what MFC says next: its revision raises no conflict.
+    const dn = edit(d, noteKey(S), { note: 'n2' }, dSaw, 0);
+    await sleep(5);
+    await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    const { cursor: gSaw } = await drain(g);
+    const { cursor: aSaw } = await drain(a);
+    expect(outcomes(await pushed(d, [dn]))).toEqual(['APPLIED']);
+    const r0 = (await drain(a, aSaw)).events.filter((e) => e.facetKey === noteKey(S));
+    expect(r0).toHaveLength(1);
+    expect(r0[0]!.version).toMatch(/#0{32}$/);
+    expect(await revisions(a.userId)).toBe(1);
+    expect(await pending(a)).toBe(0n);
+    // A third import settles S after that write; g's note, made before it, is late for import 3 only.
+    await imported(a, [row(x, 'Owned', { note: 'n3' })], '2026-09-30');
+    const res = await pushed(g, [edit(g, noteKey(S), { note: 'g-note' }, gSaw, 120_000)]);
+    expect(outcomes(res)).toEqual(['STALE']);
+    expect(await revisions(a.userId)).toBe(1);
+    expect(await heldCount(a.userId)).toBe(0);
+    expect((await stateOf(a)).get(noteKey(S))).toMatchObject({ note: 'n3' });
+  });
+
+  it("one push, a late score edit made before a revision and a late note made after its device pulled it: the note does not meet the revision's write, and both are APPLIED", async () => {
+    const a = await SyncCaller.enrol(h);
+    const [d, g] = [await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a)];
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { note: 'n1', score: '7/10' })]);
+    const { cursor: dSaw } = await drain(d);
+    const dn = edit(d, noteKey(S), { note: 'n2' }, dSaw, 0);
+    await sleep(5);
+    await imported(a, [row(x, 'Owned', { note: 'n2', score: '7/10' })], DATE_B);
+    const { cursor: gSaw } = await drain(g);
+    // g's score edit, made offline before the revision.
+    const gs = edit(g, `uf/${S}/score`, { score: 9 }, gSaw, 60_000);
+    expect(outcomes(await pushed(d, [dn]))).toEqual(['APPLIED']);
+    expect(await revisions(a.userId)).toBe(1);
+    // g pulls the revision's note write, then edits the note, before import 3.
+    const { cursor: gSaw2 } = await drain(g, gSaw);
+    await imported(a, [row(x, 'Owned', { note: 'n3', score: '7/10' })], '2026-09-30');
+    const res = await pushed(g, [gs, edit(g, noteKey(S), { note: 'g-note' }, gSaw2, 120_000)]);
+    expect(outcomes(res)).toEqual(['APPLIED', 'APPLIED']);
+    expect(await heldCount(a.userId)).toBe(0);
+    const state = await stateOf(a);
+    expect(state.get(noteKey(S))).toMatchObject({ note: 'g-note' });
+    expect(state.get(`uf/${S}/score`)).toMatchObject({ score: 9 });
+  });
+
+  it("a late note late for two imports, where the earlier wrote the note and the note changes its decision: HELD for the two settled imports, not STALE for the earlier import's write", async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { note: 'n1', score: '7/10' })]);
+    const { cursor: bSaw } = await drain(b);
+    await imported(a, [row(x, 'Owned', { note: 'n2', score: '7/10' })], DATE_B);
+    await imported(a, [row(x, 'Owned', { note: 'n2', score: '8/10' })], '2026-09-30');
+    const res = await pushed(b, [edit(b, noteKey(S), { note: 'b-note' }, bSaw, 120_000)]);
+    expect(outcomes(res)).toEqual(['HELD']);
+    expect(await heldCount(a.userId)).toBe(1);
+    expect(await revisions(a.userId)).toBe(0);
+    expect((await stateOf(a)).get(noteKey(S))).toMatchObject({ note: 'n2' });
+  });
+});
+
 describe("a late edit meets only its own user's server writes", () => {
   it("another user's import of the same MFC figure writes the same figure-value key after the late edit's basis: the late note still stands", async () => {
     const { a, b } = await twoDevices();
