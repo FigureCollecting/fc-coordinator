@@ -762,8 +762,9 @@ import, is LATE (`src/import/holds.ts`,
 `replay.ts`); moving a copy into or out of such a figure counts. It is replayed
 just before the earliest such import, against the figure as that import found it
 (`import_frame.before`). A late edit whose facet a server write followed since
-its basis, other than one of the import it is replayed before (a revision's
-write, a re-emission included), is STALE first: its device had not seen it,
+its basis, other than the writes of the imports it is replayed for (each from
+its transaction's start to its marker; a revision's write, a re-emission
+included, is never one of them), is STALE first: its device had not seen it,
 and it neither stands nor changes the import's decision. An import settles a figure when its decision is not a
 conflict and writes a facet of the figure's copies or values, or moves a copy or
 field base of it (`import_frame.settled`); the figure item it raises, keeps,
