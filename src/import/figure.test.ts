@@ -247,6 +247,46 @@ describe('takeEffect: which copies it changes', () => {
   });
 });
 
+describe('takeEffect: the user\'s own copy of the figure counts before any copy is made (WK-14d)', () => {
+  const elsewhere = '20000000-0000-4000-8000-000000000002';
+
+  it('binds a hand copy live at the kind: no copy is made and none is changed', () => {
+    const e = takeEffect(view(copy(O1, 'owned')), S, [row(1)], comps('alike'), occId);
+    expect([...e.statuses]).toEqual([]);
+    expect(e.created).toEqual([]);
+  });
+
+  it('binds only as many as MFC lacks: Count 2 beside one hand copy makes one, at the row\'s first ordinal', () => {
+    const e = takeEffect(view(copy(O1, 'owned')), S, [row(2)], comps('apply'), occId);
+    expect(e.created.map((c) => [c.kind, c.ordinal])).toEqual([['owned', 1]]);
+    // Two hand copies beside a Count of 1: the second is the user's own and stays.
+    const two = takeEffect(view([...copy(O1, 'owned'), ...copy(O2, 'owned')]), S, [row(1)], comps('matched+app-only'), occId);
+    expect([...two.statuses]).toEqual([]);
+    expect(two.created).toEqual([]);
+  });
+
+  it('binds a live copy whose base is out, the one REALIGN left beyond an earlier Count', () => {
+    const e = takeEffect(view(copy(O1, 'owned', 1), [[O1, based('out')]]), S, [row(1)], comps('apply'), occId);
+    expect([...e.statuses]).toEqual([]);
+    expect(e.created).toEqual([]);
+  });
+
+  it('binds a live hand copy before it restores a tracked copy the app sold', () => {
+    const e = takeEffect(view([...copy(O1, 'former', 1), ...copy(O2, 'owned')], [[O1, based('owned')]], [row(1)]), S, [row(1)], comps('conflict'), occId);
+    expect([...e.statuses]).toEqual([]);
+    expect(e.created).toEqual([]);
+  });
+
+  it('never binds a hand copy of another kind, nor one now on another figure: those stay and MFC\'s copy is made', () => {
+    const wished = takeEffect(view(copy(O1, 'wished')), S, [row(1)], comps('apply'), occId);
+    expect([...wished.statuses]).toEqual([]);
+    expect(wished.created.map((c) => c.kind)).toEqual(['owned']);
+    const moved = takeEffect(view(copy(O1, 'owned', undefined, elsewhere), [[O1, based('out')]]), S, [row(1)], comps('apply'), occId);
+    expect([...moved.statuses]).toEqual([]);
+    expect(moved.created.map((c) => c.kind)).toEqual(['owned']);
+  });
+});
+
 describe('the knowing keeps an answer adds and ends', () => {
   const final = new Map<string, 'owned' | 'out'>([
     [O1, 'owned'],
