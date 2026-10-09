@@ -294,8 +294,8 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
     for (const { e } of replayed) if (!out.has(e.index)) toPlace.set(e.index, e);
     const lateHere = new Set(toPlace.keys());
     const lastLate = new Map([...toPlace.values()].sort(byIndex).map((e) => [e.facetKey, e.index]));
-    // None of these has an outcome yet: edits to one key are one unit, held or revised whole.
-    for (const o of edits) if (o.index < (lastLate.get(o.facetKey) ?? -1)) toPlace.set(o.index, o);
+    // One with an outcome is skipped: a late edit a replay answered STALE stays STALE.
+    for (const o of edits) if (o.index < (lastLate.get(o.facetKey) ?? -1) && !out.has(o.index)) toPlace.set(o.index, o);
     const placedLate = new Map<string, string[]>();
     for (const e of [...toPlace.values()].sort(byIndex)) {
       if (!lateHere.has(e.index)) {
