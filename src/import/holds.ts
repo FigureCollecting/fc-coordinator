@@ -282,17 +282,25 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
 
     for (const t of placed) if (held.has(t.unit)) out.set(t.e.index, 'held');
     // A late edit no replay answered (a decision left as it was, its facet not written) is placed
-    // here by LWW, once though it is late on two figures: its outcome is known before it is kept.
-    // The service places the push's other edits after these, so each one ahead of a late edit in
-    // the push, to its key, is placed here too, before it: every edit to that key lands in push
-    // order, as on a figure no import framed.
+    // here by LWW (placeLate), once though it is late on two figures: its outcome is known before
+    // it is kept. The service places the push's other edits after these, so each one ahead of a
+    // late edit in the push, to its key, is placed here too, before it: every edit to that key
+    // lands in push order, as on a figure no import framed.
     const toPlace = new Map<number, PushedEdit>();
     for (const { e } of replayed) if (!out.has(e.index)) toPlace.set(e.index, e);
     const lastLate = new Map<string, number>();
     for (const e of toPlace.values()) lastLate.set(e.facetKey, Math.max(lastLate.get(e.facetKey) ?? -1, e.index));
+    const lateHere = new Set(toPlace.keys());
     for (const o of edits) if (!out.has(o.index) && o.index < (lastLate.get(o.facetKey) ?? -1)) toPlace.set(o.index, o);
+    const placedLate = new Map<string, string[]>();
     for (const e of [...toPlace.values()].sort((p, q) => p.index - q.index)) {
-      out.set(e.index, (await applyEvent(tx, userId, e, feed)).applied ? 'applied' : 'stale');
+      if (!lateHere.has(e.index)) {
+        out.set(e.index, (await applyEvent(tx, userId, e, feed)).applied ? 'applied' : 'stale');
+        continue;
+      }
+      const stands = await placeLate(tx, userId, e, placedLate.get(e.facetKey) ?? [], feed);
+      out.set(e.index, stands ? 'applied' : 'stale');
+      if (stands) placedLate.set(e.facetKey, [...(placedLate.get(e.facetKey) ?? []), e.version]);
     }
     // A STALE answer is final: only a late edit that stood is kept, under its earliest import, so a
     // later replay places it before that import and each later one.
@@ -307,6 +315,33 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
     }
     return out;
   };
+}
+
+/**
+ * A late edit the replay leaves standing, placed by LWW against what it competes with at its own
+ * version: its facet as its device saw it (the latest event at or before its basis), each device
+ * edit to it since, each late edit kept for later replays, and the late edits to it this push
+ * placed before it (`placedHere`). A server write since its basis is none of these: an import's
+ * would have made it STALE in its replay and an answer's holds it, so it is a revision's, which
+ * emits a device edit's value, or the value before the import, at a server version. One that
+ * stands below such a write is emitted above it, at a server version, and is APPLIED.
+ */
+async function placeLate(tx: SqlClient, userId: string, e: PushedEdit, placedHere: readonly string[], feed: FeedTransaction): Promise<boolean> {
+  const { rows } = await tx.query<{ seen: boolean; version: string }>(
+    `(SELECT true AS seen, version FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND seq <= $3 ORDER BY seq DESC LIMIT 1)
+     UNION ALL SELECT false, version FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND seq > $3
+     UNION ALL SELECT false, version FROM import_late_edit WHERE user_id = $1 AND facet_key = $2`,
+    [userId, e.facetKey, e.basisSeq.toString()],
+  );
+  const rivals = [...rows.filter((r) => r.seen || !isServerVersion(r.version)).map((r) => r.version), ...placedHere];
+  if (rivals.some((v) => compareVersion(e.version, v) <= 0)) return false;
+  const now = (await facetsNow(tx, userId, [e.facetKey])).get(e.facetKey);
+  if (now === undefined || compareVersion(e.version, now.version) > 0) return (await applyEvent(tx, userId, e, feed)).applied;
+  if (!sameValue(e, now)) {
+    const version = canonicalVersion({ instant: (await serverNow(tx)).iso, counter: 0, deviceId: SERVER_DEVICE_ID });
+    await applyEvent(tx, userId, { facetKey: e.facetKey, op: e.op, payload: e.payload, version: writeVersion(version, now.version) }, feed);
+  }
+  return true;
 }
 
 /** The replay of S's late edits in one Push: held, the decision as it was, or a revision. */
