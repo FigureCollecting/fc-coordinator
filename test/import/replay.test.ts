@@ -1361,9 +1361,11 @@ describe('a late edit meets the push and the device edits around it in push orde
     await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
     const { cursor: bNow } = await drain(b);
     const { cursor: aSaw } = await drain(a);
-    const res = await pushed(b, [edit(b, `uf/${S}/score`, { score: 3 }, bNow, 1000), edit(b, `uf/${S}/score`, { score: 9 }, bSaw, 5000)]);
+    const pushedNow = [edit(b, `uf/${S}/score`, { score: 3 }, bNow, 1000), edit(b, `uf/${S}/score`, { score: 9 }, bSaw, 5000)];
+    const res = await pushed(b, pushedNow);
     expect(outcomes(res)).toEqual(['APPLIED', 'APPLIED']);
-    expect((await drain(a, aSaw)).events.map((e) => (JSON.parse(e.payload) as { score: number }).score)).toEqual([3, 9]);
+    // Each at its own version: the late edit stands above the value it meets.
+    expect((await drain(a, aSaw)).events.map((e) => [e.version, e.payload])).toEqual(pushedNow.map((e) => [e.version, e.payload]));
     const { rows: runs } = await db.admin.query<{ n: number }>('SELECT max(import_number) AS n FROM import_run WHERE user_id = $1', [a.userId]);
     expect(await lateRows(a.userId)).toEqual([[`uf/${S}/score`, runs[0]!.n]]);
   });
@@ -1400,6 +1402,26 @@ describe('a late edit meets the push and the device edits around it in push orde
     const res = await pushed(b, [edit(b, `uf/${S}/score`, { score: 3 }, bNow, 1000), edit(b, `uf/${S}/score`, { score: 9 }, bSaw, 5000)]);
     expect(outcomes(res)).toEqual(['STALE', 'APPLIED']);
     expect((await stateOf(a)).get(`uf/${S}/score`)).toMatchObject({ score: 9 });
+  });
+
+  it('a copy moved between two figures: late edits to one key, late on different figures, and an edit between them that is not late, land in push order', async () => {
+    const { a, b } = await twoDevices();
+    const [x, y] = [nextId(), nextId()];
+    // The figure on which only the oldest filing is late sorts first: the replay visits that filing first.
+    const [first, second] = [x, y].sort((p, q) => (headFor(p) < headFor(q) ? -1 : 1)) as [string, string];
+    const cx = importOccId(KEY, a.userId, first, 1);
+    await imported(a, [row(first, 'Owned', { note: 'n1' }), row(second, 'Owned', { note: 'n1' })]);
+    const { cursor: oldest } = await drain(b);
+    await imported(a, [row(first, 'Owned', { note: 'n2' }), row(second, 'Owned', { note: 'n1' })], DATE_B);
+    const { cursor: mid } = await drain(b);
+    await imported(a, [row(first, 'Owned', { note: 'n2' }), row(second, 'Owned', { note: 'n2' })], DATE_B);
+    const { cursor: now } = await drain(b);
+    const { cursor: aSaw } = await drain(a);
+    const filing = (basis: string, ms: number) => edit(b, `occ/${cx}/collection`, { collection: `owned/${randomUUID()}` }, basis, ms);
+    // Late on the second figure only, not late, late on both; then the move, not late.
+    const events = [filing(mid, 1000), filing(now, 2000), filing(oldest, 3000), edit(b, `occ/${cx}/head`, { head_id: headFor(second) }, now, 4000)];
+    expect(outcomes(await pushed(b, events))).toEqual(['APPLIED', 'APPLIED', 'APPLIED', 'APPLIED']);
+    expect((await drain(a, aSaw)).events.map((e) => e.payload)).toEqual(events.map((e) => e.payload));
   });
 
   it('control: an edit that is not late and comes after the late one in the push is still placed after it, by LWW', async () => {

@@ -299,6 +299,7 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
     const placedLate = new Map<string, string[]>();
     for (const e of [...toPlace.values()].sort(byIndex)) {
       if (!lateHere.has(e.index)) {
+        // An edit that is not late is placed as the service places it: LWW against the facet as it is.
         out.set(e.index, (await applyEvent(tx, userId, e, feed)).applied ? 'applied' : 'stale');
         continue;
       }
@@ -337,8 +338,10 @@ async function placeLate(tx: SqlClient, userId: string, e: PushedEdit, placedHer
      UNION ALL SELECT false, version FROM import_late_edit WHERE user_id = $1 AND facet_key = $2`,
     [userId, e.facetKey, e.basisSeq.toString()],
   );
+  // The event at the basis is in the first part only: `>` and `>=` read the same in the second.
   const rivals = [...rows.filter((r) => r.seen || !isServerVersion(r.version)).map((r) => r.version), ...placedHere];
   if (rivals.some((v) => compareVersion(e.version, v) <= 0)) return false;
+  // `now` is a rival, which the edit is above, or a server write, which no device version equals.
   const now = (await facetsNow(tx, userId, [e.facetKey])).get(e.facetKey);
   if (now === undefined || compareVersion(e.version, now.version) > 0) return (await applyEvent(tx, userId, e, feed)).applied;
   if (!sameValue(e, now)) {
