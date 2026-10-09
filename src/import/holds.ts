@@ -4,7 +4,8 @@
 // replayed just before the earliest such import, against S as that import found it (./replay.ts):
 //
 //   * the import decides S the same way: the edit is placed as it would have been. It is STALE
-//     where the import (placed after it) wrote its facet, and placed by LWW otherwise;
+//     where the import (placed after it) wrote its facet, and placed by LWW otherwise, at its own
+//     version against the device edits it competes with (placeLate);
 //   * the import decides S otherwise: a REVISION. The server emits, in the Push's transaction, each
 //     difference between S replayed and S as it has emitted it, moves S's bases, item and keeps to
 //     the replay's, and records the revision when S's live copies or items change.
@@ -29,9 +30,11 @@
 // kept with its basis (held_edit) and answered HELD with `current`; the held-edit card that shows
 // and answers it is not built yet, though StatusResponse.pending_review counts it.
 //
-// Not late, as in WK-14a: an edit to a figure an import framed without settling it (a marker-only
-// re-import, a conflict it only raised). LWW places it, so one that would have settled the
-// conflict, replayed before that import, leaves the item pending.
+// Not late, as in WK-14a: an edit to a figure an import framed without settling it. An import
+// settles S when its decision of S is not a conflict and writes a facet of S's copies or values,
+// or moves a copy or field base of S (plan.ts `settled`); the figure item it raises, keeps,
+// rewrites or ends, and the row bases it moves, settle nothing. LWW places such an edit, so one
+// that would have settled the conflict, replayed before that import, leaves the item pending.
 //
 // Units: one push's edits to one copy's head, status, collection and disposal are one unit; every
 // other edit is a unit with the push's other edits of its key. A unit is held or replayed whole.
@@ -286,14 +289,15 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
     // it is kept. The service places the push's other edits after these, so each one ahead of a
     // late edit in the push, to its key, is placed here too, before it: every edit to that key
     // lands in push order, as on a figure no import framed.
+    const byIndex = (p: PushedEdit, q: PushedEdit) => p.index - q.index;
     const toPlace = new Map<number, PushedEdit>();
     for (const { e } of replayed) if (!out.has(e.index)) toPlace.set(e.index, e);
-    const lastLate = new Map<string, number>();
-    for (const e of toPlace.values()) lastLate.set(e.facetKey, Math.max(lastLate.get(e.facetKey) ?? -1, e.index));
     const lateHere = new Set(toPlace.keys());
-    for (const o of edits) if (!out.has(o.index) && o.index < (lastLate.get(o.facetKey) ?? -1)) toPlace.set(o.index, o);
+    const lastLate = new Map([...toPlace.values()].sort(byIndex).map((e) => [e.facetKey, e.index]));
+    // None of these has an outcome yet: edits to one key are one unit, held or revised whole.
+    for (const o of edits) if (o.index < (lastLate.get(o.facetKey) ?? -1)) toPlace.set(o.index, o);
     const placedLate = new Map<string, string[]>();
-    for (const e of [...toPlace.values()].sort((p, q) => p.index - q.index)) {
+    for (const e of [...toPlace.values()].sort(byIndex)) {
       if (!lateHere.has(e.index)) {
         out.set(e.index, (await applyEvent(tx, userId, e, feed)).applied ? 'applied' : 'stale');
         continue;

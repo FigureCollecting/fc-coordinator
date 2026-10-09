@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { create } from '@bufbuild/protobuf';
-import { PushOutcome, SyncOp, canonicalVersion, type SyncEvent } from '@figurecollecting/fc-api-contract';
+import { PushOutcome, SyncOp, canonicalVersion, compareVersion, type SyncEvent } from '@figurecollecting/fc-api-contract';
 import { GetProductsResponseSchema } from '@figurecollecting/ingest-contract/read';
 import { Ajv2020 } from 'ajv/dist/2020.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -141,6 +141,8 @@ const lateRows = async (userId: string) =>
       [userId],
     )
   ).rows.map((r) => [r.facet_key, r.import_number]);
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Device a imports; device b had pulled only what `setup` imported, and edits offline. */
 async function twoDevices(): Promise<{ a: SyncCaller; b: SyncCaller }> {
@@ -1384,6 +1386,22 @@ describe('a late edit meets the push and the device edits around it in push orde
     expect((await drain(a, aSaw)).events.map((e) => (JSON.parse(e.payload) as { score: number }).score)).toEqual([1, 2, 3]);
   });
 
+  it('an edit that is not late, older than the value it meets, ahead of a newer late edit to the same key: STALE, then the late edit APPLIED', async () => {
+    const { a, b } = await twoDevices();
+    const c = await SyncCaller.sibling(h, a);
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    const { cursor: cSaw } = await drain(c);
+    expect(outcomes(await pushed(c, [edit(c, `uf/${S}/score`, { score: 5 }, cSaw, 3000)]))).toEqual(['APPLIED']);
+    const { cursor: bNow } = await drain(b);
+    const res = await pushed(b, [edit(b, `uf/${S}/score`, { score: 3 }, bNow, 1000), edit(b, `uf/${S}/score`, { score: 9 }, bSaw, 5000)]);
+    expect(outcomes(res)).toEqual(['STALE', 'APPLIED']);
+    expect((await stateOf(a)).get(`uf/${S}/score`)).toMatchObject({ score: 9 });
+  });
+
   it('control: an edit that is not late and comes after the late one in the push is still placed after it, by LWW', async () => {
     const { a, b } = await twoDevices();
     const x = nextId();
@@ -1399,13 +1417,12 @@ describe('a late edit meets the push and the device edits around it in push orde
 });
 
 describe('a late edit competes by LWW with the device edits placed before its import at their own versions, never with the server version a revision re-emitted one under', () => {
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const collectionOf = async (c: SyncCaller, occ: string) => ((await stateOf(c)).get(`occ/${occ}/collection`) as { collection?: string } | undefined)?.collection;
 
   /**
    * x Owned, and a files its copy cx on an owned shelf; the second import moves x to Ordered and
    * refiles cx. d's filing F and g's filing G of cx are made after a's and before that import (F
-   * before G, or G before F), and pushed after it. d's push also adds an ordered hand copy, which
+   * before G, or G before F; g's filing `mid` between the two), and pushed after it. d's push also adds an ordered hand copy, which
    * MFC's move pairs with: the revision refiles nothing, and F stands, re-emitted at a server
    * version above the import's refile.
    */
@@ -1423,6 +1440,8 @@ describe('a late edit competes by LWW with the device edits placed before its im
     await sleep(5);
     const first = gFirst ? edit(g, `occ/${cx}/collection`, { collection: shelfG }, gSaw, 0) : edit(d, `occ/${cx}/collection`, { collection: shelfF }, dSaw, 0);
     await sleep(5);
+    const mid = edit(g, `occ/${cx}/collection`, { collection: `owned/${randomUUID()}` }, gSaw, 0);
+    await sleep(5);
     const second = gFirst ? edit(d, `occ/${cx}/collection`, { collection: shelfF }, dSaw, 0) : edit(g, `occ/${cx}/collection`, { collection: shelfG }, gSaw, 0);
     const [F, G] = gFirst ? [second, first] : [first, second];
     const hand = randomUUID();
@@ -1434,7 +1453,7 @@ describe('a late edit competes by LWW with the device edits placed before its im
     const refiled = (await drain(a, aSaw)).events.filter((e) => e.facetKey === `occ/${cx}/collection`);
     expect(refiled.map((e) => e.payload)).toEqual([F.payload]);
     expect(refiled[0]!.version).toMatch(/#0{32}$/);
-    return { a, g, cx, G, shelfF, shelfG };
+    return { a, g, cx, G, mid, shelfF, shelfG };
   }
 
   it('a late filing stamped above the filing a revision re-emitted is APPLIED, and stands', async () => {
@@ -1445,11 +1464,99 @@ describe('a late edit competes by LWW with the device edits placed before its im
     expect(await lateRows(a.userId)).toContainEqual([`occ/${cx}/collection`, expect.any(Number)]);
   });
 
+  it('two late filings in one push, the first stamped above the re-emitted filing and the second between the two: the second is STALE', async () => {
+    const { a, g, cx, G, mid, shelfG } = await reEmitted(false);
+    const res = await pushed(g, [G, mid]);
+    expect(outcomes(res)).toEqual(['APPLIED', 'STALE']);
+    expect(await collectionOf(a, cx)).toBe(shelfG);
+  });
+
+  it('a late filing that stands with the value the revision re-emitted writes nothing; the same filing pushed again is STALE', async () => {
+    const { a, g, cx, G, shelfF } = await reEmitted(false);
+    const same = { ...G, payload: JSON.stringify({ collection: shelfF, ...DISPLAY }) };
+    const { cursor: aSaw } = await drain(a);
+    expect(outcomes(await pushed(g, [same]))).toEqual(['APPLIED']);
+    expect((await drain(a, aSaw)).events).toEqual([]);
+    expect(outcomes(await pushed(g, [same]))).toEqual(['STALE']);
+  });
+
+  it('a late filing that stands below a re-emitted filing minted ahead of the server clock is emitted above it', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [p, q, g] = [await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a)];
+    const x = nextId();
+    const S = headFor(x);
+    const cx = importOccId(KEY, a.userId, x, 1);
+    // Two minutes ahead (a device may run up to five): every write minted over it is ahead too.
+    const T = new Date(Date.now() + 120_000);
+    const at = (c: SyncCaller, counter: number) => canonicalVersion({ instant: T, counter, deviceId: c.deviceId });
+    const [lo, hi] = compareVersion(at(p, 1), at(q, 1)) < 0 ? [p, q] : [q, p];
+    const filing = (c: SyncCaller, counter: number, basis: string) => ({
+      facetKey: `occ/${cx}/collection`,
+      version: at(c, counter),
+      op: SyncOp.UPSERT,
+      payload: JSON.stringify({ collection: `owned/${randomUUID()}`, ...DISPLAY }),
+      basis,
+    });
+    await imported(a, [row(x, 'Owned')]);
+    const { cursor: loSaw } = await drain(lo);
+    expect(outcomes(await pushed(lo, [filing(lo, 1, loSaw)]))).toEqual(['APPLIED']);
+    const [{ cursor: hiSaw }, { cursor: gSaw }] = [await drain(hi), await drain(g)];
+    // The import refiles cx at (T, 2, server); F at (T, 1) is below it, G at (T, 2, g) above F.
+    const F = filing(hi, 1, hiSaw);
+    const G = filing(g, 2, gSaw);
+    const hand = randomUUID();
+    await imported(a, [row(x, 'Ordered')], DATE_B);
+    expect(outcomes(await pushed(hi, [edit(hi, `occ/${hand}/head`, { head_id: S }, hiSaw), edit(hi, `occ/${hand}/status`, { status: 'ordered' }, hiSaw), F]))).toEqual([
+      'APPLIED',
+      'APPLIED',
+      'APPLIED',
+    ]);
+    const { cursor: aSaw } = await drain(a);
+    expect(outcomes(await pushed(g, [G]))).toEqual(['APPLIED']);
+    const tail = (await drain(a, aSaw)).events;
+    expect(tail.map((e) => e.payload)).toEqual([G.payload]);
+    expect(compareVersion(tail[0]!.version, at(g, 3))).toBeGreaterThan(0);
+  });
+
   it('a late filing stamped below the filing a revision re-emitted is STALE, with that filing', async () => {
     const { a, g, cx, G, shelfF } = await reEmitted(true);
     const res = await pushed(g, [G]);
     expect(outcomes(res)).toEqual(['STALE']);
     expect(JSON.parse(res.results[0]!.current!.payload)).toMatchObject({ collection: shelfF });
     expect(await collectionOf(a, cx)).toBe(shelfF);
+  });
+});
+
+describe('a late edit the replay leaves standing still meets, at its version, what its device saw', () => {
+  it("a late move stamped below the import write its device had seen is STALE, though the import it is late for wrote no facet of the copy", async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    // Stamped a minute before the first import's write, which b had pulled.
+    const res = await pushed(b, [edit(b, `occ/${cx}/status`, { status: 'wished' }, bSaw, -60_000)]);
+    expect(outcomes(res)).toEqual(['STALE']);
+    expect(JSON.parse(res.results[0]!.current!.payload)).toMatchObject({ status: 'owned' });
+    expect(await lateRows(a.userId)).toEqual([]);
+  });
+
+  it('a late move whose basis is the very event of an undo it saw meets that undo, though it breaks THE FACET FLOOR and is stamped below it', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const S = headFor(x);
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned')]);
+    const re = await imported(a, [row(x, 'Wished')], DATE_B);
+    const move = edit(b, `occ/${cx}/status`, { status: 'ordered' }, '', 0);
+    await sleep(5);
+    const { cursor } = await drain(a);
+    expect(outcomes(await pushed(a, [answer(a, S, { item: 'change', rev: re.applied[0]!.rev, choice: 'undo' }, cursor)]))).toEqual(['APPLIED']);
+    const { rows } = await db.admin.query<{ seq: string }>('SELECT max(seq) AS seq FROM feed_event WHERE user_id = $1 AND facet_key = $2', [a.userId, `occ/${cx}/status`]);
+    await imported(a, [row(x, 'Wished', { note: 'n3' })], '2026-09-30');
+    const res = await pushed(b, [{ ...move, basis: encodeCursor(BigInt(rows[0]!.seq)) }]);
+    expect(outcomes(res)).toEqual(['STALE']);
+    expect(JSON.parse(res.results[0]!.current!.payload)).toMatchObject({ status: 'owned' });
   });
 });

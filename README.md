@@ -757,13 +757,24 @@ export cannot account for, knowing keeps included; contract 0.3.0 has no RPC
 for it, so nothing serves it yet. `StatusResponse.pending_review` counts the
 pending figure items and the held edits.
 
-A Push edit to a figure an import settled (wrote to, or moved a copy or field
-base of), made before its device saw that import, is LATE (`src/import/holds.ts`,
+A Push edit to a figure an import settled, made before its device saw that
+import, is LATE (`src/import/holds.ts`,
 `replay.ts`); moving a copy into or out of such a figure counts. It is replayed
 just before the earliest such import, against the figure as that import found it
-(`import_frame.before`). If the import decides the figure the same way, the edit
-is placed as it would have been: STALE where the import wrote its facet, by LWW
-otherwise. If not, the Push emits each difference between the figure replayed
+(`import_frame.before`). An import settles a figure when its decision is not a
+conflict and writes a facet of the figure's copies or values, or moves a copy or
+field base of it (`import_frame.settled`); the figure item it raises, keeps,
+rewrites or ends, and the row bases it moves, settle nothing. If the import
+decides the figure the same way, the edit is placed as it would have been: STALE
+where the import wrote its facet, else by LWW at the edit's own version against
+what it competes with there: its facet as its device saw it, each device edit
+to it since and each late edit kept for a replay. A server write since its basis
+is none of these (an import's would have made it STALE, an answer's holds it):
+it is a revision's, which emits one of them, or the value before the import, at
+a server version. An edit that stands below such a write is emitted above it at
+a server version and answered APPLIED; one that loses is STALE. Each edit of the
+Push ahead of a late edit, to its key, is placed before it, so every key lands
+in push order. If not, the Push emits each difference between the figure replayed
 and as emitted, and moves its bases, item and knowing keeps to the replay's (a
 REVISION; `import_revision` keeps one that changed the figure's live copies or
 items). A STALE answer is final: only a late edit that stood (APPLIED) is kept
@@ -780,9 +791,10 @@ built for them: a revision on a figure with any other activity since the import
 one, a copy moved between two late figures, an edit whose replay changes
 nothing while an answer on the figure followed its basis, a frame recorded
 before 0006, a replica without the import key. A held edit has no card yet,
-though `pending_review` counts it. A marker-only re-import, or a figure an import
-only raised a conflict on, does not make an edit late: LWW places it, so a late
-edit that would have settled such a conflict leaves the item pending. Not built
+though `pending_review` counts it. A frame that settled nothing (a marker-only
+re-import, a figure the import only raised, kept or ended an item on) does not
+make an edit late: LWW places it, so a late edit that would have settled such a
+conflict leaves the item pending. Not built
 yet: divergence items, align-MFC entries and acknowledgements, settlement by a
 FAVOR preference and held-edit cards.
 
