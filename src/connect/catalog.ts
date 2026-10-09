@@ -28,8 +28,9 @@
 // and binds its keyset token to its own form), forwards one page for one page,
 // and maps each hit through the same allowlist as GetProducts. Only what the
 // contract states as a number is checked here first: an empty query, and one
-// over 256 code points in the NFKC-normalized, White_Space-trimmed form. The
-// page size is capped at 50 on the way out, and a spine page over 50 is
+// over 256 code points in the NFKC-normalized, White_Space-trimmed form (a raw
+// query too long ever to come within 256 is refused before it is normalized).
+// The page size is capped at 50 on the way out, and a spine page over 50 is
 // refused rather than truncated. A spine refusal of a STALE token (ErrorInfo
 // TOKEN_EXPIRED_OR_REBASED in figurecollecting.com) reaches the client as
 // INVALID_ARGUMENT carrying that same (domain, reason) pair, rebuilt here;
@@ -78,6 +79,18 @@ export const MAX_SEARCH_PAGE = 50;
 
 /** A query's bound in code points, counted in the NFKC-normalized, trimmed form (read.proto 0.9.0). */
 export const MAX_SEARCH_QUERY_CHARS = 256;
+
+/**
+ * The longest raw query, in UTF-16 units after the White_Space trim, that is
+ * normalized at all: 256 x 18 x 2 = 9,216. NFKC never drops a code point,
+ * never turns one that is not White_Space into only White_Space, and composes
+ * at most 4 into one (U+1F82 is the longest canonical decomposition), so a raw
+ * query over 9,216 units, at least 4,609 code points, normalizes to at least
+ * 1,153: never within 256. Refusing it unread bounds what NFKC is
+ * given, which is quadratic in a run of combining marks it must reorder; 18 is
+ * NFKC's largest expansion (U+FDFA), so its output is at most 165,888 points.
+ */
+export const MAX_RAW_SEARCH_QUERY_UNITS = MAX_SEARCH_QUERY_CHARS * 18 * 2;
 
 /** The (domain, reason) pair read.proto 0.9.0 names for a search token issued before a ranking or encoding change. */
 export const STALE_SEARCH_TOKEN = { reason: 'TOKEN_EXPIRED_OR_REBASED', domain: 'figurecollecting.com' } as const;
@@ -551,11 +564,11 @@ function trimWhiteSpace(text: string): string {
  * White_Space trimmed) and returned AS TYPED: that form is the spine's to make.
  */
 function searchQuery(query: string): string {
+  const tooLong = (): ConnectError => invalid(`query must not exceed ${MAX_SEARCH_QUERY_CHARS} characters`);
+  if (trimWhiteSpace(query).length > MAX_RAW_SEARCH_QUERY_UNITS) throw tooLong();
   const form = trimWhiteSpace(query.normalize('NFKC'));
   if (form === '') throw invalid('query must not be empty or only whitespace');
-  if (longerThan(form, MAX_SEARCH_QUERY_CHARS)) {
-    throw invalid(`query must not exceed ${MAX_SEARCH_QUERY_CHARS} characters`);
-  }
+  if (longerThan(form, MAX_SEARCH_QUERY_CHARS)) throw tooLong();
   return query;
 }
 
