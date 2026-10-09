@@ -917,6 +917,53 @@ describe('(f) SearchProducts — the query, validated before anything leaves the
     expect(harness.spine.wire).toHaveLength(0);
   });
 
+  // NFKC itself is quadratic in a run of combining marks it must reorder (marks
+  // of alternating combining class), and it ran on the whole raw query. A raw
+  // query, once trimmed, longer than 9,216 UTF-16 units can never come within
+  // 256 code points, so it is refused unread. 'e' + U+0301 needs no reordering
+  // and was always fast; it pins the refusal, not the slowness.
+  it.each([
+    ['e and 200 000 U+0301', `e${'\u0301'.repeat(200_000)}`],
+    ['a and 64 Ki pairs of marks of combining class 230 and 220', `a${'\u0301\u0316'.repeat(64 * 1024)}`],
+  ])('refuses a query of %s within 250 ms, before any spine call', async (_label, query) => {
+    harness = await start();
+
+    const started = performance.now();
+    const err = await searchError(harness.catalog.searchProducts({ query }));
+    const elapsedMs = performance.now() - started;
+
+    expect(err.code).toBe(Code.InvalidArgument);
+    expect(err.rawMessage).toBe('query must not exceed 256 characters');
+    expect(elapsedMs).toBeLessThan(250);
+    expect(harness.spine.wire).toHaveLength(0);
+  });
+
+  // NFKC composes at most 4 code points into one (U+1F82 is α, U+0313, U+0300,
+  // U+0345), so the raw bound must leave room for 1,024 code points that
+  // normalize to 256.
+  it('accepts 1,024 code points that NFKC composes to 256 (U+1F82 spelled out), and sends it as typed', async () => {
+    harness = await start();
+    const query = '\u03B1\u0313\u0300\u0345'.repeat(256);
+    expect(query.normalize('NFKC')).toBe('\u1F82'.repeat(256));
+
+    expect(await codeOf(harness.catalog.searchProducts({ query }))).toBe('OK');
+    expect(harness.spine.searchCalls[0]?.request.query).toBe(query);
+  });
+
+  // The trim steps one unit at a time from each end: an odd-length pad pins the step.
+  it.each([
+    ['one leading ASCII space', ` ${'a'.repeat(257)}`],
+    ['three leading ideographic spaces', `${'\u3000'.repeat(3)}${'a'.repeat(257)}`],
+    ['one trailing ASCII space', `${'a'.repeat(257)} `],
+    ['three trailing ideographic spaces', `${'a'.repeat(257)}${'\u3000'.repeat(3)}`],
+  ])('refuses 257 letters behind %s as INVALID_ARGUMENT before any spine call', async (_label, query) => {
+    harness = await start();
+    const err = await searchError(harness.catalog.searchProducts({ query }));
+    expect(err.code).toBe(Code.InvalidArgument);
+    expect(err.rawMessage).toBe('query must not exceed 256 characters');
+    expect(harness.spine.wire).toHaveLength(0);
+  });
+
   it('accepts 256 letters inside 200 000 White_Space on each side, and sends it as typed', async () => {
     harness = await start();
     const pad = ' \u3000\u0085\t'.repeat(50_000);
