@@ -297,16 +297,10 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
     const lastLate = new Map([...toPlace.values()].sort(byIndex).map((e) => [e.facetKey, e.index]));
     // One with an outcome is skipped: a late edit a replay answered STALE stays STALE.
     for (const o of edits) if (o.index < (lastLate.get(o.facetKey) ?? -1) && !out.has(o.index)) toPlace.set(o.index, o);
-    const placedLate = new Map<string, string[]>();
     for (const e of [...toPlace.values()].sort(byIndex)) {
-      if (!lateHere.has(e.index)) {
-        // An edit that is not late is placed as the service places it: LWW against the facet as it is.
-        out.set(e.index, (await applyEvent(tx, userId, e, feed)).applied ? 'applied' : 'stale');
-        continue;
-      }
-      const stands = await placeLate(tx, userId, e, placedLate.get(e.facetKey) ?? [], feed);
-      out.set(e.index, stands ? 'applied' : 'stale');
-      if (stands) placedLate.set(e.facetKey, [...(placedLate.get(e.facetKey) ?? []), e.version]);
+      // An edit that is not late is placed as the service places it: LWW against the facet as it is.
+      const applied = lateHere.has(e.index) ? await placeLate(tx, userId, e, feed) : (await applyEvent(tx, userId, e, feed)).applied;
+      out.set(e.index, applied ? 'applied' : 'stale');
     }
     // A STALE answer is final: only a late edit that stood is kept, under its earliest import, so a
     // later replay places it before that import and each later one.
@@ -324,23 +318,18 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
 }
 
 /**
- * A late edit the replay leaves standing, placed by LWW at its own version against the device
- * writes it races: its facet as its device saw it (the latest event at or before its basis), each
- * device edit to it since, each late edit kept for later replays, and the late edits to it this push
- * placed before it (`placedHere`). A server write to it since its basis, an import's or a
- * revision's re-emission, is one its device had not seen: the edit is STALE, never emitted above it.
+ * A late edit the replay leaves standing. A server write to its facet since its basis, an import's
+ * or a revision's re-emission, is one its device had not seen: the edit is STALE, never emitted
+ * above it. Otherwise every write since its basis is a device edit it races, and LWW places it at
+ * its own version against the facet as it is: the value its device saw, those device edits, and
+ * the late edits kept or placed before it, each on the feed at or below that facet's version.
  */
-async function placeLate(tx: SqlClient, userId: string, e: PushedEdit, placedHere: readonly string[], feed: FeedTransaction): Promise<boolean> {
-  const { rows } = await tx.query<{ since: boolean; version: string }>(
-    `(SELECT false AS since, version FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND seq <= $3 ORDER BY seq DESC LIMIT 1)
-     UNION ALL SELECT true, version FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND seq > $3
-     UNION ALL SELECT false, version FROM import_late_edit WHERE user_id = $1 AND facet_key = $2`,
+async function placeLate(tx: SqlClient, userId: string, e: PushedEdit, feed: FeedTransaction): Promise<boolean> {
+  const { rows } = await tx.query<{ version: string }>(
+    'SELECT version FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND seq > $3',
     [userId, e.facetKey, e.basisSeq.toString()],
   );
-  // The event at the basis is in the first part only: `>` and `>=` read the same in the second.
-  if (rows.some((r) => r.since && isServerVersion(r.version))) return false;
-  if ([...rows.map((r) => r.version), ...placedHere].some((v) => compareVersion(e.version, v) <= 0)) return false;
-  // Every feed event since the basis is a device edit the edit is above, so LWW applies it.
+  if (rows.some((r) => isServerVersion(r.version))) return false;
   return (await applyEvent(tx, userId, e, feed)).applied;
 }
 
