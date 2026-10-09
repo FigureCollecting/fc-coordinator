@@ -1,7 +1,10 @@
 // import.proto HELD and LATE EDITS AND REPLAY, in Push. A LATE EDIT is a pushed edit to a copy or a
 // figure value of a figure S whose basis is before the marker of an import that settled S (wrote
 // to it or moved a base of it): its device made it without having seen that import. It is
-// replayed just before the earliest such import, against S as that import found it (./replay.ts):
+// replayed just before the earliest such import, against S as that import found it (./replay.ts).
+// One whose key a server write other than a replayed import's own followed since its basis (a
+// revision's write, of any import) is STALE first: it neither stands nor changes a decision.
+// The rest:
 //
 //   * the import decides S the same way: the edit is placed as it would have been. It is STALE
 //     where the import (placed after it) wrote its facet, or where any server write to the facet
@@ -96,7 +99,7 @@ interface Recorded {
 
 type Verdict =
   | { kind: 'hold' }
-  /** `stale`: the late edits (by index) a replayed decision wrote over; LWW places the rest. */
+  /** `stale`: the late edits (by index) a replayed decision wrote over or a server write since their basis met; LWW places the rest. */
   | { kind: 'unchanged'; stale: Set<number> }
   | { kind: 'revise'; write: (feed: FeedTransaction) => Promise<Map<number, LateOutcome>> };
 
@@ -352,9 +355,22 @@ async function replayFigure(
   if (answers.length > 0) return HOLD;
   const recorded = await readLateEdits(tx, userId, S);
 
+  // Each late edit a server write to its key followed since its basis, other than one of an import
+  // replayed here (from its transaction's start to its marker), such as a revision's re-emission:
+  // its device had not seen it. STALE before the replay, so it neither stands nor changes a decision.
+  const stale = new Set<number>();
+  const replayedImport = (seq: bigint) => settled.some((f) => seq >= f.start && seq <= f.marker);
+  for (const e of late) {
+    const { rows } = await tx.query<{ seq: string; version: string }>('SELECT seq, version FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND seq > $3', [
+      userId,
+      e.facetKey,
+      e.basisSeq.toString(),
+    ]);
+    if (rows.some((r) => isServerVersion(r.version) && !replayedImport(BigInt(r.seq)))) stale.add(e.index);
+  }
+
   // Each late edit an earlier frame's decision wrote over: STALE, and placed before no later import.
   // Per edit: one made after that import is not written over by it.
-  const stale = new Set<number>();
   for (const f of settled) {
     const frame: Frame = { importNumber: f.importNumber, exportDate: f.exportDate, before: f.before! };
     const here = late.filter((e) => e.basisSeq < f.marker && !stale.has(e.index));
@@ -369,7 +385,7 @@ async function replayFigure(
     if (!sameDecision(as, again)) {
       // A revision is built for one import whose figure nothing else touched since.
       if (settled.length > 1 || knowing) return HOLD;
-      return reviseOrHold(tx, userId, S, f, frame, late, placedBefore, recorded, pre, again);
+      return reviseOrHold(tx, userId, S, f, frame, late.filter((e) => !stale.has(e.index)), stale, placedBefore, recorded, pre, again);
     }
     // The same decision: `as` writes these keys too (sameDecision leaves out only item upserts, and
     // a late edit is never to an item).
@@ -391,6 +407,7 @@ async function reviseOrHold(
   f: FrameRow,
   frame: Frame,
   late: readonly PushedEdit[],
+  stale: ReadonlySet<number>,
   placedBefore: readonly Facet[],
   recorded: readonly Recorded[],
   pre: ReadonlyMap<string, Facet>,
@@ -458,7 +475,9 @@ async function reviseOrHold(
           JSON.stringify(changed),
         ]);
       }
-      return new Map(late.map((e): [number, LateOutcome] => [e.index, replay.get(e.facetKey)?.version === e.version ? 'applied' : 'stale']));
+      const out = new Map<number, LateOutcome>([...stale].map((index) => [index, 'stale']));
+      for (const e of late) out.set(e.index, replay.get(e.facetKey)?.version === e.version ? 'applied' : 'stale');
+      return out;
     },
   };
 }

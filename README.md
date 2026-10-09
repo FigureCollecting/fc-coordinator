@@ -761,7 +761,10 @@ A Push edit to a figure an import settled, made before its device saw that
 import, is LATE (`src/import/holds.ts`,
 `replay.ts`); moving a copy into or out of such a figure counts. It is replayed
 just before the earliest such import, against the figure as that import found it
-(`import_frame.before`). An import settles a figure when its decision is not a
+(`import_frame.before`). A late edit whose facet a server write followed since
+its basis, other than one of the import it is replayed before (a revision's
+write, a re-emission included), is STALE first: its device had not seen it,
+and it neither stands nor changes the import's decision. An import settles a figure when its decision is not a
 conflict and writes a facet of the figure's copies or values, or moves a copy or
 field base of it (`import_frame.settled`); the figure item it raises, keeps,
 rewrites or ends, and the row bases it moves, settle nothing. If the import
@@ -771,7 +774,7 @@ import's, or a revision's re-emission) followed the edit's basis, since its
 device had not seen it; else by LWW at the edit's own version against the device
 writes it races there: its facet as its device saw it, each device edit to it
 since and each late edit kept for a replay. A late edit is never emitted above
-a server write. Each edit of the Push ahead of a late edit, to its key, is
+a server write it had not seen, in a revision either. Each edit of the Push ahead of a late edit, to its key, is
 placed before it, so every key lands in push order; one that is not late is
 placed by plain LWW against the facet as it is, so it can lose to a revision's
 server-version write it had not seen. If not, the Push emits each difference
