@@ -1477,14 +1477,15 @@ describe('a late edit competes by LWW only with the device writes it races: a se
    * before G, or G before F; g's filing `mid` between the two), and pushed after it. d's push also adds an ordered hand copy, which
    * MFC's move pairs with: the revision refiles nothing, and F stands, re-emitted at a server
    * version above the import's refile. G is late for that import too, and meets both server writes.
+   * `notes`: x's note in the two imports, so a late note of g changes the second import's decision.
    */
-  async function reEmitted(gFirst: boolean) {
+  async function reEmitted(gFirst: boolean, notes: [string, string] = ['', '']) {
     const a = await SyncCaller.enrol(h);
     const [d, g] = [await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a)];
     const x = nextId();
     const S = headFor(x);
     const cx = importOccId(KEY, a.userId, x, 1);
-    await imported(a, [row(x, 'Owned')]);
+    await imported(a, [row(x, 'Owned', { note: notes[0] })]);
     const { cursor: aSaw0 } = await drain(a);
     expect(outcomes(await pushed(a, [edit(a, `occ/${cx}/collection`, { collection: `owned/${randomUUID()}` }, aSaw0, 0)]))).toEqual(['APPLIED']);
     const [{ cursor: dSaw }, { cursor: gSaw }] = [await drain(d), await drain(g)];
@@ -1499,13 +1500,13 @@ describe('a late edit competes by LWW only with the device writes it races: a se
     const hand = randomUUID();
     const handCopy = [edit(d, `occ/${hand}/head`, { head_id: S }, dSaw, 0), edit(d, `occ/${hand}/status`, { status: 'ordered' }, dSaw, 0)];
     await sleep(5);
-    await imported(a, [row(x, 'Ordered')], DATE_B);
+    await imported(a, [row(x, 'Ordered', { note: notes[1] })], DATE_B);
     const { cursor: aSaw } = await drain(a);
     expect(outcomes(await pushed(d, [...handCopy, F]))).toEqual(['APPLIED', 'APPLIED', 'APPLIED']);
     const refiled = (await drain(a, aSaw)).events.filter((e) => e.facetKey === `occ/${cx}/collection`);
     expect(refiled.map((e) => e.payload)).toEqual([F.payload]);
     expect(refiled[0]!.version).toMatch(/#0{32}$/);
-    return { a, g, cx, G, mid, shelfF, shelfG, kept: await lateRows(a.userId) };
+    return { a, g, S, cx, G, gSaw, mid, shelfF, shelfG, kept: await lateRows(a.userId) };
   }
 
   it('a late filing stamped above the filing a revision re-emitted is STALE, with that filing, and is not kept', async () => {
@@ -1517,6 +1518,34 @@ describe('a late edit competes by LWW only with the device writes it races: a se
     expect((await drain(a, aSaw)).events).toEqual([]);
     expect(await collectionOf(a, cx)).toBe(shelfF);
     expect(await lateRows(a.userId)).toEqual(kept);
+  });
+
+  const revisions = async (userId: string) => (await db.admin.query('SELECT 1 FROM import_revision WHERE user_id = $1', [userId])).rows.length;
+
+  it("the same late filing riding a late note that revises the import again is STALE: the second revision places the note, never the filing above the first's", async () => {
+    const { a, g, S, cx, G, gSaw, shelfF, kept } = await reEmitted(false, ['n1', 'n2']);
+    const { cursor: aSaw } = await drain(a);
+    const note = edit(g, `uf/${S}/note`, { note: 'g-note' }, gSaw, 0);
+    const res = await pushed(g, [note, G]);
+    expect(outcomes(res)).toEqual(['APPLIED', 'STALE']);
+    expect(JSON.parse(res.results[1]!.current!.payload)).toMatchObject({ collection: shelfF });
+    expect(await revisions(a.userId)).toBe(2);
+    expect(await heldCount(a.userId)).toBe(0);
+    expect((await drain(a, aSaw)).events.filter((e) => e.facetKey === `occ/${cx}/collection`)).toEqual([]);
+    expect(await collectionOf(a, cx)).toBe(shelfF);
+    expect((await lateRows(a.userId)).sort()).toEqual([...kept, [`uf/${S}/note`, 2]].sort());
+  });
+
+  it('the same late filing riding a second ordered hand copy that revises the import again is STALE, and the hand copy stands', async () => {
+    const { a, g, S, cx, G, gSaw, shelfF } = await reEmitted(false);
+    const { cursor: aSaw } = await drain(a);
+    const hand = randomUUID();
+    const res = await pushed(g, [edit(g, `occ/${hand}/head`, { head_id: S }, gSaw, 0), edit(g, `occ/${hand}/status`, { status: 'ordered' }, gSaw, 0), G]);
+    expect(outcomes(res)).toEqual(['APPLIED', 'APPLIED', 'STALE']);
+    expect(JSON.parse(res.results[2]!.current!.payload)).toMatchObject({ collection: shelfF });
+    expect(await revisions(a.userId)).toBe(2);
+    expect((await drain(a, aSaw)).events.filter((e) => e.facetKey === `occ/${cx}/collection`)).toEqual([]);
+    expect(await collectionOf(a, cx)).toBe(shelfF);
   });
 
   it('two late filings in one push, the first stamped above the re-emitted filing and the second between the two: both STALE', async () => {
