@@ -357,7 +357,9 @@ async function replayFigure(
 
   // Each late edit a server write to its key followed since its basis, other than one of an import
   // replayed here (from its transaction's start to its marker), such as a revision's re-emission:
-  // its device had not seen it. STALE before the replay, so it neither stands nor changes a decision.
+  // its device had not seen it. STALE before the replay, so it neither stands nor changes a decision;
+  // a revision leaves it out, and placeLate answers it STALE, as it meets that write. The event at a
+  // marker is the import's marker facet, never a late edit's key, so `<=` and `<` read the same.
   const stale = new Set<number>();
   const replayedImport = (seq: bigint) => settled.some((f) => seq >= f.start && seq <= f.marker);
   for (const e of late) {
@@ -385,7 +387,7 @@ async function replayFigure(
     if (!sameDecision(as, again)) {
       // A revision is built for one import whose figure nothing else touched since.
       if (settled.length > 1 || knowing) return HOLD;
-      return reviseOrHold(tx, userId, S, f, frame, late.filter((e) => !stale.has(e.index)), stale, placedBefore, recorded, pre, again);
+      return reviseOrHold(tx, userId, S, f, frame, late.filter((e) => !stale.has(e.index)), placedBefore, recorded, pre, again);
     }
     // The same decision: `as` writes these keys too (sameDecision leaves out only item upserts, and
     // a late edit is never to an item).
@@ -407,7 +409,6 @@ async function reviseOrHold(
   f: FrameRow,
   frame: Frame,
   late: readonly PushedEdit[],
-  stale: ReadonlySet<number>,
   placedBefore: readonly Facet[],
   recorded: readonly Recorded[],
   pre: ReadonlyMap<string, Facet>,
@@ -475,9 +476,7 @@ async function reviseOrHold(
           JSON.stringify(changed),
         ]);
       }
-      const out = new Map<number, LateOutcome>([...stale].map((index) => [index, 'stale']));
-      for (const e of late) out.set(e.index, replay.get(e.facetKey)?.version === e.version ? 'applied' : 'stale');
-      return out;
+      return new Map(late.map((e): [number, LateOutcome] => [e.index, replay.get(e.facetKey)?.version === e.version ? 'applied' : 'stale']));
     },
   };
 }
