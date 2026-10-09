@@ -1436,6 +1436,34 @@ describe('a late edit meets the push and the device edits around it in push orde
     expect(outcomes(res)).toEqual(['APPLIED', 'STALE', 'APPLIED']);
     expect((await stateOf(a)).get(`uf/${S}/score`)).toMatchObject({ score: 9 });
   });
+
+  it('a late edit the replay answered STALE, ahead in the push of a later late edit to its key, stays STALE: only the later one lands and is kept', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const cx = importOccId(KEY, a.userId, x, 1);
+    // b had not pulled the import that created the copy; K1 is stamped a minute ahead, so LWW alone would apply it.
+    const K1 = edit(b, `occ/${cx}/status`, { status: 'wished' }, '', 60_000);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    const K2 = edit(b, `occ/${cx}/status`, { status: 'former' }, bSaw, 120_000);
+    await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    const { cursor: aSaw } = await drain(a);
+    const res = await pushed(b, [K1, K2]);
+    expect(outcomes(res)).toEqual(['STALE', 'APPLIED']);
+    expect((await drain(a, aSaw)).events.map((e) => e.payload)).toEqual([K2.payload]);
+    expect(await lateRows(a.userId)).toEqual([[`occ/${cx}/status`, 2]]);
+  });
+
+  it('control: the first of them pushed alone is STALE', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const cx = importOccId(KEY, a.userId, x, 1);
+    const K1 = edit(b, `occ/${cx}/status`, { status: 'wished' }, '', 60_000);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    expect(outcomes(await pushed(b, [K1]))).toEqual(['STALE']);
+    expect(await lateRows(a.userId)).toEqual([]);
+  });
 });
 
 describe('a late edit competes by LWW with the device edits placed before its import at their own versions, never with the server version a revision re-emitted one under', () => {
