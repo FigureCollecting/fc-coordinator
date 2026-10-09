@@ -282,14 +282,17 @@ export function createLatePolicy(occIdKey: Uint8Array | null): HoldPolicy {
 
     for (const t of placed) if (held.has(t.unit)) out.set(t.e.index, 'held');
     // A late edit no replay answered (a decision left as it was, its facet not written) is placed
-    // here by LWW, in push order, and once though it is late on two figures (the outcome set the
-    // first time skips it): its outcome is known before it is kept. The service places the push's
-    // other edits after these, so one ahead of a late edit in the push, to its key at a higher
-    // version, makes it STALE here, as push order would.
-    const lateIndex = new Set(replayed.map((r) => r.e.index));
-    const newerAhead = (e: PushedEdit) => edits.some((o) => o.index < e.index && !lateIndex.has(o.index) && o.facetKey === e.facetKey && compareVersion(o.version, e.version) > 0);
-    for (const e of replayed.map((r) => r.e).sort((p, q) => p.index - q.index)) {
-      if (!out.has(e.index)) out.set(e.index, newerAhead(e) || !(await applyEvent(tx, userId, e, feed)).applied ? 'stale' : 'applied');
+    // here by LWW, once though it is late on two figures: its outcome is known before it is kept.
+    // The service places the push's other edits after these, so each one ahead of a late edit in
+    // the push, to its key, is placed here too, before it: every edit to that key lands in push
+    // order, as on a figure no import framed.
+    const toPlace = new Map<number, PushedEdit>();
+    for (const { e } of replayed) if (!out.has(e.index)) toPlace.set(e.index, e);
+    const lastLate = new Map<string, number>();
+    for (const e of toPlace.values()) lastLate.set(e.facetKey, Math.max(lastLate.get(e.facetKey) ?? -1, e.index));
+    for (const o of edits) if (!out.has(o.index) && o.index < (lastLate.get(o.facetKey) ?? -1)) toPlace.set(o.index, o);
+    for (const e of [...toPlace.values()].sort((p, q) => p.index - q.index)) {
+      out.set(e.index, (await applyEvent(tx, userId, e, feed)).applied ? 'applied' : 'stale');
     }
     // A STALE answer is final: only a late edit that stood is kept, under its earliest import, so a
     // later replay places it before that import and each later one.
