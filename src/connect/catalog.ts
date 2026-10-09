@@ -553,10 +553,20 @@ function trimWhiteSpace(text: string): string {
 function searchQuery(query: string): string {
   const form = trimWhiteSpace(query.normalize('NFKC'));
   if (form === '') throw invalid('query must not be empty or only whitespace');
-  if ([...form].length > MAX_SEARCH_QUERY_CHARS) {
+  if (longerThan(form, MAX_SEARCH_QUERY_CHARS)) {
     throw invalid(`query must not exceed ${MAX_SEARCH_QUERY_CHARS} characters`);
   }
   return query;
+}
+
+/** Whether the text has more than max code points, counted only until it does: no array of the whole query. */
+function longerThan(text: string, max: number): boolean {
+  let points = 0;
+  for (const _ of text) {
+    points += 1;
+    if (points > max) return true;
+  }
+  return false;
 }
 
 const ERROR_INFO_TYPE = 'google.rpc.ErrorInfo';
