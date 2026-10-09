@@ -1639,4 +1639,24 @@ describe('a late edit the replay leaves standing still meets, at its version, wh
     expect(outcomes(res)).toEqual(['STALE']);
     expect(JSON.parse(res.results[0]!.current!.payload)).toMatchObject({ status: 'owned' });
   });
+
+  it('control: the same late move stamped above the undo it saw at its basis is APPLIED, as that server write is not since its basis', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const S = headFor(x);
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned')]);
+    const re = await imported(a, [row(x, 'Wished')], DATE_B);
+    const { cursor } = await drain(a);
+    expect(outcomes(await pushed(a, [answer(a, S, { item: 'change', rev: re.applied[0]!.rev, choice: 'undo' }, cursor)]))).toEqual(['APPLIED']);
+    const { rows } = await db.admin.query<{ seq: string; version: string }>(
+      'SELECT seq, version FROM feed_event WHERE user_id = $1 AND facet_key = $2 ORDER BY seq DESC LIMIT 1',
+      [a.userId, `occ/${cx}/status`],
+    );
+    expect(rows[0]!.version).toMatch(/#0{32}$/);
+    await imported(a, [row(x, 'Wished', { note: 'n3' })], '2026-09-30');
+    const res = await pushed(b, [edit(b, `occ/${cx}/status`, { status: 'ordered' }, encodeCursor(BigInt(rows[0]!.seq)), 60_000)]);
+    expect(outcomes(res)).toEqual(['APPLIED']);
+    expect((await stateOf(a)).get(`occ/${cx}/status`)).toMatchObject({ status: 'ordered' });
+  });
 });
