@@ -1185,3 +1185,166 @@ describe('the replay: pins of its order and its bounds', () => {
     expect((await stateOf(a)).get(`uf/${S}/score`)).toMatchObject({ score: 9 });
   });
 });
+
+describe('a frame makes an edit late only where its import settled the figure: a facet of its copies or values written, or a copy or field base moved', () => {
+  const frames = async (userId: string) =>
+    (await db.admin.query<{ settled: boolean }>('SELECT settled FROM import_frame WHERE user_id = $1 ORDER BY import_number', [userId])).rows.map((r) => r.settled);
+  const revisions = async (userId: string) => (await db.admin.query('SELECT 1 FROM import_revision WHERE user_id = $1', [userId])).rows.length;
+
+  it('a re-import that only raises a conflict on a figure an earlier import settled: an edit made between the two is placed by LWW, and the item stays', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    const { cursor: aSaw } = await drain(a);
+    await pushed(a, [edit(a, `uf/${S}/note`, { note: 'app' }, aSaw)]);
+    // MFC changes the note the app changed too: a conflict, and nothing of the figure is written.
+    expect(await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B)).toMatchObject({ conflictsRaised: 1, facetsWritten: 2 });
+    expect(await frames(a.userId)).toEqual([true, false]);
+    // b's score, made before that import, is not late: LWW places it, though it is stamped below the item.
+    const res = await pushed(b, [edit(b, `uf/${S}/score`, { score: 4 }, bSaw, -60_000)]);
+    expect(outcomes(res)).toEqual(['APPLIED']);
+    expect(await lateRows(a.userId)).toEqual([]);
+    expect(await revisions(a.userId)).toBe(0);
+    expect(await pending(a)).toBe(1n);
+    expect((await stateOf(a)).get(`uf/${S}/score`)).toMatchObject({ score: 4 });
+  });
+
+  it('a re-import that keeps a pending item and rewrites its payload for the app side: an edit made before it is not late', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: aSaw } = await drain(a);
+    await pushed(a, [edit(a, `uf/${S}/note`, { note: 'app' }, aSaw)]);
+    const raised = await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    const { cursor: aNow } = await drain(a);
+    const { cursor: bSaw } = await drain(b);
+    // The app's side moves (a wished copy added by hand): the same export keeps the item's rev and
+    // rewrites its payload, which lists the app's counts and copies.
+    const hand = randomUUID();
+    await pushed(a, [edit(a, `occ/${hand}/head`, { head_id: S }, aNow), edit(a, `occ/${hand}/status`, { status: 'wished' }, aNow)]);
+    const kept = await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B);
+    expect(kept).toMatchObject({ conflictsRaised: 0, conflictsPending: 1, facetsWritten: 2 });
+    expect(kept.review[0]!.items[0]!.rev).toBe(raised.review[0]!.items[0]!.rev);
+    expect(await frames(a.userId)).toEqual([true, false, false]);
+    const res = await pushed(b, [edit(b, `uf/${S}/score`, { score: 5 }, bSaw, -60_000)]);
+    expect(outcomes(res)).toEqual(['APPLIED']);
+    expect(await lateRows(a.userId)).toEqual([]);
+    expect(await revisions(a.userId)).toBe(0);
+  });
+
+  it('a re-import that only ends an item, MFC back at the value it was settled at: an edit made before it is not late', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { note: 'n1' })]);
+    const { cursor: aSaw } = await drain(a);
+    await pushed(a, [edit(a, `uf/${S}/note`, { note: 'app' }, aSaw)]);
+    expect(await imported(a, [row(x, 'Owned', { note: 'n2' })], DATE_B)).toMatchObject({ conflictsRaised: 1 });
+    const { cursor: bSaw } = await drain(b);
+    // MFC goes back to n1: nothing of MFC's side changed, so the item ends and nothing else is written.
+    const back = await imported(a, [row(x, 'Owned', { note: 'n1' })], DATE_B);
+    expect(back).toMatchObject({ conflictsRaised: 0, conflictsPending: 0, facetsWritten: 2 });
+    expect(await frames(a.userId)).toEqual([true, false, false]);
+    const res = await pushed(b, [edit(b, `uf/${S}/score`, { score: 6 }, bSaw, -60_000)]);
+    expect(outcomes(res)).toEqual(['APPLIED']);
+    expect(await lateRows(a.userId)).toEqual([]);
+    expect(await revisions(a.userId)).toBe(0);
+  });
+});
+
+describe('HELD (ii) and sameDecision: the reaction checks at their bounds', () => {
+  const keptOf = async (userId: string) =>
+    (await db.admin.query<{ occ_id: string }>('SELECT occ_id FROM import_kept_copy WHERE user_id = $1 ORDER BY occ_id', [userId])).rows.map((r) => r.occ_id);
+  const seqOf = async (userId: string, facetKey: string, op: 'upsert' | 'delete') =>
+    BigInt((await db.admin.query<{ seq: string }>('SELECT max(seq) AS seq FROM feed_event WHERE user_id = $1 AND facet_key = $2 AND op = $3', [userId, facetKey, op])).rows[0]!.seq);
+
+  const feedHeadOf = async (userId: string) => BigInt((await db.admin.query<{ seq: string }>('SELECT max(seq) AS seq FROM feed_event WHERE user_id = $1', [userId])).rows[0]!.seq);
+  /**
+   * a's hand copy H of x (owned) is there before the first import of x, which pairs MFC's row with
+   * it and writes MFC's note. b's late note revises that import into a conflict (item F1, the last
+   * event of the revision); d's later late note, MFC's own, revises it again and ends F1. H's live
+   * state is the same either side of both revisions: only the items change.
+   */
+  async function itemRaisedThenEnded() {
+    const a = await SyncCaller.enrol(h);
+    const [b, d] = [await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a)];
+    const x = nextId();
+    const S = headFor(x);
+    const H = randomUUID();
+    await pushed(a, [edit(a, `occ/${H}/head`, { head_id: S }, '', -2000), edit(a, `occ/${H}/status`, { status: 'owned' }, '', -2000)]);
+    const [{ cursor: bSaw }, { cursor: dSaw }] = [await drain(b), await drain(d)];
+    const first = await imported(a, [row(x, 'Owned', { note: 'mfc' })]);
+    expect(first).toMatchObject({ occurrencesAdded: 0, conflictsRaised: 0 });
+    expect(outcomes(await pushed(b, [edit(b, `uf/${S}/note`, { note: 'b' }, bSaw, 1000)]))).toEqual(['APPLIED']);
+    expect(await pending(a)).toBe(1n);
+    const F1 = await seqOf(a.userId, `imp/mfc/figure/${S}`, 'upsert');
+    expect(F1).toBe(await feedHeadOf(a.userId));
+    expect(outcomes(await pushed(d, [edit(d, `uf/${S}/note`, { note: 'mfc' }, dSaw, 60_000)]))).toEqual(['APPLIED']);
+    expect(await pending(a)).toBe(0n);
+    expect(await seqOf(a.userId, `imp/mfc/figure/${S}`, 'delete')).toBeGreaterThan(F1);
+    return { a, S, H, F1 };
+  }
+
+  it('(ii) holds an edit to a copy of the figure whose basis is the very event that raised the item a later revision ended: its device saw it pending', async () => {
+    const { a, H, F1 } = await itemRaisedThenEnded();
+    const c = await SyncCaller.sibling(h, a);
+    const res = await pushed(c, [edit(c, `occ/${H}/status`, { status: 'ordered' }, encodeCursor(F1), 2000)]);
+    expect(outcomes(res)).toEqual(['HELD']);
+  });
+
+  it('(ii) control: one event before it, the item was not yet seen, so the same edit is no reaction', async () => {
+    const { a, H, F1 } = await itemRaisedThenEnded();
+    const c = await SyncCaller.sibling(h, a);
+    const res = await pushed(c, [edit(c, `occ/${H}/status`, { status: 'ordered' }, encodeCursor(F1 - 1n), 2000)]);
+    expect(outcomes(res)).toEqual(['APPLIED']);
+  });
+
+  it('(ii) holds a copy added to the figure, which had no head when the import ran, after a revision that changed no item', async () => {
+    const { a, b } = await twoDevices();
+    const c = await SyncCaller.sibling(h, a);
+    const x = nextId();
+    const S = headFor(x);
+    const cx = importOccId(KEY, a.userId, x, 1);
+    const hand = randomUUID();
+    // b's hand copy, made before the first import of x: placed there, MFC's row pairs with it.
+    const added = [edit(b, `occ/${hand}/head`, { head_id: S }, '', 1000), edit(b, `occ/${hand}/status`, { status: 'owned' }, '', 1000)];
+    expect(await imported(a, [row(x, 'Owned')])).toMatchObject({ occurrencesAdded: 1 });
+    const { cursor: cSaw } = await drain(c);
+    expect(outcomes(await pushed(b, added))).toEqual(['APPLIED', 'APPLIED']);
+    const state = await stateOf(a);
+    expect(state.has(`occ/${cx}/status`)).toBe(false);
+    expect([...state.keys()].filter((k) => /^imp\/mfc\/(figure|change)\//.test(k))).toEqual([]);
+    // c saw the copy the import made and no item: a copy it adds now reacts to the withdrawn copy.
+    const fresh = randomUUID();
+    const res = await pushed(c, [edit(c, `occ/${fresh}/head`, { head_id: S }, cSaw, 2000), edit(c, `occ/${fresh}/status`, { status: 'owned' }, cSaw, 2000)]);
+    expect(outcomes(res)).toEqual(['HELD', 'HELD']);
+  });
+
+  it('a late edit whose replay ends no keep the import ended is a revision: the import, replayed with a wished copy added, leaves the kept copy kept', async () => {
+    const { a, b } = await twoDevices();
+    const x = nextId();
+    const S = headFor(x);
+    const [lo, removed] = [1, 2].map((n) => importOccId(KEY, a.userId, x, n)).sort() as [string, string];
+    await imported(a, [row(x, 'Owned', { count: '2' })]);
+    const lowered = await imported(a, [row(x, 'Owned')], DATE_B);
+    const { cursor } = await drain(a);
+    await pushed(a, [answer(a, S, { item: 'change', rev: lowered.applied[0]!.rev, choice: 'undo' }, cursor)]);
+    expect(await keptOf(a.userId)).toEqual([removed]);
+    // a sells the copy MFC still counts: the kept copy is now the only owned one, as MFC's Count says.
+    const { cursor: undone } = await drain(a);
+    await pushed(a, [edit(a, `occ/${lo}/status`, { status: 'former' }, undone)]);
+    expect(await keptOf(a.userId)).toEqual([removed]);
+    const { cursor: bSaw } = await drain(b);
+    const wished = randomUUID();
+    const added = [edit(b, `occ/${wished}/head`, { head_id: S }, bSaw), edit(b, `occ/${wished}/status`, { status: 'wished' }, bSaw)];
+    // MFC changes only the note: the counts equal MFC's, so the import ends the keep.
+    expect(await imported(a, [row(x, 'Owned', { note: 'n3' })], '2026-09-30')).toMatchObject({ conflictsRaised: 0 });
+    expect(await keptOf(a.userId)).toEqual([]);
+    // Placed before that import, b's wished copy makes the counts differ: the import ends no keep.
+    expect(outcomes(await pushed(b, added))).toEqual(['APPLIED', 'APPLIED']);
+    expect(await keptOf(a.userId)).toEqual([removed]);
+  });
+});

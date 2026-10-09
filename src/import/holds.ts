@@ -198,6 +198,7 @@ async function reactions(tx: SqlClient, userId: string, placed: readonly Placed[
       if (t.e.basisSeq < r.marker || t.e.basisSeq >= r.seq) continue;
       const onFigure = t.heads.includes(r.head);
       // A copy the revision summarised is S's whatever its head is now: the revision may have taken it out.
+      // Both summaries are taken over the same copies (reviseOrHold), so either side names it; both are read.
       if (!onFigure && !(t.occ !== null && (t.occ in r.before.copies || t.occ in r.after.copies))) continue;
       const headOrStatus = /^occ\/[^/]+\/(head|status)$/.test(t.e.facetKey);
       const hadHead = !(onFigure && headOrStatus) || (await hadHeadBy(tx, userId, t.occ!, r.marker));
