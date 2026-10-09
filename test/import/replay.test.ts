@@ -1661,6 +1661,28 @@ describe('a late edit competes by LWW only with the device writes it races: a se
   });
 });
 
+describe("a late edit meets only its own user's server writes", () => {
+  it("another user's import of the same MFC figure writes the same figure-value key after the late edit's basis: the late note still stands", async () => {
+    const { a, b } = await twoDevices();
+    const other = await SyncCaller.enrol(h);
+    expect(other.userId).not.toBe(a.userId);
+    const x = nextId();
+    const S = headFor(x);
+    await imported(a, [row(x, 'Owned', { score: '7/10', note: 'n1' })]);
+    const { cursor: bSaw } = await drain(b);
+    const N = edit(b, `uf/${S}/note`, { note: 'b-note' }, bSaw, 0);
+    await imported(a, [row(x, 'Owned', { score: '8/10', note: 'n1' })], DATE_B);
+    // The same figure, so the same head and key, written at a server version on the shared feed sequence.
+    await imported(other, [row(x, 'Owned', { note: 'other-user-note' })]);
+    const writers = await db.admin.query('SELECT DISTINCT user_id FROM feed_event WHERE facet_key = $1', [`uf/${S}/note`]);
+    expect(writers.rows.length).toBe(2);
+    const res = await pushed(b, [N]);
+    expect(outcomes(res)).toEqual(['APPLIED']);
+    expect((await stateOf(a)).get(`uf/${S}/note`)).toMatchObject({ note: 'b-note' });
+    expect((await stateOf(other)).get(`uf/${S}/note`)).toMatchObject({ note: 'other-user-note' });
+  });
+});
+
 describe('a late edit the replay leaves standing still meets, at its version, what its device saw', () => {
   it("a late move stamped below the import write its device had seen is STALE, though the import it is late for wrote no facet of the copy", async () => {
     const { a, b } = await twoDevices();
