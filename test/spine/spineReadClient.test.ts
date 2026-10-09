@@ -22,6 +22,7 @@ import {
   CompareResponseSchema,
   GetProductImagesResponseSchema,
   GetProductsResponseSchema,
+  SearchProductsResponseSchema,
   SpineRead,
 } from '@figurecollecting/ingest-contract/read';
 import { ENTITLEMENTS_HEADER } from '@figurecollecting/ingest-contract/entitlement';
@@ -447,5 +448,69 @@ describe('SpineReadClient.getProductImages — the request it makes', () => {
     });
     expect(res.imagesJson).toBe(body);
     expect(res.nextPageToken).toBe('img-2');
+  });
+});
+
+describe('SpineReadClient.searchProducts — the request it makes (WK-17)', () => {
+  const FIRST = { pageSize: 0, pageToken: '' };
+
+  it('arrives as gRPC on an HTTP/2 stream, like every other spine call', async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS });
+    await new SpineReadClient(spine.baseUrl).searchProducts('nendoroid miku', NOW_ISO, null, FIRST);
+
+    expect(spine.wire).toHaveLength(1);
+    expect(spine.wire[0]?.path).toBe('/read.v1.SpineRead/SearchProducts');
+    expect(spine.wire[0]?.httpVersion).toBe('2.0');
+    expect(spine.wire[0]?.contentType).toMatch(GRPC_CONTENT_TYPE);
+  });
+
+  it('forwards the query as typed, now_iso and paging verbatim, and sends neither filter', async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS });
+    const typed = '  ｎｅｎｄｏｒｏｉｄ　ミク ';
+    await new SpineReadClient(spine.baseUrl).searchProducts(typed, NOW_ISO, null, {
+      pageSize: 30,
+      pageToken: 'search-token-1',
+    });
+
+    const req = spine.searchCalls[0]?.request;
+    expect(req?.query).toBe(typed);
+    expect(req?.nowIso).toBe(NOW_ISO);
+    expect(req?.pageSize).toBe(30);
+    expect(req?.pageToken).toBe('search-token-1');
+    // ABSENT, not empty: present-but-empty is INVALID_ARGUMENT at the spine.
+    expect(req?.manufacturer).toBeUndefined();
+    expect(req?.releaseYm).toBeUndefined();
+  });
+
+  it('attaches the assertion as METADATA, and sends no header without one', async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS });
+    const client = new SpineReadClient(spine.baseUrl);
+    const token = 'eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJ4In0.c2ln';
+
+    await client.searchProducts('miku', NOW_ISO, token, FIRST);
+    await client.searchProducts('miku', NOW_ISO, null, FIRST);
+
+    expect(spine.searchCalls[0]?.headers.get(ENTITLEMENTS_HEADER)).toBe(token);
+    expect(JSON.stringify(spine.searchCalls[0]?.request)).not.toContain(token);
+    expect(spine.searchCalls[1]?.headers.get(ENTITLEMENTS_HEADER)).toBeNull();
+    expect(spine.searchCalls[0]?.headers.get('traceparent')).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$/);
+  });
+
+  it('returns products_json and next_page_token unedited', async () => {
+    const odd = '{ "products" : [] , "coverage" : {} }';
+    spine = await startFakeSpineRead({
+      keys: NO_KEYS,
+      respondSearch: () => create(SearchProductsResponseSchema, { productsJson: odd, nextPageToken: 'search-2' }),
+    });
+    const res = await new SpineReadClient(spine.baseUrl).searchProducts('miku', NOW_ISO, null, FIRST);
+    expect(res.productsJson).toBe(odd);
+    expect(res.nextPageToken).toBe('search-2');
+  });
+
+  it('times out rather than hanging', { timeout: 5_000 }, async () => {
+    spine = await startFakeSpineRead({ keys: NO_KEYS, respondSearch: () => new Promise<never>(() => {}) });
+    await expect(
+      new SpineReadClient(spine.baseUrl, 150).searchProducts('miku', NOW_ISO, null, FIRST),
+    ).rejects.toMatchObject({ code: Code.DeadlineExceeded });
   });
 });

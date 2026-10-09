@@ -14,7 +14,9 @@
  *   (d) the spine REFUSES a call without a verified assertion, and the entitled
  *       fields are asserted PRESENT, not only that a redaction happened;
  *   (e) GetProductImages returns nothing when the media base is unset;
- *   (f) SearchProducts is UNIMPLEMENTED.
+ *   (f) SearchProducts is a pass-through over read.v1 SpineRead.SearchProducts
+ *       (WK-17): field mapping, the 50-hit page cap, the stale-token
+ *       translation, the entitlement header, and the gRPC wire.
  *
  * NO PRODUCTION ANYTHING. Every server binds 127.0.0.1 on an ephemeral port and
  * every key is generated per run.
@@ -24,9 +26,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { Code, ConnectError, createClient, type Client } from '@connectrpc/connect';
 import { createConnectTransport } from '@connectrpc/connect-node';
 import { create, toJsonString } from '@bufbuild/protobuf';
+import { BinaryReader, BinaryWriter, WireType } from '@bufbuild/protobuf/wire';
 import {
   GetProductImagesResponseSchema as WireImagesResponseSchema,
   GetProductsResponseSchema as WireProductsResponseSchema,
+  SearchProductsResponseSchema as WireSearchResponseSchema,
 } from '@figurecollecting/ingest-contract/read';
 import { CatalogService, CompareService, ProductCardSchema } from '@figurecollecting/fc-api-contract';
 import type { FastifyInstance } from 'fastify';
@@ -659,19 +663,458 @@ describe('(e) GetProductImages', () => {
 });
 
 // ===========================================================================
-// (f) SearchProducts — served, and UNIMPLEMENTED until WK-17.
+// (f) SearchProducts — a pass-through over read.v1 SpineRead.SearchProducts (WK-17).
 // ===========================================================================
-describe('(f) SearchProducts', () => {
-  it('is MOUNTED and answers UNIMPLEMENTED itself, not as an unknown route', async () => {
+const ERROR_INFO = 'google.rpc.ErrorInfo';
+const STALE = 'TOKEN_EXPIRED_OR_REBASED';
+const DOMAIN = 'figurecollecting.com';
+
+/** google.rpc.ErrorInfo { reason = 1; domain = 2; map<string,string> metadata = 3 }, as the spine writes it. */
+const errorInfoBytes = (reason: string, domain: string, metadata: Record<string, string> = {}): Uint8Array => {
+  const w = new BinaryWriter();
+  // Metadata FIRST, so a reader that cannot skip a field it does not want fails here.
+  for (const [k, v] of Object.entries(metadata)) {
+    w.tag(3, WireType.LengthDelimited).fork().tag(1, WireType.LengthDelimited).string(k);
+    w.tag(2, WireType.LengthDelimited).string(v).join();
+  }
+  return w.tag(1, WireType.LengthDelimited).string(reason).tag(2, WireType.LengthDelimited).string(domain).finish();
+};
+
+/** The ErrorInfo details a client received, decoded field by field. */
+const errorInfosOf = (err: ConnectError): { reason: string; domain: string }[] =>
+  err.details.flatMap((d) => {
+    if (!('type' in d) || d.type !== ERROR_INFO) return [];
+    const r = new BinaryReader(d.value);
+    const info = { reason: '', domain: '' };
+    while (r.pos < r.len) {
+      const [field, wt] = r.tag();
+      if (field === 1) info.reason = r.string();
+      else if (field === 2) info.domain = r.string();
+      else r.skip(wt);
+    }
+    return [info];
+  });
+
+const spineRefusal = (details: { type: string; value: Uint8Array }[], code = Code.InvalidArgument): never => {
+  const err = new ConnectError('page_token rebased under ranking v2 at 10.42.0.7', code);
+  err.details.push(...details);
+  throw err;
+};
+
+const searchError = async (p: Promise<unknown>): Promise<ConnectError> => {
+  const err = await p.then(
+    () => null,
+    (e: unknown) => e,
+  );
+  expect(err).toBeInstanceOf(ConnectError);
+  return err as ConnectError;
+};
+
+const hit = (id: string): Record<string, unknown> => ({ ...cannedProductRecord([], true), productId: id });
+const hitId = (i: number): string => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`;
+const searchJson = (products: unknown[]): string => JSON.stringify({ products, coverage: {} });
+
+describe('(f) SearchProducts — the wire', () => {
+  it('is mounted, no longer UNIMPLEMENTED, and reaches the spine as gRPC on an HTTP/2 stream', async () => {
     harness = await start();
 
-    // An unmounted route also reads as UNIMPLEMENTED to a Connect client, so
-    // the code alone would pass against a service that never registered it.
     expect(harness.app.hasRoute({ method: 'POST', url: '/coordinator.v1.CatalogService/SearchProducts' })).toBe(true);
-    const err = await harness.catalog.searchProducts({ query: 'miku' }).catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(ConnectError);
-    expect((err as ConnectError).code).toBe(Code.Unimplemented);
-    expect((err as ConnectError).rawMessage).toContain('WK-17');
+    expect(await codeOf(harness.catalog.searchProducts({ query: 'nendoroid miku' }))).toBe('OK');
+
+    expect(harness.spine.wire.map((w) => w.path)).toEqual(['/read.v1.SpineRead/SearchProducts']);
+    expect(harness.spine.wire[0]?.httpVersion).toBe('2.0');
+    expect(harness.spine.wire[0]?.contentType).toMatch(GRPC_CONTENT_TYPE);
+    expect(harness.spine.searchCalls).toHaveLength(1);
+  });
+});
+
+describe('(f) SearchProducts — field mapping', () => {
+  it('forwards the query AS TYPED, the coordinator clock, page_size and page_token, and no filter', async () => {
+    harness = await start();
+    const typed = '  ｎｅｎｄｏｒｏｉｄ　ミク ';
+
+    await harness.catalog.searchProducts({ query: typed, pageSize: 20, pageToken: 'search-tok-2' });
+
+    const req = harness.spine.searchCalls[0]?.request;
+    // The spine normalizes, binds the token to and matches ITS form; sending ours would make two forms.
+    expect(req?.query).toBe(typed);
+    expect(req?.nowIso).toBe(NOW.toISOString());
+    expect(req?.pageSize).toBe(20);
+    expect(req?.pageToken).toBe('search-tok-2');
+    // catalog.proto 0.3.0 has no filter fields: ABSENT, never present-but-empty (which the spine refuses).
+    expect(req?.manufacturer).toBeUndefined();
+    expect(req?.releaseYm).toBeUndefined();
+  });
+
+  it('maps every hit through the card allowlist: no image URL, no unknown key, no gated key', async () => {
+    harness = await start({
+      respondSearch: () =>
+        create(WireSearchResponseSchema, { productsJson: searchJson([hit(CANNED_HEAD_ID)]), nextPageToken: 'next-1' }),
+    });
+
+    const res = await harness.catalog.searchProducts({ query: 'miku' });
+
+    expect(res.nextPageToken).toBe('next-1');
+    expect(res.products).toHaveLength(1);
+    const card = res.products[0]!;
+    expect(card.headId).toBe(CANNED_HEAD_ID);
+    expect(card.title).toMatchObject({ value: 'Hatsune Miku Symphony 2025 Ver.', asOf: '2026-09-01T10:00:00.123456Z' });
+    expect(card.manufacturer).toMatchObject({ value: 'Good Smile Company' });
+    expect(card.series).toMatchObject({ value: 'Character Vocal Series' });
+    expect(card.character).toMatchObject({ value: 'Hatsune Miku' });
+    expect(card.scale).toMatchObject({ value: '1/7' });
+    expect(card.releaseYm).toMatchObject({ value: '2026-03', asOf: '' });
+    expect(card.contentLevel).toMatchObject({ value: 'general' });
+    expect(card.gtin14s).toEqual([GTIN]);
+    expect(card.derivativeIds).toEqual([]);
+    const wire = toJsonString(ProductCardSchema, card);
+    for (const leak of ['images.store.example', 'originals', 'SHOULD-NEVER-SHIP', 'mysteryKey', 'imageUrl', 'stockOnHand']) {
+      expect(wire).not.toContain(leak);
+    }
+  });
+
+  it('gives a hit an EMPTY requested_as, even when the spine echoes a ref: this request named none', async () => {
+    harness = await start({
+      respondSearch: () =>
+        create(WireSearchResponseSchema, {
+          productsJson: searchJson([cannedProductRecord([{ productId: hitId(9) }, { gtin14: GTIN }], true)]),
+        }),
+    });
+
+    const res = await harness.catalog.searchProducts({ query: 'miku' });
+    expect(res.products[0]?.headId).toBe(CANNED_HEAD_ID);
+    expect(res.products[0]?.requestedAs).toEqual([]);
+  });
+
+  it('answers no hits as OK with an empty list and no token', async () => {
+    harness = await start({
+      respondSearch: () => create(WireSearchResponseSchema, { productsJson: searchJson([]) }),
+    });
+
+    const res = await harness.catalog.searchProducts({ query: 'no such figure' });
+    expect(res.products).toEqual([]);
+    expect(res.nextPageToken).toBe('');
+  });
+
+  it('passes keyset pages through one to one, in the spine order, following its tokens', async () => {
+    const ids = Array.from({ length: 7 }, (_, i) => hitId(i));
+    harness = await start({
+      respondSearch: (call) => {
+        const from = call.request.pageToken === '' ? 0 : Number(call.request.pageToken.slice('after-'.length));
+        const page = ids.slice(from, from + 3);
+        return create(WireSearchResponseSchema, {
+          productsJson: searchJson(page.map(hit)),
+          nextPageToken: from + 3 < ids.length ? `after-${from + 3}` : '',
+        });
+      },
+    });
+
+    const seen: string[] = [];
+    let token = '';
+    let pages = 0;
+    do {
+      const res = await harness.catalog.searchProducts({ query: 'miku', pageSize: 3, pageToken: token });
+      seen.push(...res.products.map((c) => c.headId));
+      token = res.nextPageToken;
+      pages += 1;
+    } while (token !== '' && pages < 10);
+
+    expect(pages).toBe(3);
+    expect(seen).toEqual(ids);
+    expect(harness.spine.searchCalls.map((c) => c.request.pageToken)).toEqual(['', 'after-3', 'after-6']);
+    expect(harness.spine.searchCalls.every((c) => c.request.query === 'miku' && c.request.pageSize === 3)).toBe(true);
+  });
+});
+
+describe('(f) SearchProducts — the page cap of 50', () => {
+  it.each([
+    [0, 0],
+    [1, 1],
+    [49, 49],
+    [50, 50],
+    [51, 50],
+    [500, 50],
+    [4_294_967_295, 50],
+  ])('page_size %i reaches the spine as %i', async (asked, sent) => {
+    harness = await start();
+    await harness.catalog.searchProducts({ query: 'miku', pageSize: asked });
+    expect(harness.spine.searchCalls[0]?.request.pageSize).toBe(sent);
+  });
+
+  it('serves a spine page of exactly 50 hits', async () => {
+    harness = await start({
+      respondSearch: () =>
+        create(WireSearchResponseSchema, { productsJson: searchJson(Array.from({ length: 50 }, (_, i) => hit(hitId(i)))) }),
+    });
+    const res = await harness.catalog.searchProducts({ query: 'miku', pageSize: 50 });
+    expect(res.products).toHaveLength(50);
+  });
+
+  it('answers INTERNAL for a spine page of 51 hits, never a truncated page that would desync the keyset', async () => {
+    harness = await start({
+      respondSearch: () =>
+        create(WireSearchResponseSchema, { productsJson: searchJson(Array.from({ length: 51 }, (_, i) => hit(hitId(i)))) }),
+    });
+    expect(await codeOf(harness.catalog.searchProducts({ query: 'miku', pageSize: 50 }))).toBe(Code.Internal);
+  });
+});
+
+describe('(f) SearchProducts — the query, validated before anything leaves the process', () => {
+  it.each([
+    ['empty', ''],
+    ['ASCII spaces only', '   '],
+    ['Unicode White_Space only (ideographic space, NEL, tab, newline)', '　\u0085\t\n'],
+  ])('a query that is %s is INVALID_ARGUMENT, and neither the spine nor OpenFGA is asked', async (_label, query) => {
+    harness = await start();
+    expect(await codeOf(harness.catalog.searchProducts({ query }))).toBe(Code.InvalidArgument);
     expect(harness.spine.wire).toHaveLength(0);
+    expect(harness.fga.calls).toHaveLength(0);
+  });
+
+  // The bound is 256 code points COUNTED IN THE NFKC-NORMALIZED, TRIMMED FORM (read.proto 0.9.0).
+  it.each([
+    ['256 ASCII letters', 'a'.repeat(256)],
+    ['256 astral code points (512 UTF-16 units)', '\u{20BB7}'.repeat(256)],
+    ['512 code points that NFKC composes to 256 (half-width ｶﾞ -> ガ)', 'ｶﾞ'.repeat(256)],
+    ['64 ㍿ that NFKC expands to exactly 256', '㍿'.repeat(64)],
+    ['256 letters wrapped in Unicode White_Space JS trim misses (NEL)', `\u0085${'a'.repeat(256)}　`],
+  ])('accepts %s and sends it as typed', async (_label, query) => {
+    harness = await start();
+    expect(await codeOf(harness.catalog.searchProducts({ query }))).toBe('OK');
+    expect(harness.spine.searchCalls[0]?.request.query).toBe(query);
+  });
+
+  it.each([
+    ['257 ASCII letters', 'a'.repeat(257)],
+    ['257 astral code points', '\u{20BB7}'.repeat(257)],
+    ['514 code points that NFKC composes to 257', 'ｶﾞ'.repeat(257)],
+    ['65 ㍿ that NFKC expands to 260', '㍿'.repeat(65)],
+    ['256 letters and a BOM, which is not White_Space', `${'a'.repeat(256)}﻿`],
+  ])('refuses %s as INVALID_ARGUMENT before any spine call', async (_label, query) => {
+    harness = await start();
+    expect(await codeOf(harness.catalog.searchProducts({ query }))).toBe(Code.InvalidArgument);
+    expect(harness.spine.wire).toHaveLength(0);
+  });
+
+  // The trim must cost time linear in the query: a regex anchored at both ends
+  // backtracks quadratically over an INTERIOR run of White_Space, and the 256
+  // bound is only checked after the trim, on the one event loop every service
+  // shares. 200 000 spaces took ~11 s that way; a linear trim takes milliseconds.
+  it.each([
+    ['ASCII spaces', ' '],
+    ['ideographic spaces', '\u3000'],
+  ])('refuses a query with an interior run of 200 000 %s within 1 s, before any spine call', async (_label, ws) => {
+    harness = await start();
+    const query = `a${ws.repeat(200_000)}a`;
+
+    const started = performance.now();
+    const err = await searchError(harness.catalog.searchProducts({ query }));
+    const elapsedMs = performance.now() - started;
+
+    expect(err.code).toBe(Code.InvalidArgument);
+    expect(err.rawMessage).toBe('query must not exceed 256 characters');
+    expect(elapsedMs).toBeLessThan(1000);
+    expect(harness.spine.wire).toHaveLength(0);
+  });
+
+  // NFKC itself is quadratic in a run of combining marks it must reorder (marks
+  // of alternating combining class), and it ran on the whole raw query. A raw
+  // query, once trimmed, longer than 9,216 UTF-16 units can never come within
+  // 256 code points, so it is refused unread. 'e' + U+0301 needs no reordering
+  // and was always fast; it pins the refusal, not the slowness.
+  it.each([
+    ['e and 200 000 U+0301', `e${'\u0301'.repeat(200_000)}`],
+    ['a and 64 Ki pairs of marks of combining class 230 and 220', `a${'\u0301\u0316'.repeat(64 * 1024)}`],
+  ])('refuses a query of %s within 250 ms, before any spine call', async (_label, query) => {
+    harness = await start();
+
+    const started = performance.now();
+    const err = await searchError(harness.catalog.searchProducts({ query }));
+    const elapsedMs = performance.now() - started;
+
+    expect(err.code).toBe(Code.InvalidArgument);
+    expect(err.rawMessage).toBe('query must not exceed 256 characters');
+    expect(elapsedMs).toBeLessThan(250);
+    expect(harness.spine.wire).toHaveLength(0);
+  });
+
+  // NFKC composes at most 4 code points into one (U+1F82 is α, U+0313, U+0300,
+  // U+0345), so the raw bound must leave room for 1,024 code points that
+  // normalize to 256.
+  it('accepts 1,024 code points that NFKC composes to 256 (U+1F82 spelled out), and sends it as typed', async () => {
+    harness = await start();
+    const query = '\u03B1\u0313\u0300\u0345'.repeat(256);
+    expect(query.normalize('NFKC')).toBe('\u1F82'.repeat(256));
+
+    expect(await codeOf(harness.catalog.searchProducts({ query }))).toBe('OK');
+    expect(harness.spine.searchCalls[0]?.request.query).toBe(query);
+  });
+
+  // The trim steps one unit at a time from each end: an odd-length pad pins the step.
+  it.each([
+    ['one leading ASCII space', ` ${'a'.repeat(257)}`],
+    ['three leading ideographic spaces', `${'\u3000'.repeat(3)}${'a'.repeat(257)}`],
+    ['one trailing ASCII space', `${'a'.repeat(257)} `],
+    ['three trailing ideographic spaces', `${'a'.repeat(257)}${'\u3000'.repeat(3)}`],
+  ])('refuses 257 letters behind %s as INVALID_ARGUMENT before any spine call', async (_label, query) => {
+    harness = await start();
+    const err = await searchError(harness.catalog.searchProducts({ query }));
+    expect(err.code).toBe(Code.InvalidArgument);
+    expect(err.rawMessage).toBe('query must not exceed 256 characters');
+    expect(harness.spine.wire).toHaveLength(0);
+  });
+
+  it('accepts 256 letters inside 200 000 White_Space on each side, and sends it as typed', async () => {
+    harness = await start();
+    const pad = ' \u3000\u0085\t'.repeat(50_000);
+    const query = `${pad}${'a'.repeat(128)} ${'b'.repeat(127)}${pad}`;
+
+    const started = performance.now();
+    expect(await codeOf(harness.catalog.searchProducts({ query }))).toBe('OK');
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(harness.spine.searchCalls[0]?.request.query).toBe(query);
+  });
+});
+
+describe('(f) SearchProducts — the entitlement assertion travels as it does for GetProducts', () => {
+  it('ENTITLED: the refusing spine accepts the call and the hit fields are present', async () => {
+    harness = await start({ allow: true, requireAssertion: true });
+
+    const res = await harness.catalog.searchProducts({ query: 'miku' });
+
+    expect(harness.spine.searchCalls[0]?.entitlementOutcome).toBe('granted');
+    expect(harness.spine.searchCalls[0]?.entitled).toBe(true);
+    expect(harness.spine.searchCalls[0]?.headers.get('fc-entitlements')).toMatch(/^[\w-]+\.[\w-]+\.[\w-]+$/);
+    expect(JSON.stringify(harness.spine.searchCalls[0]?.request)).not.toContain('fc-entitlements');
+    expect(res.products[0]?.title?.value).toBe('Hatsune Miku Symphony 2025 Ver.');
+    expect(res.products[0]?.character?.value).toBe('Hatsune Miku');
+    expect(harness.fga.calls).toHaveLength(1);
+  });
+
+  it('NO CALLER: nothing is minted and OpenFGA is never asked: the same hits, redacted', async () => {
+    harness = await start({ subject: null });
+
+    const res = await harness.catalog.searchProducts({ query: 'miku' });
+
+    expect(res.products[0]?.title?.value).toBe('Hatsune Miku Symphony 2025 Ver.');
+    expect(harness.fga.calls).toHaveLength(0);
+    expect(harness.spine.searchCalls[0]?.entitlementOutcome).toBe('absent');
+    expect(harness.spine.searchCalls[0]?.headers.get('fc-entitlements')).toBeNull();
+  });
+
+  it('UNENTITLED: nothing is minted, the refusing spine says no, and the client sees UNAVAILABLE', async () => {
+    harness = await start({ allow: false, requireAssertion: true });
+
+    expect(await codeOf(harness.catalog.searchProducts({ query: 'miku' }))).toBe(Code.Unavailable);
+    expect(harness.spine.searchCalls[0]?.entitlementOutcome).toBe('absent');
+  });
+
+  it('never widens redaction: an unentitled caller is served the redacted page as the spine cut it', async () => {
+    harness = await start({ allow: false });
+
+    const res = await harness.catalog.searchProducts({ query: 'miku' });
+
+    expect(harness.spine.searchCalls).toHaveLength(1);
+    expect(harness.spine.searchCalls[0]?.entitled).toBe(false);
+    // One spine call, no second read to "fill in" what was withheld, and no gated value on the card.
+    expect(harness.spine.wire).toHaveLength(1);
+    expect(toJsonString(ProductCardSchema, res.products[0]!)).not.toContain('stockOnHand');
+  });
+});
+
+describe('(f) SearchProducts — the stale-token refusal, in the catalog contract shape', () => {
+  it('relays TOKEN_EXPIRED_OR_REBASED @ figurecollecting.com as INVALID_ARGUMENT carrying the same ErrorInfo', async () => {
+    harness = await start({
+      respondSearch: () =>
+        spineRefusal([{ type: ERROR_INFO, value: errorInfoBytes(STALE, DOMAIN, { ranking: 'v2' }) }]),
+    });
+
+    const err = await searchError(harness.catalog.searchProducts({ query: 'miku', pageToken: 'old-tok' }));
+
+    expect(err.code).toBe(Code.InvalidArgument);
+    expect(errorInfosOf(err)).toEqual([{ reason: STALE, domain: DOMAIN }]);
+    // Built fresh: reason and domain only, none of the spine's metadata.
+    const detail = err.details.find((d) => 'type' in d && d.type === ERROR_INFO) as { value: Uint8Array };
+    expect(detail.value).toEqual(errorInfoBytes(STALE, DOMAIN));
+    expect(err.rawMessage).toMatch(/restart the search from page one/);
+    expect(err.rawMessage).not.toContain('10.42.0.7');
+    expect(err.rawMessage).not.toContain('ranking v2');
+  });
+
+  it.each([
+    ['no details at all', []],
+    ['a lower-case reason', [{ type: ERROR_INFO, value: errorInfoBytes(STALE.toLowerCase(), DOMAIN) }]],
+    ['another domain', [{ type: ERROR_INFO, value: errorInfoBytes(STALE, 'spine.figurecollecting.com') }]],
+    ['another reason', [{ type: ERROR_INFO, value: errorInfoBytes('QUERY_MISMATCH', DOMAIN) }]],
+    ['the stale bytes under another detail type', [{ type: 'google.rpc.BadRequest', value: errorInfoBytes(STALE, DOMAIN) }]],
+    ['ErrorInfo bytes that cannot be decoded', [{ type: ERROR_INFO, value: new Uint8Array([0x0a, 0x7f, 0x41]) }]],
+  ])('any other INVALID_ARGUMENT (%s) stays INVALID_ARGUMENT, with no ErrorInfo and no spine words', async (_l, details) => {
+    harness = await start({ respondSearch: () => spineRefusal(details) });
+
+    const err = await searchError(harness.catalog.searchProducts({ query: 'miku', pageToken: 'other-query-tok' }));
+
+    expect(err.code).toBe(Code.InvalidArgument);
+    expect(errorInfosOf(err)).toEqual([]);
+    expect(err.details).toEqual([]);
+    expect(err.rawMessage).toBe('the spine refused the search request');
+    expect(err.rawMessage).not.toContain('10.42.0.7');
+  });
+
+  it('a non-stale INVALID_ARGUMENT on page one (no page_token) says nothing about a page_token', async () => {
+    harness = await start({
+      respondSearch: () => {
+        throw new ConnectError('now_iso must be ISO-8601 (10.42.0.7)', Code.InvalidArgument);
+      },
+    });
+
+    const err = await searchError(harness.catalog.searchProducts({ query: 'miku' }));
+
+    expect(harness.spine.searchCalls[0]?.request.pageToken).toBe('');
+    expect(err.code).toBe(Code.InvalidArgument);
+    expect(err.details).toEqual([]);
+    expect(err.rawMessage).toBe('the spine refused the search request');
+  });
+
+  it('a stale ErrorInfo on any code but INVALID_ARGUMENT is UNAVAILABLE, not a restart', async () => {
+    harness = await start({
+      respondSearch: () => spineRefusal([{ type: ERROR_INFO, value: errorInfoBytes(STALE, DOMAIN) }], Code.Internal),
+    });
+
+    const err = await searchError(harness.catalog.searchProducts({ query: 'miku', pageToken: 'tok' }));
+    expect(err.code).toBe(Code.Unavailable);
+    expect(errorInfosOf(err)).toEqual([]);
+  });
+});
+
+describe('(f) SearchProducts — failure behaviour', () => {
+  it('answers UNAVAILABLE when no spine is configured', async () => {
+    harness = await start({ noSpine: true });
+    expect(await codeOf(harness.catalog.searchProducts({ query: 'miku' }))).toBe(Code.Unavailable);
+  });
+
+  it('answers UNAVAILABLE when the spine fails, without relaying its message', async () => {
+    harness = await start({
+      respondSearch: () => {
+        throw new ConnectError('connection refused at 10.42.0.7:5432', Code.Internal);
+      },
+    });
+    const err = await searchError(harness.catalog.searchProducts({ query: 'miku' }));
+    expect(err.code).toBe(Code.Unavailable);
+    expect(err.message).not.toContain('10.42.0.7');
+  });
+
+  it.each([
+    ['not JSON', 'not json at all'],
+    ['not an object', '[]'],
+    ['products missing', '{"coverage":{}}'],
+    ['products not a list', '{"products":{},"coverage":{}}'],
+    ['a hit with no productId', '{"products":[{"display":{}}],"coverage":{}}'],
+  ])('answers INTERNAL for a search payload that is %s', async (_label, body) => {
+    harness = await start({
+      respondSearch: () => create(WireSearchResponseSchema, { productsJson: body }),
+    });
+    const err = await searchError(harness.catalog.searchProducts({ query: 'miku' }));
+    expect(err.code).toBe(Code.Internal);
+    expect(err.rawMessage).toBe('spine returned a search payload that could not be read');
   });
 });
