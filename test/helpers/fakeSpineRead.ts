@@ -44,12 +44,15 @@ import {
   CompareResponseSchema,
   GetProductsResponseSchema,
   GetProductImagesResponseSchema,
+  SearchProductsResponseSchema,
   type CompareRequest as WireCompareRequest,
   type CompareResponse as WireCompareResponse,
   type GetProductsRequest as WireGetProductsRequest,
   type GetProductsResponse as WireGetProductsResponse,
   type GetProductImagesRequest as WireGetProductImagesRequest,
   type GetProductImagesResponse as WireGetProductImagesResponse,
+  type SearchProductsRequest as WireSearchProductsRequest,
+  type SearchProductsResponse as WireSearchProductsResponse,
 } from '@figurecollecting/ingest-contract/read';
 import {
   ENTITLEMENTS_HEADER,
@@ -166,6 +169,18 @@ export function cannedProductsJson(request: WireGetProductsRequest, entitled: bo
   });
 }
 
+/**
+ * What a canned SearchProducts answer serves: one hit, the same display record
+ * GetProducts carries with `requestedAs` empty (read.proto 0.9.0: a hit was
+ * found, not named), redacted exactly as GetProducts redacts.
+ */
+export function cannedSearchJson(entitled: boolean): string {
+  return JSON.stringify({
+    products: [cannedProductRecord([], entitled)],
+    coverage: entitled ? {} : { redacted: [INVENTORY_LEVELS] },
+  });
+}
+
 /** One stream as the server saw it on the socket, before any adapter ran. */
 export interface WireRecord {
   path: string;
@@ -190,6 +205,8 @@ export interface FakeSpineRead {
   productCalls: SpineCall<WireGetProductsRequest>[];
   /** GetProductImages calls, in order. */
   imageCalls: SpineCall<WireGetProductImagesRequest>[];
+  /** SearchProducts calls, in order. */
+  searchCalls: SpineCall<WireSearchProductsRequest>[];
   /** Every stream, whatever its protocol — including ones the adapter refused. */
   wire: WireRecord[];
   close: () => Promise<void>;
@@ -210,6 +227,10 @@ export interface FakeSpineReadOptions {
   respondImages?: (
     call: SpineCall<WireGetProductImagesRequest>,
   ) => WireGetProductImagesResponse | Promise<WireGetProductImagesResponse>;
+  /** Override the whole SearchProducts reply. Throw from it to answer with a status. */
+  respondSearch?: (
+    call: SpineCall<WireSearchProductsRequest>,
+  ) => WireSearchProductsResponse | Promise<WireSearchProductsResponse>;
   /** Refuse, PERMISSION_DENIED, every call whose assertion does not verify as granted. */
   requireAssertion?: boolean;
 }
@@ -218,6 +239,7 @@ export async function startFakeSpineRead(options: FakeSpineReadOptions): Promise
   const calls: SpineCall[] = [];
   const productCalls: SpineCall<WireGetProductsRequest>[] = [];
   const imageCalls: SpineCall<WireGetProductImagesRequest>[] = [];
+  const searchCalls: SpineCall<WireSearchProductsRequest>[] = [];
   const wire: WireRecord[] = [];
 
   const admit = <R>(request: R, requestHeader: Headers): SpineCall<R> => {
@@ -264,6 +286,14 @@ export async function startFakeSpineRead(options: FakeSpineReadOptions): Promise
           imagesJson: '{"products":[],"coverage":{}}',
         });
       },
+      searchProducts: async (request, ctx): Promise<WireSearchProductsResponse> => {
+        const call = admit(request, ctx.requestHeader);
+        searchCalls.push(call);
+        refuseUnlessEntitled(call);
+
+        if (options.respondSearch) return options.respondSearch(call);
+        return create(SearchProductsResponseSchema, { productsJson: cannedSearchJson(call.entitled) });
+      },
     });
   };
 
@@ -292,6 +322,7 @@ export async function startFakeSpineRead(options: FakeSpineReadOptions): Promise
     calls,
     productCalls,
     imageCalls,
+    searchCalls,
     wire,
     close: async () => {
       // Sessions first: a handler parked on a never-settling promise holds a
