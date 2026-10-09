@@ -895,6 +895,38 @@ describe('(f) SearchProducts — the query, validated before anything leaves the
     expect(await codeOf(harness.catalog.searchProducts({ query }))).toBe(Code.InvalidArgument);
     expect(harness.spine.wire).toHaveLength(0);
   });
+
+  // The trim must cost time linear in the query: a regex anchored at both ends
+  // backtracks quadratically over an INTERIOR run of White_Space, and the 256
+  // bound is only checked after the trim, on the one event loop every service
+  // shares. 200 000 spaces took ~11 s that way; a linear trim takes milliseconds.
+  it.each([
+    ['ASCII spaces', ' '],
+    ['ideographic spaces', '\u3000'],
+  ])('refuses a query with an interior run of 200 000 %s within 1 s, before any spine call', async (_label, ws) => {
+    harness = await start();
+    const query = `a${ws.repeat(200_000)}a`;
+
+    const started = performance.now();
+    const err = await searchError(harness.catalog.searchProducts({ query }));
+    const elapsedMs = performance.now() - started;
+
+    expect(err.code).toBe(Code.InvalidArgument);
+    expect(err.rawMessage).toBe('query must not exceed 256 characters');
+    expect(elapsedMs).toBeLessThan(1000);
+    expect(harness.spine.wire).toHaveLength(0);
+  });
+
+  it('accepts 256 letters inside 200 000 White_Space on each side, and sends it as typed', async () => {
+    harness = await start();
+    const pad = ' \u3000\u0085\t'.repeat(50_000);
+    const query = `${pad}${'a'.repeat(128)} ${'b'.repeat(127)}${pad}`;
+
+    const started = performance.now();
+    expect(await codeOf(harness.catalog.searchProducts({ query }))).toBe('OK');
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(harness.spine.searchCalls[0]?.request.query).toBe(query);
+  });
 });
 
 describe('(f) SearchProducts — the entitlement assertion travels as it does for GetProducts', () => {
@@ -977,8 +1009,23 @@ describe('(f) SearchProducts — the stale-token refusal, in the catalog contrac
     expect(err.code).toBe(Code.InvalidArgument);
     expect(errorInfosOf(err)).toEqual([]);
     expect(err.details).toEqual([]);
-    expect(err.rawMessage).toMatch(/page_token only with the query/);
+    expect(err.rawMessage).toBe('the spine refused the search request');
     expect(err.rawMessage).not.toContain('10.42.0.7');
+  });
+
+  it('a non-stale INVALID_ARGUMENT on page one (no page_token) says nothing about a page_token', async () => {
+    harness = await start({
+      respondSearch: () => {
+        throw new ConnectError('now_iso must be ISO-8601 (10.42.0.7)', Code.InvalidArgument);
+      },
+    });
+
+    const err = await searchError(harness.catalog.searchProducts({ query: 'miku' }));
+
+    expect(harness.spine.searchCalls[0]?.request.pageToken).toBe('');
+    expect(err.code).toBe(Code.InvalidArgument);
+    expect(err.details).toEqual([]);
+    expect(err.rawMessage).toBe('the spine refused the search request');
   });
 
   it('a stale ErrorInfo on any code but INVALID_ARGUMENT is UNAVAILABLE, not a restart', async () => {
@@ -1019,6 +1066,8 @@ describe('(f) SearchProducts — failure behaviour', () => {
     harness = await start({
       respondSearch: () => create(WireSearchResponseSchema, { productsJson: body }),
     });
-    expect(await codeOf(harness.catalog.searchProducts({ query: 'miku' }))).toBe(Code.Internal);
+    const err = await searchError(harness.catalog.searchProducts({ query: 'miku' }));
+    expect(err.code).toBe(Code.Internal);
+    expect(err.rawMessage).toBe('spine returned a search payload that could not be read');
   });
 });
