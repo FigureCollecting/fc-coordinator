@@ -23,6 +23,18 @@
 // carries `unresolved`. The coordinator neither follows nor rewrites tokens, so
 // a client page is a spine page and the two can never disagree about position.
 //
+// SEARCH IS A PASS-THROUGH OF THE SAME KIND (WK-17). SearchProducts sends the
+// query to read.v1 SpineRead.SearchProducts AS TYPED (the spine normalizes it
+// and binds its keyset token to its own form), forwards one page for one page,
+// and maps each hit through the same allowlist as GetProducts. Only what the
+// contract states as a number is checked here first: an empty query, and one
+// over 256 code points in the NFKC-normalized, White_Space-trimmed form. The
+// page size is capped at 50 on the way out, and a spine page over 50 is
+// refused rather than truncated. A spine refusal of a STALE token (ErrorInfo
+// TOKEN_EXPIRED_OR_REBASED in figurecollecting.com) reaches the client as
+// INVALID_ARGUMENT carrying that same (domain, reason) pair, rebuilt here;
+// nothing else of the spine's error does.
+//
 // IMAGES ARE OFF until a public media base is configured (MEDIA_PUBLIC_BASE_URL,
 // unset by default — no derivative exists yet). Off means GetProductImages
 // answers an empty page without asking the spine. On means a row is returned
@@ -30,6 +42,7 @@
 // ============================================================================
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
 import { create } from '@bufbuild/protobuf';
+import { BinaryReader, BinaryWriter, WireType } from '@bufbuild/protobuf/wire';
 import {
   CardTextSchema,
   CatalogService,
@@ -39,6 +52,7 @@ import {
   ProductImageSchema,
   ProductImagesSchema,
   ProductRefSchema,
+  SearchProductsResponseSchema,
   canonicalInstant,
   type CardText,
   type GetProductImagesRequest,
@@ -49,6 +63,8 @@ import {
   type ProductImage,
   type ProductImages,
   type ProductRef,
+  type SearchProductsRequest,
+  type SearchProductsResponse,
 } from '@figurecollecting/fc-api-contract';
 import { entitlementHeaderFor as defaultEntitlementHeaderFor } from '../entitlements/index.js';
 import type { SpinePage, SpineProductRef } from '../spine/spineReadClient.js';
@@ -56,6 +72,15 @@ import { kCallerSubject } from './identity.js';
 
 /** Refs (or head ids) one call may carry. More is INVALID_ARGUMENT, never truncated. */
 export const MAX_CATALOG_REFS = 200;
+
+/** Hits one SearchProducts page may carry: a larger page_size is served at 50 (catalog.proto, read.proto 0.9.0). */
+export const MAX_SEARCH_PAGE = 50;
+
+/** A query's bound in code points, counted in the NFKC-normalized, trimmed form (read.proto 0.9.0). */
+export const MAX_SEARCH_QUERY_CHARS = 256;
+
+/** The (domain, reason) pair read.proto 0.9.0 names for a search token issued before a ranking or encoding change. */
+export const STALE_SEARCH_TOKEN = { reason: 'TOKEN_EXPIRED_OR_REBASED', domain: 'figurecollecting.com' } as const;
 
 /**
  * THE ALLOWLIST: every CardText field of a ProductCard, and the ONE place each
@@ -142,6 +167,12 @@ export interface SpineCatalog {
     assertion: string | null,
     page: SpinePage,
   ): Promise<{ imagesJson: string; nextPageToken: string }>;
+  searchProducts(
+    query: string,
+    nowIso: string,
+    assertion: string | null,
+    page: SpinePage,
+  ): Promise<{ productsJson: string; nextPageToken: string }>;
 }
 
 export interface CatalogRoutesDeps {
@@ -382,6 +413,25 @@ export function readProductsPayload(json: string): { products: ProductCard[]; un
   return { products: cards, unresolved: refList(unresolved) };
 }
 
+/**
+ * products_json of a search page -> cards, or null when it cannot be read whole
+ * or carries more hits than a page may. Each hit goes through toProductCard, as
+ * a GetProducts record does, and names no ref: this request sent none, so a ref
+ * the spine echoed would tell the client it asked for something it did not.
+ */
+export function readSearchPayload(json: string): ProductCard[] | null {
+  const products = parseObject(json)?.['products'];
+  if (!Array.isArray(products) || products.length > MAX_SEARCH_PAGE) return null;
+  const cards: ProductCard[] = [];
+  for (const record of products) {
+    const card = toProductCard(record);
+    if (card === null) return null;
+    card.requestedAs = [];
+    cards.push(card);
+  }
+  return cards;
+}
+
 /** A raw pixel-size token as a uint32; 0 when unknown or not a whole number in range. */
 const pixels = (raw: unknown): number => {
   if (typeof raw !== 'string' || !/^\d+$/.test(raw)) return 0;
@@ -478,6 +528,74 @@ function relay(err: unknown): ConnectError {
   return new ConnectError('spine read is unavailable', Code.Unavailable, undefined, undefined, err);
 }
 
+/** Leading and trailing Unicode White_Space: String.prototype.trim also strips U+FEFF and keeps U+0085. */
+const EDGE_WHITE_SPACE = /^\p{White_Space}+|\p{White_Space}+$/gu;
+
+/**
+ * The query, checked in the form read.proto 0.9.0 counts it in (NFKC, then
+ * White_Space trimmed) and returned AS TYPED: that form is the spine's to make.
+ */
+function searchQuery(query: string): string {
+  const form = query.normalize('NFKC').replace(EDGE_WHITE_SPACE, '');
+  if (form === '') throw invalid('query must not be empty or only whitespace');
+  if ([...form].length > MAX_SEARCH_QUERY_CHARS) {
+    throw invalid(`query must not exceed ${MAX_SEARCH_QUERY_CHARS} characters`);
+  }
+  return query;
+}
+
+const ERROR_INFO_TYPE = 'google.rpc.ErrorInfo';
+
+/** google.rpc.ErrorInfo's reason (1) and domain (2), read by hand; null when the bytes do not decode. */
+function readErrorInfo(bytes: Uint8Array): { reason: string; domain: string } | null {
+  try {
+    const reader = new BinaryReader(bytes);
+    const info = { reason: '', domain: '' };
+    while (reader.pos < reader.len) {
+      const [field, wireType] = reader.tag();
+      if (field === 1) info.reason = reader.string();
+      else if (field === 2) info.domain = reader.string();
+      else reader.skip(wireType);
+    }
+    return info;
+  } catch {
+    return null;
+  }
+}
+
+const isStaleSearchToken = (err: ConnectError): boolean =>
+  err.details.some((detail) => {
+    if (!('type' in detail) || detail.type !== ERROR_INFO_TYPE) return false;
+    const info = readErrorInfo(detail.value);
+    return info?.reason === STALE_SEARCH_TOKEN.reason && info.domain === STALE_SEARCH_TOKEN.domain;
+  });
+
+/**
+ * A spine failure on SearchProducts, as the client may see it. The stale-token
+ * refusal keeps its (domain, reason) pair, rebuilt from the constant so none of
+ * the spine's ErrorInfo metadata rides along; any other INVALID_ARGUMENT is
+ * relayed as GetProducts relays it; everything else is UNAVAILABLE.
+ */
+function relaySearch(err: unknown): ConnectError {
+  if (err instanceof ConnectError && err.code === Code.InvalidArgument) {
+    if (!isStaleSearchToken(err)) {
+      return invalid('the spine refused the search: send a page_token only with the query it was issued for');
+    }
+    const stale = invalid('the page_token is stale: restart the search from page one');
+    stale.details.push({
+      type: ERROR_INFO_TYPE,
+      value: new BinaryWriter()
+        .tag(1, WireType.LengthDelimited)
+        .string(STALE_SEARCH_TOKEN.reason)
+        .tag(2, WireType.LengthDelimited)
+        .string(STALE_SEARCH_TOKEN.domain)
+        .finish(),
+    });
+    return stale;
+  }
+  return relay(err);
+}
+
 const unreadable = (what: string): ConnectError =>
   new ConnectError(`spine returned a ${what} payload that could not be read`, Code.Internal);
 
@@ -543,8 +661,27 @@ export function createCatalogRoutes(deps: CatalogRoutesDeps): (router: ConnectRo
     return create(GetProductImagesResponseSchema, { products, nextPageToken: upstream.nextPageToken });
   };
 
-  const searchProducts = async (): Promise<never> => {
-    throw new ConnectError('SearchProducts is not served yet (WK-17)', Code.Unimplemented);
+  const searchProducts = async (
+    request: SearchProductsRequest,
+    ctx: HandlerContext,
+  ): Promise<SearchProductsResponse> => {
+    const query = searchQuery(request.query);
+    const client = spine();
+    const assertion = await assertionFor(ctx);
+
+    let upstream: { productsJson: string; nextPageToken: string };
+    try {
+      upstream = await client.searchProducts(query, now().toISOString(), assertion, {
+        pageSize: Math.min(request.pageSize, MAX_SEARCH_PAGE),
+        pageToken: request.pageToken,
+      });
+    } catch (err) {
+      throw relaySearch(err);
+    }
+
+    const products = readSearchPayload(upstream.productsJson);
+    if (products === null) throw unreadable('search');
+    return create(SearchProductsResponseSchema, { products, nextPageToken: upstream.nextPageToken });
   };
 
   return (router: ConnectRouter) => {

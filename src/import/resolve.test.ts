@@ -37,6 +37,9 @@ function spine(known: number, pageSize = 50, edit?: (payload: Record<string, unk
     async getProductImages() {
       throw new Error('not used');
     },
+    async searchProducts() {
+      throw new Error('not used');
+    },
   };
 }
 
@@ -95,6 +98,7 @@ describe('resolveMfcIds', () => {
         throw new ConnectError('connection refused at 10.0.0.1', Code.Unavailable);
       },
       getProductImages: async () => ({ imagesJson: '', nextPageToken: '' }),
+      searchProducts: async () => ({ productsJson: '', nextPageToken: '' }),
     };
     const err = await resolveMfcIds(failing, ['1'], 'now').catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ConnectError);
@@ -106,6 +110,7 @@ describe('resolveMfcIds', () => {
     const bad = (json: string): SpineCatalog => ({
       getProducts: async () => ({ productsJson: json, nextPageToken: '' }),
       getProductImages: async () => ({ imagesJson: '', nextPageToken: '' }),
+      searchProducts: async () => ({ productsJson: '', nextPageToken: '' }),
     });
     for (const json of ['not json', '[]', '{"products":{}}', '{"products":[null]}', '{"products":[{"productId":"X","requestedAs":[]}]}', '{"products":[{"productId":"5F0C2A9E-4B7D-4E21-9C3A-8D1E6F2B7A40","requestedAs":[]}]}', '{"products":[{"productId":7}]}']) {
       await expect(resolveMfcIds(bad(json), ['1'], 'now')).rejects.toMatchObject({ code: Code.Internal });

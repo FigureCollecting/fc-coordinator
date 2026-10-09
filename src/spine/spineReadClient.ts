@@ -1,7 +1,7 @@
 /**
  * Spine read client — the coordinator's half of read.v1 SpineRead
  * (@figurecollecting/ingest-contract/read): Compare for CompareService, and
- * GetProducts / GetProductImages for CatalogService. The coordinator is the
+ * GetProducts / GetProductImages / SearchProducts for CatalogService. The coordinator is the
  * client-facing caller; fc-mobile never talks to the spine directly.
  *
  * SCOPE: THIN READ-THROUGH ONLY. Each method sends one request and returns the
@@ -38,10 +38,12 @@ import {
   CompareRequestSchema,
   GetProductImagesRequestSchema,
   GetProductsRequestSchema,
+  SearchProductsRequestSchema,
   SourceItemSchema,
   type CompareResponse,
   type GetProductImagesResponse,
   type GetProductsResponse,
+  type SearchProductsResponse,
   type ProductRef as WireProductRef,
 } from '@figurecollecting/ingest-contract/read';
 import { ENTITLEMENTS_HEADER } from '@figurecollecting/ingest-contract/entitlement';
@@ -159,6 +161,28 @@ export class SpineReadClient {
       pageToken: page.pageToken,
     });
     return this.client.getProductImages(request, this.callOptions(assertion));
+  }
+
+  /**
+   * Call SpineRead.SearchProducts for one page of one search. The query goes
+   * as the caller typed it: the spine normalizes it, binds its page token to
+   * and matches THAT form, so a copy normalized here would be a second form.
+   * Neither filter is sent — catalog.proto has none yet — and they stay ABSENT,
+   * because present-but-empty is INVALID_ARGUMENT at the spine.
+   */
+  async searchProducts(
+    query: string,
+    nowIso: string,
+    assertion: string | null,
+    page: SpinePage,
+  ): Promise<SearchProductsResponse> {
+    const request = create(SearchProductsRequestSchema, {
+      query,
+      nowIso,
+      pageSize: page.pageSize,
+      pageToken: page.pageToken,
+    });
+    return this.client.searchProducts(request, this.callOptions(assertion));
   }
 
   /**

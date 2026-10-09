@@ -152,7 +152,16 @@ records the content type and HTTP version of every stream.
 - **GetProductImages** returns nothing while `MEDIA_PUBLIC_BASE_URL` is unset.
   When it is set, a row is kept only when its URL is exactly
   `<base>/<derivative sha-256>`.
-- **SearchProducts** answers `UNIMPLEMENTED` until WK-17.
+- **SearchProducts** passes one page through to `SpineRead.SearchProducts`
+  (WK-17) with the assertion minted as for GetProducts. The query goes as
+  typed; an empty one, or one over 256 code points once NFKC-normalized and
+  trimmed of Unicode White_Space, is `INVALID_ARGUMENT` before any spine call.
+  `page_size` is capped at 50, a spine page over 50 hits is `INTERNAL`, and
+  every hit maps through the card allowlist with an empty `requested_as`. A
+  stale token (spine `ErrorInfo` `TOKEN_EXPIRED_OR_REBASED` in
+  `figurecollecting.com`) is `INVALID_ARGUMENT` carrying that same pair: the
+  client restarts from page one. catalog.proto 0.3.0 has no filter fields, so
+  `manufacturer` and `release_ym` are never sent.
 
 ### OpenFGA's own status numbers
 
