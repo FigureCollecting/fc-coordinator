@@ -718,6 +718,9 @@ describe('the pending count and the spine', () => {
     // The client answers the figure item, and the answer syncs.
     const answer = { facetKey: `res/mfc/${headFor(x)}`, version: canonicalVersion({ instant: new Date(), counter: 3, deviceId: a.deviceId }), op: SyncOp.UPSERT, payload: JSON.stringify({ item: 'figure', rev, choice: 'keep', ...DISPLAY }), basis: cursor };
     expect(ok(await a.push({ clientId: randomUUID(), events: [answer] })).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    // The item ends where every replica counts it too: its facet is tombstoned, and the server keeps none pending.
+    expect(replica((await drain(a)).events).has(`imp/mfc/figure/${headFor(x)}`)).toBe(false);
+    expect((await a.status().then(ok)).pendingReview).toBe(0n);
 
     const again = ok(await a.importMfcExport({ csvText: csv('mfc: loose'), exportDate: EXPORT_DATE }));
     expect(again).toMatchObject({ conflictsRaised: 0, conflictsPending: 0, review: [] });
@@ -768,10 +771,12 @@ describe('the pending count and the spine', () => {
     expect(again).toMatchObject({ conflictsRaised: 0, conflictsPending: 0, review: [] });
 
     // The keep settled z at MFC's note: MFC changing it again is a new conflict, with a new rev the
-    // old answer does not name; MFC going back to the note it was settled at ends that item.
-    const changed = ok(await a.importMfcExport({ csvText: mfcCsv([x, y].map((id) => row(id, 'Owned', { note: 'mfc: loose' })).concat(row(z, 'Owned', { note: 'mfc: repainted' }))), exportDate: EXPORT_DATE }));
+    // old answer does not name; MFC going back to the note it was settled at ends that item. The take
+    // left x's note at MFC's and settled it there: MFC changing x's note again is MFC's change alone.
+    const changed = ok(await a.importMfcExport({ csvText: mfcCsv([row(x, 'Owned', { note: 'mfc: repainted' }), row(y, 'Owned', { note: 'mfc: loose' }), row(z, 'Owned', { note: 'mfc: repainted' })]), exportDate: EXPORT_DATE }));
     expect(changed).toMatchObject({ conflictsRaised: 1, conflictsPending: 1 });
     expect(revOf(changed, z)).not.toBe(revOf(first, z));
+    expect(replica((await drain(a)).events).get(`uf/${headFor(x)}/note`)).toMatchObject({ note: 'mfc: repainted' });
     const back = ok(await a.importMfcExport({ csvText: csv('mfc: loose'), exportDate: EXPORT_DATE }));
     expect(back).toMatchObject({ conflictsRaised: 0, conflictsPending: 0, review: [] });
   });
