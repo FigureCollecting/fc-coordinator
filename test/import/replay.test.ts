@@ -1009,7 +1009,7 @@ describe('a STALE answer is final: no later replay or revision emits the value o
     expect(await collectionOf(a, cx)).toBe(shelfF);
   });
 
-  it('a revision that drops the refile does not stand a filing answered STALE; a later late filing for the same import is placed by LWW', async () => {
+  it('a revision that drops the refile does not stand a filing answered STALE; a later late filing for the same import meets its write and is STALE too', async () => {
     const a = await SyncCaller.enrol(h);
     const [b, d, g] = [await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a), await SyncCaller.sibling(h, a)];
     const x = nextId();
@@ -1024,9 +1024,11 @@ describe('a STALE answer is final: no later replay or revision emits the value o
     expect(outcomes(await t.push(b, a, [edit(b, `occ/${cx}/collection`, { collection: shelfR }, bSaw, 120_000)]))).toEqual(['STALE']);
     expect(outcomes(await t.push(d, a, [edit(d, `occ/${hand}/head`, { head_id: S }, dSaw), edit(d, `occ/${hand}/status`, { status: 'ordered' }, dSaw)]))).toEqual(['APPLIED', 'APPLIED']);
     expect(await collectionOf(a, cx)).not.toBe(shelfR);
-    expect(outcomes(await t.push(g, a, [edit(g, `occ/${cx}/collection`, { collection: shelfG }, gSaw, 60_000)]))).toEqual(['APPLIED']);
-    expect(await t.reEmitted(a)).toEqual({ answered: 1, found: [] });
-    expect(await collectionOf(a, cx)).toBe(shelfG);
+    const restored = await collectionOf(a, cx);
+    // Stamped a minute ahead, above the revision's write, which g had not seen.
+    expect(outcomes(await t.push(g, a, [edit(g, `occ/${cx}/collection`, { collection: shelfG }, gSaw, 60_000)]))).toEqual(['STALE']);
+    expect(await t.reEmitted(a)).toEqual({ answered: 2, found: [] });
+    expect(await collectionOf(a, cx)).toBe(restored);
   });
 
   it('a late edit LWW answers STALE (a newer value is on the copy) is not kept for later replays', async () => {
