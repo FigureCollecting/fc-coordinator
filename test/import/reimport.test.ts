@@ -840,10 +840,15 @@ describe('WK-14d: the import binds an MFC row to the user\'s own copy of the fig
   }
   const scoreOf = async (c: SyncCaller, head: string) =>
     (JSON.parse((await drain(c)).events.filter((e) => e.facetKey === `uf/${head}/score`).at(-1)!.payload) as { score: number }).score;
-  const handCopy = (c: SyncCaller, occ: string, head: string, basis: string) => [
+  const handCopy = (c: SyncCaller, occ: string, head: string, basis: string, status = 'owned') => [
     edit(c, `occ/${occ}/head`, { head_id: head }, basis),
-    edit(c, `occ/${occ}/status`, { status: 'owned' }, basis),
+    edit(c, `occ/${occ}/status`, { status }, basis),
   ];
+  /** A figure value as Delta reads it back, null when it has none. */
+  const fieldOf = async (c: SyncCaller, head: string, f: string) => {
+    const e = (await drain(c)).events.filter((x) => x.facetKey === `uf/${head}/${f}`).at(-1);
+    return e === undefined || e.op === SyncOp.DELETE ? null : (JSON.parse(e.payload) as Record<string, unknown>)[f];
+  };
 
   /** Ross's WK-16 run: a hand-added copy scored 4, then an import of the same figure at Count `count`, score 9. */
   async function handThenImport(count = 1) {
@@ -886,6 +891,26 @@ describe('WK-14d: the import binds an MFC row to the user\'s own copy of the fig
     expect(await scoreOf(a, headFor(x))).toBe(4);
     expect(await imported(a, [row(x, 'Owned', { score: '9/10' })])).toMatchObject({ facetsWritten: 1, occurrencesAdded: 0, conflictsPending: 0 });
     expect(await copiesOn(a, headFor(x))).toEqual([[hand, 'owned']]);
+  });
+
+  it.each([
+    ['Wished', 'wished', 'wishability', 2, '4', 4],
+    ['Ordered', 'ordered', 'note', 'mine', 'mfc', 'mfc'],
+  ] as const)('a hand copy, then the import of its figure as %s with a disputed figure value: take writes no copy and sets MFC\'s value', async (cell, status, field, mine, mfcCell, mfc) => {
+    const a = await SyncCaller.enrol(h);
+    const x = nextId();
+    const hand = randomUUID();
+    await pushed(a, [...handCopy(a, hand, headFor(x), '', status), edit(a, `uf/${headFor(x)}/${field}`, { [field]: mine }, '')]);
+    const b = await imported(a, [row(x, cell, { [field]: mfcCell })]);
+    expect(b).toMatchObject({ conflictsRaised: 1, occurrencesAdded: 0 });
+    const item = b.review[0]!.items[0]!;
+    expect((JSON.parse(item.payload) as { preview: { take: { copies: unknown[] } } }).preview.take.copies).toEqual([]);
+    const { cursor: seen } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await copiesOn(a, headFor(x))).toEqual([[hand, status]]);
+    expect(await fieldOf(a, headFor(x), field)).toBe(mfc);
+    expect(await imported(a, [row(x, cell, { [field]: mfcCell })])).toMatchObject({ occurrencesAdded: 0, conflictsPending: 0 });
+    expect(await copiesOn(a, headFor(x))).toEqual([[hand, status]]);
   });
 
   it('Count 2 with one hand copy: take and keep each add exactly the one copy the row lacks', async () => {

@@ -265,6 +265,19 @@ describe('takeEffect: the user\'s own copy of the figure counts before any copy 
     expect(two.created).toEqual([]);
   });
 
+  it('binds a hand copy that is wished or ordered as it binds an owned one: take writes only MFC\'s value of the disputed field', () => {
+    const wished = view([...copy(O1, 'wished'), up(`uf/${S}/wishability`, { wishability: 2, ...SHOWN })]);
+    const w = takeEffect(wished, S, [row(1, 'wished', { wishability: 4 })], comps('alike', { wishability: 'conflict' }), occId);
+    expect([...w.statuses]).toEqual([]);
+    expect(w.created).toEqual([]);
+    expect([...w.fields]).toEqual([['wishability', 4]]);
+    const ordered = view([...copy(O1, 'ordered'), up(`uf/${S}/note`, { note: 'mine', ...SHOWN })]);
+    const o = takeEffect(ordered, S, [row(1, 'ordered', { note: 'mfc' })], comps('alike', { note: 'conflict' }), occId);
+    expect([...o.statuses]).toEqual([]);
+    expect(o.created).toEqual([]);
+    expect([...o.fields]).toEqual([['note', 'mfc']]);
+  });
+
   it('binds a live copy whose base is out, the one REALIGN left beyond an earlier Count', () => {
     const e = takeEffect(view(copy(O1, 'owned', 1), [[O1, based('out')]]), S, [row(1)], comps('apply'), occId);
     expect([...e.statuses]).toEqual([]);
