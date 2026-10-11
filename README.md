@@ -151,7 +151,11 @@ records the content type and HTTP version of every stream.
   level. Pages pass through one to one.
 - **GetProductImages** returns nothing while `MEDIA_PUBLIC_BASE_URL` is unset.
   When it is set, a row is kept only when its URL is exactly
-  `<base>/<derivative sha-256>`.
+  `<base>/<derivative sha-256>`, and only when no display restriction
+  (`display_restriction`, contract 0.4.0 DISPLAY RESTRICTIONS) withholds it from
+  the caller; a withheld primary is replaced by the first image shown. Dropped
+  rows do not shorten a page: the coordinator reads on (at most 4 spine pages)
+  and resumes mid-page from its own `c1.` token. Denials are logged at info.
 - **SearchProducts** passes one page through to `SpineRead.SearchProducts`
   (WK-17) with the assertion minted as for GetProducts. The query goes as
   typed; an empty one, or one over 256 code points once NFKC-normalized and
@@ -464,6 +468,7 @@ transaction control in a pending file, `6` out-of-order file.
 | `0004_sync_transactions.sql` | `feed_event.opens_txn` (the first event of each server transaction, backfilled per database transaction) and `held_edit` (Push events answered HELD); the app role appends held edits and never rewrites them |
 | `0005_import.sql` | the MFC import's state: `import_run` and `import_frame` (append-only), the row, copy and field bases, and `import_figure_item` (pending conflicts) |
 | `0006_import_reimport.sql` | `import_copy_base.import_removed` (a copy an import removed), `import_kept_copy` (knowing keeps), `import_export_row` (the latest export's rows, for the discrepancy report), `import_frame.before` (each figure as the import found it) and, append-only, `import_late_edit` (the late edits a Push replayed and APPLIED) and `import_revision` (the revisions that changed a figure) |
+| `0007_display_restriction.sql` | `display_restriction` (rule id, level image/product/source, subject, scope no_display/owner_views_only/no_share/no_mask): data the coordinator reads at the image-list chokepoint; the CHECKs are the writer's rules; the app role may only read it |
 
 ## Shared baseline
 
