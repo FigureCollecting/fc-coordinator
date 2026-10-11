@@ -317,6 +317,13 @@ describe('takeEffect: the user\'s own copy of the figure counts before any copy 
     expect(w.created.map((c) => [c.id, c.kind])).toEqual([['120', 'wished']]);
   });
 
+  it('counts a copy an import removed once, when take restores it: Count 2 restores it and makes one more', () => {
+    const v = view(copy(O1, null, 1), [[O1, based('out', true)]], [row(0)]);
+    const e = takeEffect(v, S, [row(2)], comps('conflict'), occId);
+    expect([...e.statuses]).toEqual([[O1, 'owned']]);
+    expect(e.created.map((c) => [c.kind, c.ordinal])).toEqual([['owned', 2]]);
+  });
+
   it('never binds a hand copy of another kind, nor one now on another figure: those stay and MFC\'s copy is made', () => {
     const wished = takeEffect(view(copy(O1, 'wished')), S, [row(1)], comps('apply'), occId);
     expect([...wished.statuses]).toEqual([]);
