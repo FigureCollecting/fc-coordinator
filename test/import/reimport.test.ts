@@ -955,6 +955,26 @@ describe('WK-14d: the import binds an MFC row to the user\'s own copy of the fig
     expect(await copiesOn(a, headFor(x))).toEqual([[h1, 'owned'], [h2, 'owned']]);
   });
 
+  it('MFC lowers the Count from 3 to 1 beside a hand copy: take removes exactly the two tracked copies over it, the highest occ ids, and never the user\'s own', async () => {
+    const a = await SyncCaller.enrol(h);
+    const x = nextId();
+    const [lo, mid, hi] = [1, 2, 3].map((n) => importOccId(KEY, a.userId, x, n)).sort() as [string, string, string];
+    await imported(a, [row(x, 'Owned', { count: '3' })]);
+    const { cursor } = await drain(a);
+    const hand = randomUUID();
+    await pushed(a, handCopy(a, hand, headFor(x), cursor));
+    const b = await imported(a, [row(x, 'Owned')], DATE_B);
+    expect(b).toMatchObject({ conflictsRaised: 1, occurrencesAdded: 0 });
+    const item = b.review[0]!.items[0]!;
+    expect((JSON.parse(item.payload) as { preview: { take: unknown } }).preview.take).toEqual({ copies: [{ occ: mid, status: 'removed' }, { occ: hi, status: 'removed' }], fields: [] });
+    const { cursor: seen } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    const left = ([[hand, 'owned'], [lo, 'owned']] as [string, string][]).sort(([p], [q]) => Number(p > q) - Number(p < q));
+    expect(await copiesOn(a, headFor(x))).toEqual(left);
+    expect(await imported(a, [row(x, 'Owned')], DATE_B)).toMatchObject({ occurrencesAdded: 0, conflictsPending: 0 });
+    expect(await copiesOn(a, headFor(x))).toEqual(left);
+  });
+
   it('Count 2 with one hand copy: take and keep each add exactly the one copy the row lacks', async () => {
     for (const choice of ['take', 'keep'] as const) {
       const { a, x, hand, item, seen, payload } = await handThenImport(2);
