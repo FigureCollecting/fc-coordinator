@@ -1,7 +1,8 @@
 // ADDR-1: catalog.proto DISPLAY RESTRICTIONS (Ross, 2026-09-26; orchestrator ruling 2026-10-09), run
 // against the contract's own golden cases (golden/display-vectors.json): every case through
-// decideDisplay, every list through displayList. The evaluator is the one place a restriction is
-// decided; GetProductImages and ProductCard.derivative_ids reach it through src/connect/catalog.ts.
+// decideDisplay here; every list through the GetProductImages chokepoint itself, in each list's viewer
+// context (test/connect/catalog-display.test.ts (f)). The evaluator is the one place a restriction is
+// decided; GetProductImages reaches it through src/connect/catalog.ts.
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { describe, expect, it } from 'vitest';
@@ -10,7 +11,6 @@ import {
   DISPLAY_SCOPES,
   VIEWER_CONTEXTS,
   decideDisplay,
-  displayList,
   foldAsciiCase,
   PrimaryPromoter,
   restrictionApplies,
@@ -105,17 +105,6 @@ describe('golden display vectors: every case', () => {
   });
 });
 
-describe('golden display vectors: every list', () => {
-  it.each(v.lists.map((l) => [l.name, l] as const))('%s', (_name, l) => {
-    const got = displayList(
-      l.images.map((i) => ({ facts: facts(i), primary: i.primary, role: i.role })),
-      restrictions(l.restrictions),
-      l.context,
-    );
-    expect(got.map((g) => ({ image_id: g.entry.facts.imageId, role: g.entry.role, primary: g.primary }))).toEqual(l.expect.images);
-  });
-});
-
 describe('beyond the vectors: what the coordinator cannot know fails closed', () => {
   const img: ImageFacts = { imageId: 'img-a', productIds: ['p-head'], sources: null, hasMask: true, hasOwnAlpha: false };
 
@@ -190,13 +179,5 @@ describe('denials are sorted by rule id, then scope', () => {
       { rule: 'r1', scope: 'no_share' },
       { rule: 'r1', scope: 'owner_views_only' },
     ]);
-  });
-});
-
-describe('displayList keys a product by its head, the first product id', () => {
-  it('treats images with no product id as one product', () => {
-    const img = (id: string, primary: boolean) => ({ facts: { imageId: id, productIds: [], sources: [], hasMask: false, hasOwnAlpha: false }, primary });
-    const got = displayList([img('a', true), img('b', false)], [{ rule: 'r1', level: 'image', subject: 'a', scope: 'no_display' }], 'owner');
-    expect(got.map((g) => [g.entry.facts.imageId, g.primary])).toEqual([['b', true]]);
   });
 });

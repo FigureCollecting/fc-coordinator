@@ -220,6 +220,12 @@ export interface CatalogRoutesDeps {
   restrictions?: DisplayRestrictionSource;
   /** Where a display decision is logged; registerConnect points it at the app's logger. */
   displayLog?: DisplayLog;
+  /**
+   * The viewer context every row is decided for. Default owner: every CatalogService call is the
+   * signed-in user in their own views (catalog.proto). A surface that serves these lists to a share
+   * link or to anyone sets its own; the golden lists run through here in each of the three.
+   */
+  viewerContext?: ViewerContext;
 }
 
 /** A denial at info with its rules; an evaluation that withheld nothing at debug. */
@@ -551,7 +557,7 @@ const sourcesOf = (raw: unknown): string[] | null =>
   Array.isArray(raw) && raw.every((x): x is string => typeof x === 'string') ? raw : null;
 
 /** The most GetProducts pages one resolution may read for one batch: a spine that never ends is a fault. */
-const MAX_RESOLVE_PAGES = 10;
+export const MAX_RESOLVE_PAGES = 10;
 
 /**
  * Product ids -> the head each resolves to today, through the spine's ER (GetProducts with head_id
@@ -812,7 +818,7 @@ export function createCatalogRoutes(deps: CatalogRoutesDeps): (router: ConnectRo
   const restrictionSource = deps.restrictions ?? NO_DISPLAY_RESTRICTIONS;
   const displayLog: DisplayLog = deps.displayLog ?? (() => {});
   // Every CatalogService call is the signed-in user in their own views (catalog.proto).
-  const context: ViewerContext = 'owner';
+  const context: ViewerContext = deps.viewerContext ?? 'owner';
 
   const logDecision = (row: ImageRow, image: ProductImage, decision: DisplayDecision): void => {
     const withheld = !decision.image ? 'image' : decision.denials.length > 0 ? 'mask' : null;

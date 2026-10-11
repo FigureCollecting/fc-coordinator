@@ -161,24 +161,3 @@ export class PrimaryPromoter {
     return [...this.owed];
   }
 }
-
-export interface ListEntry {
-  readonly facts: ImageFacts;
-  readonly primary: boolean;
-}
-
-/** One product's list for one viewer: withheld images dropped, a withheld primary replaced. */
-export function displayList<T extends ListEntry>(
-  entries: readonly T[],
-  restrictions: readonly DisplayRestriction[],
-  context: ViewerContext,
-): { entry: T; primary: boolean; decision: DisplayDecision }[] {
-  const promoter = new PrimaryPromoter([]);
-  const out: { entry: T; primary: boolean; decision: DisplayDecision }[] = [];
-  for (const entry of entries) {
-    const decision = decideDisplay(entry.facts, restrictions, context);
-    const primary = promoter.admit(entry.facts.productIds[0] ?? '', entry.primary, decision.image);
-    if (primary !== null) out.push({ entry, primary, decision });
-  }
-  return out;
-}
