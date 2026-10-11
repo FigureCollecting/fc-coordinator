@@ -121,7 +121,7 @@ describe('takeEffect', () => {
   });
 
   it('converts a tracked copy first: MFC\'s arrival made true on the copy it tracks', () => {
-    const v = view([...copy(O1, 'ordered', 1), ...copy(O2, 'owned')], [[O1, based('ordered')]], [row(1, 'ordered')]);
+    const v = view([...copy(O1, 'ordered', 1), ...copy(O2, 'ordered')], [[O1, based('ordered')]], [row(1, 'ordered')]);
     const e = takeEffect(v, S, [row(1)], { counts: 'conflict', score: 'nochange', note: 'nochange', wishability: 'nochange', details: {} }, occId);
     expect([...e.statuses]).toEqual([[O1, 'owned']]);
     expect(e.created).toEqual([]);
@@ -286,6 +286,29 @@ describe('takeEffect: the user\'s own copy of the figure counts before any copy 
 
   it('binds a live hand copy before it restores a tracked copy the app sold', () => {
     const e = takeEffect(view([...copy(O1, 'former', 1), ...copy(O2, 'owned')], [[O1, based('owned')]], [row(1)]), S, [row(1)], comps('conflict'), occId);
+    expect([...e.statuses]).toEqual([]);
+    expect(e.created).toEqual([]);
+  });
+
+  it('converts no tracked copy into a kind the user\'s own copies already fill: MFC\'s arrival beside a hand copy removes the tracked one', () => {
+    for (const was of ['ordered', 'wished'] as const) {
+      const v = view([...copy(O1, was, 1), ...copy(O2, 'owned')], [[O1, based(was)]], [row(1, was)]);
+      const e = takeEffect(v, S, [row(1)], comps('conflict'), occId);
+      expect([...e.statuses], was).toEqual([[O1, null]]);
+      expect(e.created, was).toEqual([]);
+    }
+  });
+
+  it('still converts a tracked copy for the part of MFC\'s Count the user\'s own copies leave unfilled', () => {
+    const v = view([...copy(O1, 'ordered', 1), ...copy(O2, 'owned')], [[O1, based('ordered')]], [row(1, 'ordered')]);
+    const e = takeEffect(v, S, [row(2)], comps('conflict'), occId);
+    expect([...e.statuses]).toEqual([[O1, 'owned']]);
+    expect(e.created).toEqual([]);
+  });
+
+  it('removes no tracked copy for the user\'s own: beside the copy MFC tracks at its Count, a hand copy of the kind leaves both', () => {
+    const v = view([...copy(O1, 'owned', 1), ...copy(O2, 'owned')], [[O1, based('owned')]], [row(1)]);
+    const e = takeEffect(v, S, [row(1)], comps('matched+app-only', { score: 'conflict' }), occId);
     expect([...e.statuses]).toEqual([]);
     expect(e.created).toEqual([]);
   });
