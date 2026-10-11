@@ -42,6 +42,7 @@ const figureSchema = schema('imp-figure');
 
 const DATE_A = '2026-09-09';
 const DATE_B = '2026-09-20';
+const DATE_C = '2026-09-25';
 
 let db: SyncDatabase;
 let spine: FakeSpineRead;
@@ -969,5 +970,44 @@ describe('WK-14d: the import binds an MFC row to the user\'s own copy of the fig
     expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: b.review[0]!.items[0]!.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
     expect((await copiesOn(a, headFor(x))).map(([occ]) => occ).sort()).toEqual([c1, hand].sort());
     expect(await scoreOf(a, headFor(x))).toBe(7);
+  });
+
+  it('the import removes its copy, the user brings it back by hand, MFC then lists the row again with a disputed score: take binds that copy and adds none', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, y] = [nextId(), nextId()];
+    const c1 = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned', { score: '7/10' }), row(y, 'Owned')]);
+    // MFC lacks x and the app changed nothing: the import removes c1.
+    await imported(a, [row(y, 'Owned')], DATE_B);
+    expect(await copiesOn(a, headFor(x))).toEqual([]);
+    const { cursor } = await drain(a);
+    await pushed(a, [edit(a, `occ/${c1}/status`, { status: 'owned' }, cursor), edit(a, `uf/${headFor(x)}/score`, { score: 4 }, cursor)]);
+    expect(await copiesOn(a, headFor(x))).toEqual([[c1, 'owned']]);
+    const b = await imported(a, [row(x, 'Owned', { score: '9/10' }), row(y, 'Owned')], DATE_C);
+    expect(b).toMatchObject({ conflictsRaised: 1, occurrencesAdded: 0 });
+    const { cursor: seen } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: b.review[0]!.items[0]!.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await copiesOn(a, headFor(x))).toEqual([[c1, 'owned']]);
+    expect(await scoreOf(a, headFor(x))).toBe(9);
+  });
+
+  it('the user undoes the import\'s removal, MFC then lists the row again with a disputed score: take binds the copy the undo put back and adds none', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, y] = [nextId(), nextId()];
+    const c1 = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned', { score: '7/10' }), row(y, 'Owned')]);
+    const b = await imported(a, [row(y, 'Owned')], DATE_B);
+    const change = b.applied.find((i) => i.headId === headFor(x))!;
+    const { cursor: seen } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'change', rev: change.rev, choice: 'undo' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await copiesOn(a, headFor(x))).toEqual([[c1, 'owned']]);
+    const { cursor } = await drain(a);
+    await pushed(a, [edit(a, `uf/${headFor(x)}/score`, { score: 4 }, cursor)]);
+    const c = await imported(a, [row(x, 'Owned', { score: '9/10' }), row(y, 'Owned')], DATE_C);
+    expect(c).toMatchObject({ conflictsRaised: 1, occurrencesAdded: 0 });
+    const { cursor: seen2 } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: c.review[0]!.items[0]!.rev, choice: 'take' }, seen2)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await copiesOn(a, headFor(x))).toEqual([[c1, 'owned']]);
+    expect(await scoreOf(a, headFor(x))).toBe(9);
   });
 });
