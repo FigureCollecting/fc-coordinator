@@ -284,6 +284,12 @@ describe('takeEffect: the user\'s own copy of the figure counts before any copy 
     expect(e.created).toEqual([]);
   });
 
+  it('binds a copy an import removed that the user brought back by hand: it is the user\'s own, and take neither restores it nor makes a second copy', () => {
+    const e = takeEffect(view(copy(O1, 'owned', 1), [[O1, based('out', true)]], [row(0)]), S, [row(1)], comps('conflict', { score: 'conflict' }), occId);
+    expect([...e.statuses]).toEqual([]);
+    expect(e.created).toEqual([]);
+  });
+
   it('binds a live hand copy before it restores a tracked copy the app sold', () => {
     const e = takeEffect(view([...copy(O1, 'former', 1), ...copy(O2, 'owned')], [[O1, based('owned')]], [row(1)]), S, [row(1)], comps('conflict'), occId);
     expect([...e.statuses]).toEqual([]);
@@ -302,6 +308,13 @@ describe('takeEffect: the user\'s own copy of the figure counts before any copy 
   it('still converts a tracked copy for the part of MFC\'s Count the user\'s own copies leave unfilled', () => {
     const v = view([...copy(O1, 'ordered', 1), ...copy(O2, 'owned')], [[O1, based('ordered')]], [row(1, 'ordered')]);
     const e = takeEffect(v, S, [row(2)], comps('conflict'), occId);
+    expect([...e.statuses]).toEqual([[O1, 'owned']]);
+    expect(e.created).toEqual([]);
+  });
+
+  it('converts only as many tracked copies as the user\'s own leave MFC\'s Count short, the lowest first, and removes none: one hand owned, MFC owned 2 and ordered 1, two tracked ordered', () => {
+    const v = view([...copy(O1, 'ordered', 1), ...copy(O2, 'ordered', 2), ...copy(O3, 'owned')], [[O1, based('ordered')], [O2, based('ordered')]], [row(2, 'ordered')]);
+    const e = takeEffect(v, S, [row(1, 'ordered'), row(2, 'owned', {}, '120')], comps('conflict'), occId);
     expect([...e.statuses]).toEqual([[O1, 'owned']]);
     expect(e.created).toEqual([]);
   });
@@ -331,6 +344,12 @@ describe('takeEffect: the user\'s own copy of the figure counts before any copy 
     const moved = takeEffect(view(copy(O1, 'owned', undefined, elsewhere), [[O1, based('out')]]), S, [row(1)], comps('apply'), occId);
     expect([...moved.statuses]).toEqual([]);
     expect(moved.created.map((c) => c.kind)).toEqual(['owned']);
+  });
+
+  it('binds a copy the user moved onto the figure from another: a base on the other figure leaves it the user\'s own here, and take makes no copy', () => {
+    const e = takeEffect(view(copy(O1, 'owned'), [[O1, { head: elsewhere, kind: 'owned', removed: false }]]), S, [row(1)], comps('alike', { score: 'conflict' }), occId);
+    expect([...e.statuses]).toEqual([]);
+    expect(e.created).toEqual([]);
   });
 });
 
