@@ -6,7 +6,11 @@
 //       to fill one, and resumes mid-page from its own token, within a bounded number of spine reads;
 //   (d) a denial is logged with its rules at info; an evaluation that withholds nothing at debug;
 //   (e) the coordinator fails closed: no restriction set, no image (UNAVAILABLE); unknown sources
-//       count as every source.
+//       count as every source;
+//   (f) the contract's golden lists (golden/display-vectors.json) read through THIS chokepoint, in
+//       each list's viewer context, at page sizes 0 (the default), 1 and 2.
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import type { AddressInfo } from 'node:net';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Code, ConnectError, createClient, type Client } from '@connectrpc/connect';
@@ -17,7 +21,7 @@ import { CatalogService } from '@figurecollecting/fc-api-contract';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../../src/app.js';
 import { MAX_SPINE_IMAGE_READS } from '../../src/connect/catalog.js';
-import type { DisplayRestriction } from '../../src/display/restrictions.js';
+import type { DisplayRestriction, ViewerContext } from '../../src/display/restrictions.js';
 import type { DisplayRestrictionSource } from '../../src/display/source.js';
 import { SpineReadClient } from '../../src/spine/spineReadClient.js';
 import { resetEntitlementGrantsForTest, resetEntitlementSigningForTest } from '../../src/entitlements/index.js';
@@ -80,7 +84,7 @@ afterAll(async () => {
 });
 
 async function start(
-  options: Omit<FakeSpineReadOptions, 'keys'> & { restrictions?: DisplayRestrictionSource; mediaBaseUrl?: string | null } = {},
+  options: Omit<FakeSpineReadOptions, 'keys'> & { restrictions?: DisplayRestrictionSource; mediaBaseUrl?: string | null; viewerContext?: ViewerContext } = {},
 ): Promise<Harness> {
   const kp = generateTestSigningKey(KID);
   process.env['ENTITLEMENT_SIGNING_KEY_PEM'] = kp.privatePem;
@@ -89,7 +93,7 @@ async function start(
   process.env['OPENFGA_GRPC_URL'] = fga.baseUrl;
   process.env['OPENFGA_STORE_ID'] = '01KXA5NRJYR0GYKX4NWQ2ANDZS';
   process.env['OPENFGA_API_TOKEN'] = 'test-preshared-key-never-logged';
-  const { restrictions, mediaBaseUrl, ...spineOptions } = options;
+  const { restrictions, mediaBaseUrl, viewerContext, ...spineOptions } = options;
   const spine = await startFakeSpineRead({ keys: kp.keys, ...spineOptions });
   const spineRead = new SpineReadClient(spine.baseUrl);
   const lines: Record<string, unknown>[] = [];
@@ -105,6 +109,7 @@ async function start(
         mediaBaseUrl: mediaBaseUrl === undefined ? MEDIA : mediaBaseUrl,
         now: () => NOW,
         ...(restrictions !== undefined ? { restrictions } : {}),
+        ...(viewerContext !== undefined ? { viewerContext } : {}),
       },
     },
   });
@@ -384,5 +389,56 @@ describe('(e) no restriction set, no image', () => {
     harness = await start({ restrictions, mediaBaseUrl: null });
     await harness.catalog.getProductImages({ headIds: [H1] });
     expect(restrictions.calls).toBe(0);
+  });
+});
+
+interface GoldenImage {
+  image_id: string;
+  product_ids: string[];
+  sources: string[];
+  role: string;
+  primary: boolean;
+}
+interface GoldenList {
+  name: string;
+  images: GoldenImage[];
+  restrictions: DisplayRestriction[];
+  context: ViewerContext;
+  expect: { images: { image_id: string; role: string; primary: boolean }[] };
+}
+const golden = JSON.parse(
+  readFileSync(createRequire(import.meta.url).resolve('@figurecollecting/fc-api-contract/golden/display-vectors.json'), 'utf8'),
+) as { lists: GoldenList[] };
+
+describe('(f) the golden lists, through GetProductImages', () => {
+  it('reads all 9 of them', () => {
+    expect(golden.lists).toHaveLength(9);
+  });
+
+  it.each(golden.lists.map((l) => [l.name, l] as const))('%s', async (_name, l) => {
+    // The vectors name images and the head; the spine carries content addresses and product ids.
+    const shaOf = new Map(l.images.map((i, n) => [i.image_id, sha(String.fromCharCode(0x61 + n))]));
+    const nameOf = new Map([...shaOf].map(([name, hex]) => [hex, name]));
+    const id = (x: string): string => shaOf.get(x) ?? (x === 'p-head' ? H1 : x);
+    const aliases = [...new Set(l.images.flatMap((i) => i.product_ids).filter((p) => p !== 'p-head'))];
+    harness = await start({
+      viewerContext: l.context,
+      restrictions: sourceOf(l.restrictions.map((x) => r(x.rule, x.level, id(x.subject), x.scope)), { [H1]: aliases }),
+      respondImages: () => page([{ productId: H1, images: l.images.map((i) => row('a', { derivativeSha256: id(i.image_id), url: `${MEDIA}/${id(i.image_id)}`, role: i.role, primary: i.primary, sources: i.sources })) }]),
+    });
+    for (const pageSize of [0, 1, 2]) {
+      const got: { image_id: string; role: string; primary: boolean }[] = [];
+      let pageToken = '';
+      for (let calls = 0; calls < 10; calls += 1) {
+        const res = await harness.catalog.getProductImages({ headIds: [H1], pageSize, pageToken });
+        for (const p of res.products) {
+          expect(p.headId).toBe(H1);
+          for (const i of p.images) got.push({ image_id: nameOf.get(i.derivativeId) ?? i.derivativeId, role: i.role, primary: i.primary });
+        }
+        pageToken = res.nextPageToken;
+        if (pageToken === '') break;
+      }
+      expect({ pageSize, images: got }).toEqual({ pageSize, images: l.expect.images });
+    }
   });
 });

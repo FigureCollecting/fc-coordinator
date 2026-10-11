@@ -140,6 +140,17 @@ describe('ASCII case folding', () => {
   it('folds A-Z and nothing else', () => {
     expect(foldAsciiCase('ABCxyz-0_ÉK')).toBe('abcxyz-0_ÉK');
   });
+
+  it('matches a subject against ids the spine wrote in upper case: sources, product ids, the image id', () => {
+    const img: ImageFacts = { imageId: 'ABC', productIds: ['P-HEAD', 'P-MERGED'], sources: ['AmiAmi', 'HLJ'], hasMask: false, hasOwnAlpha: false };
+    expect(restrictionApplies({ rule: 'r1', level: 'source', subject: 'hlj', scope: 'no_display' }, img)).toBe(true);
+    expect(restrictionApplies({ rule: 'r1', level: 'product', subject: 'p-merged', scope: 'no_display' }, img)).toBe(true);
+    expect(restrictionApplies({ rule: 'r1', level: 'image', subject: 'abc', scope: 'no_display' }, img)).toBe(true);
+    expect(restrictionApplies({ rule: 'r1', level: 'Product', subject: 'p-head', scope: 'no_display' }, { ...img, sources: [] })).toBe(true);
+    expect(decideDisplay(img, [{ rule: 'r1', level: 'source', subject: 'hlj', scope: 'no_display' }], 'owner')).toMatchObject({ image: false });
+    // Only ASCII folds: a Kelvin sign is not a k.
+    expect(restrictionApplies({ rule: 'r1', level: 'source', subject: 'k', scope: 'no_display' }, { ...img, sources: ['\u212a'] })).toBe(false);
+  });
 });
 
 describe('PrimaryPromoter across pages', () => {

@@ -1,7 +1,7 @@
 // ADDR-1: a product restriction on a merged id covers the survivor (catalog.proto DISPLAY RESTRICTIONS).
 // The coordinator asks the spine which head each product subject names today, through GetProducts.
 import { describe, expect, it, vi } from 'vitest';
-import { MAX_CATALOG_REFS, spineHeadResolver, type SpineCatalog } from '../../src/connect/catalog.js';
+import { MAX_CATALOG_REFS, MAX_RESOLVE_PAGES, spineHeadResolver, type SpineCatalog } from '../../src/connect/catalog.js';
 
 const HEAD = '11111111-1111-4111-8111-111111111111';
 const MERGED = '22222222-2222-4222-8222-222222222222';
@@ -58,8 +58,21 @@ describe('spineHeadResolver', () => {
     await expect(spineHeadResolver(bad)([HEAD])).rejects.toThrow(/could not be read/);
   });
 
-  it('refuses to follow the spine past a bounded number of pages', async () => {
-    const endless = spineOf(vi.fn(async () => ({ productsJson: JSON.stringify({ products: [] }), nextPageToken: 'again' })));
-    await expect(spineHeadResolver(endless)([HEAD])).rejects.toThrow(/pages/);
+  it('refuses to follow the spine past MAX_RESOLVE_PAGES pages of one batch, having read exactly that many', async () => {
+    const getProducts = vi.fn(async () => ({ productsJson: JSON.stringify({ products: [] }), nextPageToken: 'again' }));
+    await expect(spineHeadResolver(spineOf(getProducts))([HEAD])).rejects.toThrow(/pages/);
+    expect(getProducts).toHaveBeenCalledTimes(MAX_RESOLVE_PAGES);
+  });
+
+  it('reads a spine that ends on the last page it may read', async () => {
+    let read = 0;
+    const getProducts = vi.fn(async () => {
+      read += 1;
+      const last = read === MAX_RESOLVE_PAGES;
+      return { productsJson: JSON.stringify({ products: last ? [record(HEAD, [MERGED])] : [] }), nextPageToken: last ? '' : `p${read}` };
+    });
+    const heads = await spineHeadResolver(spineOf(getProducts), () => NOW)([MERGED]);
+    expect(getProducts).toHaveBeenCalledTimes(MAX_RESOLVE_PAGES);
+    expect(heads.get(MERGED)).toBe(HEAD);
   });
 });

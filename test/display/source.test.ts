@@ -2,6 +2,7 @@
 // display_restriction table (migration 0007), read through a short cache, with every product subject
 // resolved to the head it names today so a restriction on a merged id covers the survivor's images.
 import { describe, expect, it, vi } from 'vitest';
+import { restrictionApplies } from '../../src/display/restrictions.js';
 import { createDbDisplayRestrictionSource, NO_DISPLAY_RESTRICTIONS, type HeadResolver } from '../../src/display/source.js';
 
 const HEAD = '11111111-1111-4111-8111-111111111111';
@@ -99,6 +100,30 @@ describe('createDbDisplayRestrictionSource', () => {
     const resolveHeads = vi.fn(async () => { throw new Error('spine down'); });
     const db = dbOf([{ rule_id: 'r1', level: 'product', subject: HEAD, scope: 'no_display' }]);
     await expect(createDbDisplayRestrictionSource({ db, resolveHeads }).current()).rejects.toThrow('spine down');
+  });
+});
+
+describe('ids are matched without regard to ASCII case, on every side', () => {
+  // Spine ids carry hex letters; ids of digits only would read the same in either case and prove nothing.
+  const HEAD_AF = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const MERGED_AF = 'ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb';
+
+  it('resolves a product subject written in upper case, so a restriction on a merged id still covers the survivor', async () => {
+    const resolveHeads = resolverOf({ [MERGED_AF]: HEAD_AF });
+    const db = dbOf([{ rule_id: 'r1', level: 'product', subject: MERGED_AF.toUpperCase(), scope: 'no_display' }]);
+    const set = await createDbDisplayRestrictionSource({ db, resolveHeads }).current();
+    expect(resolveHeads.mock.calls[0]![0]).toEqual([MERGED_AF]);
+    expect(set.productIdsFor(HEAD_AF)).toEqual([HEAD_AF, MERGED_AF]);
+    // The evaluator then matches the rule's own (upper-case) subject against the folded alias.
+    expect(restrictionApplies(set.restrictions[0]!, { imageId: 'c'.repeat(64), productIds: set.productIdsFor(HEAD_AF), sources: [], hasMask: false, hasOwnAlpha: false })).toBe(true);
+  });
+
+  it('finds the aliases of a head asked for, or resolved to, in upper case', async () => {
+    const resolveHeads = resolverOf({ [MERGED_AF]: HEAD_AF.toUpperCase() });
+    const db = dbOf([{ rule_id: 'r1', level: 'product', subject: MERGED_AF, scope: 'no_display' }]);
+    const set = await createDbDisplayRestrictionSource({ db, resolveHeads }).current();
+    expect(set.productIdsFor(HEAD_AF)).toEqual([HEAD_AF, MERGED_AF]);
+    expect(set.productIdsFor(HEAD_AF.toUpperCase())).toEqual([HEAD_AF.toUpperCase(), MERGED_AF]);
   });
 });
 
