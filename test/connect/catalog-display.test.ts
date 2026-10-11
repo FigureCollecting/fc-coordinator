@@ -259,6 +259,25 @@ describe('(b) a withheld primary is replaced by the first image shown', () => {
   });
 });
 
+describe('(b2) the debt survives a spine page boundary', () => {
+  it('owes the primary across the spine\'s own token: the next spine page\'s first image of that product is the primary', async () => {
+    const pages: Record<string, ReturnType<typeof page>> = {
+      '': page([{ productId: H1, images: [row('a', { primary: true })] }, { productId: H2, images: [row('c', { primary: true })] }], 's2'),
+      s2: page([{ productId: H1, images: [row('b')] }], ''),
+    };
+    harness = await start({
+      restrictions: sourceOf([r('r1', 'image', sha('a'), 'no_display')]),
+      respondImages: (call) => pages[call.request.pageToken]!,
+    });
+    const first = await harness.catalog.getProductImages({ headIds: [H1, H2], pageSize: 1 });
+    expect(shown(first)).toEqual([{ head: H2, images: ['c*:gallery'] }]);
+    expect(first.nextPageToken).toMatch(/^c1\./);
+    const second = await harness.catalog.getProductImages({ headIds: [H1, H2], pageSize: 1, pageToken: first.nextPageToken });
+    expect(shown(second)).toEqual([{ head: H1, images: ['b*:gallery'] }]);
+    expect(harness.spine.imageCalls.map((c) => c.request.pageToken)).toEqual(['', 's2']);
+  });
+});
+
 describe('(c) withheld rows are dropped before the page is cut', () => {
   it('reads the next spine page to fill a page, and resumes mid-page from its own token', async () => {
     const pages: Record<string, ReturnType<typeof page>> = {
