@@ -265,6 +265,16 @@ describe('takeEffect: the user\'s own copy of the figure counts before any copy 
     expect(two.created).toEqual([]);
   });
 
+  it('binds every one of the user\'s own copies of the kind, not one per kind: two hand copies beside Count 2 make no copy, and beside Count 3 make one', () => {
+    const v = view([...copy(O1, 'owned'), ...copy(O2, 'owned')]);
+    const e = takeEffect(v, S, [row(2)], comps('conflict', { score: 'conflict' }), occId);
+    expect([...e.statuses]).toEqual([]);
+    expect(e.created).toEqual([]);
+    const three = takeEffect(v, S, [row(3)], comps('conflict'), occId);
+    expect([...three.statuses]).toEqual([]);
+    expect(three.created.map((c) => [c.kind, c.ordinal])).toEqual([['owned', 1]]);
+  });
+
   it('binds a hand copy that is wished or ordered as it binds an owned one: take writes only MFC\'s value of the disputed field', () => {
     const wished = view([...copy(O1, 'wished'), up(`uf/${S}/wishability`, { wishability: 2, ...SHOWN })]);
     const w = takeEffect(wished, S, [row(1, 'wished', { wishability: 4 })], comps('alike', { wishability: 'conflict' }), occId);
@@ -303,6 +313,13 @@ describe('takeEffect: the user\'s own copy of the figure counts before any copy 
       expect([...e.statuses], was).toEqual([[O1, null]]);
       expect(e.created, was).toEqual([]);
     }
+  });
+
+  it('converts no tracked copy where two of the user\'s own fill MFC\'s Count 2: beside two hand owned copies the tracked ordered one is removed and none is made', () => {
+    const v = view([...copy(O1, 'ordered', 1), ...copy(O2, 'owned'), ...copy(O3, 'owned')], [[O1, based('ordered')]], [row(1, 'ordered')]);
+    const e = takeEffect(v, S, [row(2)], comps('conflict'), occId);
+    expect([...e.statuses]).toEqual([[O1, null]]);
+    expect(e.created).toEqual([]);
   });
 
   it('still converts a tracked copy for the part of MFC\'s Count the user\'s own copies leave unfilled', () => {
