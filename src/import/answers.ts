@@ -6,11 +6,13 @@
 // the answer's own time) and the item's tombstone.
 //
 //   figure item  keep: what the rev found MFC alone changed is applied where it is still MFC's
-//                alone; take: MFC's side made true on the copies MFC tracks; per_copy: keep's part,
-//                then the listed statuses and the side named per disputed field. Then the bases
-//                REALIGN to MFC's side. A keep or per_copy on a rev that found the counts disputed
-//                or changed by MFC alone is a KNOWING KEEP of each copy MATERIALIZE would remove
-//                for MFC's unmatched transitions to out that the answer leaves live.
+//                alone; take: MFC's side made true on the copies MFC tracks, the user's own live
+//                copies left as they are but counted toward MFC's Count of their kind; per_copy:
+//                keep's part, then the listed statuses and the side named per disputed field.
+//                Then the bases REALIGN to MFC's side. A keep or per_copy on a rev that found the
+//                counts disputed or changed by MFC alone is a KNOWING KEEP of each copy
+//                MATERIALIZE would remove for MFC's unmatched transitions to out that the answer
+//                leaves live.
 //   change entry undo: each facet the import wrote back to its value before, while every write
 //                still holds what the import wrote (else STALE); a copy it removed that the undo
 //                restores is a knowing keep. Moves no base. dismiss: the entry goes.

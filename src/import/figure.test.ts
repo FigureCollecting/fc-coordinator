@@ -311,6 +311,10 @@ describe('takeEffect: the user\'s own copy of the figure counts before any copy 
     const e = takeEffect(v, S, [row(1)], comps('matched+app-only', { score: 'conflict' }), occId);
     expect([...e.statuses]).toEqual([]);
     expect(e.created).toEqual([]);
+    // Nor converts it: MFC's new wished row is a new copy, not the tracked owned one moved.
+    const w = takeEffect(v, S, [row(1), row(1, 'wished', {}, '120')], comps('conflict'), occId);
+    expect([...w.statuses]).toEqual([]);
+    expect(w.created.map((c) => [c.id, c.kind])).toEqual([['120', 'wished']]);
   });
 
   it('never binds a hand copy of another kind, nor one now on another figure: those stay and MFC\'s copy is made', () => {
