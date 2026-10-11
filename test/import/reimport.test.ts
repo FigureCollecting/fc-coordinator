@@ -42,6 +42,7 @@ const figureSchema = schema('imp-figure');
 
 const DATE_A = '2026-09-09';
 const DATE_B = '2026-09-20';
+const DATE_C = '2026-09-25';
 
 let db: SyncDatabase;
 let spine: FakeSpineRead;
@@ -824,3 +825,258 @@ describe('what the import refuses', () => {
 });
 
 void ({} as ImportMfcExportResponse);
+
+describe('WK-14d: the import binds an MFC row to the user\'s own copy of the figure, never a duplicate', () => {
+  /** The live copies on `head`, as [occ, status], in occ-id order, read back through Delta. */
+  async function copiesOn(c: SyncCaller, head: string): Promise<[string, string][]> {
+    const state = new Map((await drain(c)).events.map((e) => [e.facetKey, e]));
+    const occs = [...state.values()]
+      .filter((e) => /^occ\/[^/]+\/head$/.test(e.facetKey) && e.op === SyncOp.UPSERT && (JSON.parse(e.payload) as { head_id: string }).head_id === head)
+      .map((e) => e.facetKey.split('/')[1]!);
+    return occs
+      .map((occ) => [occ, state.get(`occ/${occ}/status`)] as const)
+      .filter(([, s]) => s !== undefined && s.op === SyncOp.UPSERT)
+      .map(([occ, s]) => [occ, (JSON.parse(s!.payload) as { status: string }).status] as [string, string])
+      .sort(([p], [q]) => Number(p > q) - Number(p < q));
+  }
+  const scoreOf = async (c: SyncCaller, head: string) =>
+    (JSON.parse((await drain(c)).events.filter((e) => e.facetKey === `uf/${head}/score`).at(-1)!.payload) as { score: number }).score;
+  const handCopy = (c: SyncCaller, occ: string, head: string, basis: string, status = 'owned') => [
+    edit(c, `occ/${occ}/head`, { head_id: head }, basis),
+    edit(c, `occ/${occ}/status`, { status }, basis),
+  ];
+  /** A figure value as Delta reads it back, null when it has none. */
+  const fieldOf = async (c: SyncCaller, head: string, f: string) => {
+    const e = (await drain(c)).events.filter((x) => x.facetKey === `uf/${head}/${f}`).at(-1);
+    return e === undefined || e.op === SyncOp.DELETE ? null : (JSON.parse(e.payload) as Record<string, unknown>)[f];
+  };
+
+  /** Ross's WK-16 run: a hand-added copy scored 4, then an import of the same figure at Count `count`, score 9. */
+  async function handThenImport(count = 1) {
+    const a = await SyncCaller.enrol(h);
+    const x = nextId();
+    const hand = randomUUID();
+    await pushed(a, [...handCopy(a, hand, headFor(x), ''), edit(a, `uf/${headFor(x)}/score`, { score: 4 }, '')]);
+    const b = await imported(a, [row(x, 'Owned', { count: String(count), score: '9/10' })]);
+    expect(b).toMatchObject({ conflictsRaised: 1, occurrencesAdded: 0 });
+    const item = b.review[0]!.items[0]!;
+    const { cursor: seen } = await drain(a);
+    return { a, x, hand, item, seen, payload: JSON.parse(item.payload) as Record<string, unknown> };
+  }
+
+  it('hand copy, then the import: the item names that copy, take previews and writes no new copy, and sets the score on the figure', async () => {
+    const { a, x, hand, item, seen, payload } = await handThenImport();
+    expect(figureSchema(payload)).toBe(true);
+    expect(payload).toMatchObject({ counts: { owned: { base: 0, app: 1, mfc: 1 } }, copies: [{ occ: hand, status: 'owned' }] });
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await copiesOn(a, headFor(x))).toEqual([[hand, 'owned']]);
+    const { events } = await drain(a, seen);
+    expect(events.filter((e) => e.facetKey.startsWith('occ/'))).toEqual([]);
+    // What the item previewed is what the answer wrote.
+    expect(payload['preview']).toEqual({
+      keep: { copies: [], fields: [] },
+      take: { copies: [], fields: [{ head_id: headFor(x), field: 'score', score: 9 }] },
+    });
+    expect(await scoreOf(a, headFor(x))).toBe(9);
+    // The answer bound the row to the hand copy: the same export again finds nothing to do.
+    const { rows } = await db.admin.query<{ occ_id: string; kind: string }>('SELECT occ_id, kind FROM import_copy_base WHERE user_id = $1', [a.userId]);
+    expect(rows).toEqual([{ occ_id: hand, kind: 'owned' }]);
+    expect(await imported(a, [row(x, 'Owned', { score: '9/10' })])).toMatchObject({ facetsWritten: 1, occurrencesAdded: 0, conflictsPending: 0 });
+    expect(await copiesOn(a, headFor(x))).toEqual([[hand, 'owned']]);
+  });
+
+  it('hand copy, then the import: keep leaves the one copy and the app\'s score, and binds the row to it', async () => {
+    const { a, x, hand, item, seen } = await handThenImport();
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'keep' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await copiesOn(a, headFor(x))).toEqual([[hand, 'owned']]);
+    expect(await scoreOf(a, headFor(x))).toBe(4);
+    expect(await imported(a, [row(x, 'Owned', { score: '9/10' })])).toMatchObject({ facetsWritten: 1, occurrencesAdded: 0, conflictsPending: 0 });
+    expect(await copiesOn(a, headFor(x))).toEqual([[hand, 'owned']]);
+  });
+
+  it.each([
+    ['Wished', 'wished', 'wishability', 2, '4', 4],
+    ['Ordered', 'ordered', 'note', 'mine', 'mfc', 'mfc'],
+  ] as const)('a hand copy, then the import of its figure as %s with a disputed figure value: take writes no copy and sets MFC\'s value', async (cell, status, field, mine, mfcCell, mfc) => {
+    const a = await SyncCaller.enrol(h);
+    const x = nextId();
+    const hand = randomUUID();
+    await pushed(a, [...handCopy(a, hand, headFor(x), '', status), edit(a, `uf/${headFor(x)}/${field}`, { [field]: mine }, '')]);
+    const b = await imported(a, [row(x, cell, { [field]: mfcCell })]);
+    expect(b).toMatchObject({ conflictsRaised: 1, occurrencesAdded: 0 });
+    const item = b.review[0]!.items[0]!;
+    expect((JSON.parse(item.payload) as { preview: { take: { copies: unknown[] } } }).preview.take.copies).toEqual([]);
+    const { cursor: seen } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await copiesOn(a, headFor(x))).toEqual([[hand, status]]);
+    expect(await fieldOf(a, headFor(x), field)).toBe(mfc);
+    expect(await imported(a, [row(x, cell, { [field]: mfcCell })])).toMatchObject({ occurrencesAdded: 0, conflictsPending: 0 });
+    expect(await copiesOn(a, headFor(x))).toEqual([[hand, status]]);
+  });
+
+  it.each([
+    ['Ordered', 'ordered'],
+    ['Wished', 'wished'],
+  ] as const)('an import tracks a copy as %s, the user adds an owned one by hand, MFC then says Owned: take removes the tracked copy, never a second owned one', async (cell, was) => {
+    const a = await SyncCaller.enrol(h);
+    const x = nextId();
+    const c1 = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, cell)]);
+    const { cursor } = await drain(a);
+    const hand = randomUUID();
+    await pushed(a, handCopy(a, hand, headFor(x), cursor));
+    const b = await imported(a, [row(x, 'Owned')], DATE_B);
+    expect(b).toMatchObject({ conflictsRaised: 1, occurrencesAdded: 0 });
+    const item = b.review[0]!.items[0]!;
+    expect((JSON.parse(item.payload) as { preview: { take: unknown } }).preview.take).toEqual({ copies: [{ occ: c1, status: 'removed' }], fields: [] });
+    const { cursor: seen } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await copiesOn(a, headFor(x)), was).toEqual([[hand, 'owned']]);
+    expect(await imported(a, [row(x, 'Owned')], DATE_B)).toMatchObject({ occurrencesAdded: 0, conflictsPending: 0 });
+    expect(await copiesOn(a, headFor(x)), was).toEqual([[hand, 'owned']]);
+  });
+
+  it('an import tracks a copy as Ordered, the user adds two owned by hand, MFC then says Owned Count 2: take removes the tracked copy, never a third owned one', async () => {
+    const a = await SyncCaller.enrol(h);
+    const x = nextId();
+    const c1 = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Ordered')]);
+    const { cursor } = await drain(a);
+    const [h1, h2] = [randomUUID(), randomUUID()].sort() as [string, string];
+    await pushed(a, [...handCopy(a, h1, headFor(x), cursor), ...handCopy(a, h2, headFor(x), cursor)]);
+    const b = await imported(a, [row(x, 'Owned', { count: '2' })], DATE_B);
+    expect(b).toMatchObject({ conflictsRaised: 1, occurrencesAdded: 0 });
+    const item = b.review[0]!.items[0]!;
+    expect((JSON.parse(item.payload) as { preview: { take: unknown } }).preview.take).toEqual({ copies: [{ occ: c1, status: 'removed' }], fields: [] });
+    const { cursor: seen } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await copiesOn(a, headFor(x))).toEqual([[h1, 'owned'], [h2, 'owned']]);
+    expect(await imported(a, [row(x, 'Owned', { count: '2' })], DATE_B)).toMatchObject({ occurrencesAdded: 0, conflictsPending: 0 });
+    expect(await copiesOn(a, headFor(x))).toEqual([[h1, 'owned'], [h2, 'owned']]);
+  });
+
+  it('MFC lowers the Count from 3 to 1 beside a hand copy: take removes exactly the two tracked copies over it, the highest occ ids, and never the user\'s own', async () => {
+    const a = await SyncCaller.enrol(h);
+    const x = nextId();
+    const [lo, mid, hi] = [1, 2, 3].map((n) => importOccId(KEY, a.userId, x, n)).sort() as [string, string, string];
+    await imported(a, [row(x, 'Owned', { count: '3' })]);
+    const { cursor } = await drain(a);
+    const hand = randomUUID();
+    await pushed(a, handCopy(a, hand, headFor(x), cursor));
+    const b = await imported(a, [row(x, 'Owned')], DATE_B);
+    expect(b).toMatchObject({ conflictsRaised: 1, occurrencesAdded: 0 });
+    const item = b.review[0]!.items[0]!;
+    expect((JSON.parse(item.payload) as { preview: { take: unknown } }).preview.take).toEqual({ copies: [{ occ: mid, status: 'removed' }, { occ: hi, status: 'removed' }], fields: [] });
+    const { cursor: seen } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    const left = ([[hand, 'owned'], [lo, 'owned']] as [string, string][]).sort(([p], [q]) => Number(p > q) - Number(p < q));
+    expect(await copiesOn(a, headFor(x))).toEqual(left);
+    expect(await imported(a, [row(x, 'Owned')], DATE_B)).toMatchObject({ occurrencesAdded: 0, conflictsPending: 0 });
+    expect(await copiesOn(a, headFor(x))).toEqual(left);
+  });
+
+  it('Count 2 with one hand copy: take and keep each add exactly the one copy the row lacks', async () => {
+    for (const choice of ['take', 'keep'] as const) {
+      const { a, x, hand, item, seen, payload } = await handThenImport(2);
+      const added = { occ: importOccId(KEY, a.userId, x, 1), status: 'owned', head_id: headFor(x), origin: { site: 'mfc', native_id: x, ordinal: 1 } };
+      expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+      expect(await copiesOn(a, headFor(x))).toEqual([[hand, 'owned'], [added.occ, 'owned']].sort(([p], [q]) => Number(p! > q!) - Number(p! < q!)));
+      expect((payload['preview'] as Record<string, { copies: unknown[] }>)[choice]!.copies).toEqual([added]);
+      expect(await imported(a, [row(x, 'Owned', { count: '2', score: '9/10' })])).toMatchObject({ occurrencesAdded: 0, conflictsPending: 0 });
+    }
+  });
+
+  it('Count 3 with one hand copy: take previews and adds the two copies the row lacks, at its first two ordinals, and the same export adds none', async () => {
+    const { a, x, hand, item, seen, payload } = await handThenImport(3);
+    const added = [1, 2]
+      .map((n) => ({ occ: importOccId(KEY, a.userId, x, n), status: 'owned', head_id: headFor(x), origin: { site: 'mfc', native_id: x, ordinal: n } }))
+      .sort((p, q) => Number(p.occ > q.occ) - Number(p.occ < q.occ));
+    expect((payload['preview'] as { take: { copies: unknown[] } }).take.copies).toEqual(added);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    const three = ([[hand, 'owned'], ...added.map((c) => [c.occ, 'owned'])] as [string, string][]).sort(([p], [q]) => Number(p > q) - Number(p < q));
+    expect(await copiesOn(a, headFor(x))).toEqual(three);
+    expect(await imported(a, [row(x, 'Owned', { count: '3', score: '9/10' })])).toMatchObject({ occurrencesAdded: 0, conflictsPending: 0 });
+    expect(await copiesOn(a, headFor(x))).toEqual(three);
+  });
+
+  it('Count 2 with one hand copy and nothing disputed: the import binds the hand copy and adds one', async () => {
+    const a = await SyncCaller.enrol(h);
+    const x = nextId();
+    const hand = randomUUID();
+    await pushed(a, handCopy(a, hand, headFor(x), ''));
+    expect(await imported(a, [row(x, 'Owned', { count: '2' })])).toMatchObject({ conflictsRaised: 0, occurrencesAdded: 1 });
+    expect((await copiesOn(a, headFor(x))).map(([occ]) => occ).sort()).toEqual([hand, importOccId(KEY, a.userId, x, 1)].sort());
+  });
+
+  it('two hand copies, then the import at Count 2 with a disputed score: the import adds none, and take previews and writes no copy and sets the score', async () => {
+    const a = await SyncCaller.enrol(h);
+    const x = nextId();
+    const [h1, h2] = [randomUUID(), randomUUID()].sort() as [string, string];
+    await pushed(a, [...handCopy(a, h1, headFor(x), ''), ...handCopy(a, h2, headFor(x), ''), edit(a, `uf/${headFor(x)}/score`, { score: 4 }, '')]);
+    const b = await imported(a, [row(x, 'Owned', { count: '2', score: '9/10' })]);
+    expect(b).toMatchObject({ conflictsRaised: 1, occurrencesAdded: 0 });
+    const item = b.review[0]!.items[0]!;
+    expect((JSON.parse(item.payload) as { preview: { take: { copies: unknown[] } } }).preview.take.copies).toEqual([]);
+    const { cursor: seen } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await copiesOn(a, headFor(x))).toEqual([[h1, 'owned'], [h2, 'owned']]);
+    expect(await scoreOf(a, headFor(x))).toBe(9);
+    expect(await imported(a, [row(x, 'Owned', { count: '2', score: '9/10' })])).toMatchObject({ occurrencesAdded: 0, conflictsPending: 0 });
+    expect(await copiesOn(a, headFor(x))).toEqual([[h1, 'owned'], [h2, 'owned']]);
+  });
+
+  it('the import first, then a hand copy: an answer to a later conflict adds no copy and leaves the user\'s own', async () => {
+    const a = await SyncCaller.enrol(h);
+    const x = nextId();
+    const c1 = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned', { score: '9/10' })]);
+    const { cursor } = await drain(a);
+    const hand = randomUUID();
+    await pushed(a, [...handCopy(a, hand, headFor(x), cursor), edit(a, `uf/${headFor(x)}/score`, { score: 4 }, cursor)]);
+    const b = await imported(a, [row(x, 'Owned', { score: '7/10' })], DATE_B);
+    expect(b).toMatchObject({ conflictsRaised: 1, occurrencesAdded: 0 });
+    const { cursor: seen } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: b.review[0]!.items[0]!.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect((await copiesOn(a, headFor(x))).map(([occ]) => occ).sort()).toEqual([c1, hand].sort());
+    expect(await scoreOf(a, headFor(x))).toBe(7);
+  });
+
+  it('the import removes its copy, the user brings it back by hand, MFC then lists the row again with a disputed score: take binds that copy and adds none', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, y] = [nextId(), nextId()];
+    const c1 = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned', { score: '7/10' }), row(y, 'Owned')]);
+    // MFC lacks x and the app changed nothing: the import removes c1.
+    await imported(a, [row(y, 'Owned')], DATE_B);
+    expect(await copiesOn(a, headFor(x))).toEqual([]);
+    const { cursor } = await drain(a);
+    await pushed(a, [edit(a, `occ/${c1}/status`, { status: 'owned' }, cursor), edit(a, `uf/${headFor(x)}/score`, { score: 4 }, cursor)]);
+    expect(await copiesOn(a, headFor(x))).toEqual([[c1, 'owned']]);
+    const b = await imported(a, [row(x, 'Owned', { score: '9/10' }), row(y, 'Owned')], DATE_C);
+    expect(b).toMatchObject({ conflictsRaised: 1, occurrencesAdded: 0 });
+    const { cursor: seen } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: b.review[0]!.items[0]!.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await copiesOn(a, headFor(x))).toEqual([[c1, 'owned']]);
+    expect(await scoreOf(a, headFor(x))).toBe(9);
+  });
+
+  it('the user undoes the import\'s removal, MFC then lists the row again with a disputed score: take binds the copy the undo put back and adds none', async () => {
+    const a = await SyncCaller.enrol(h);
+    const [x, y] = [nextId(), nextId()];
+    const c1 = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned', { score: '7/10' }), row(y, 'Owned')]);
+    const b = await imported(a, [row(y, 'Owned')], DATE_B);
+    const change = b.applied.find((i) => i.headId === headFor(x))!;
+    const { cursor: seen } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'change', rev: change.rev, choice: 'undo' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await copiesOn(a, headFor(x))).toEqual([[c1, 'owned']]);
+    const { cursor } = await drain(a);
+    await pushed(a, [edit(a, `uf/${headFor(x)}/score`, { score: 4 }, cursor)]);
+    const c = await imported(a, [row(x, 'Owned', { score: '9/10' }), row(y, 'Owned')], DATE_C);
+    expect(c).toMatchObject({ conflictsRaised: 1, occurrencesAdded: 0 });
+    const { cursor: seen2 } = await drain(a);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: c.review[0]!.items[0]!.rev, choice: 'take' }, seen2)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    expect(await copiesOn(a, headFor(x))).toEqual([[c1, 'owned']]);
+    expect(await scoreOf(a, headFor(x))).toBe(9);
+  });
+});
