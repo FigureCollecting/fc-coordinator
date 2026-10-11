@@ -26,7 +26,8 @@ import { createImportRoutes, type ImportRoutesDeps } from '../import/service.js'
 import { createSpineReadClientFromEnv } from '../spine/spineReadClient.js';
 import { createSyncRoutes, MAX_REQUEST_BYTES, type SyncRoutesDeps } from '../sync/service.js';
 import type { SyncPool } from '../sync/store.js';
-import { createCatalogRoutes, resolveMediaBaseUrl, type CatalogRoutesDeps } from './catalog.js';
+import { createCatalogRoutes, resolveMediaBaseUrl, spineHeadResolver, type CatalogRoutesDeps } from './catalog.js';
+import { createDbDisplayRestrictionSource } from '../display/source.js';
 import { createCompareRoutes, type CompareRoutesDeps } from './compare.js';
 import {
   decoratorDeviceResolver,
@@ -96,7 +97,13 @@ export function productionConnectOptions(pool: SyncPool, env: NodeJS.ProcessEnv 
     spineRead,
     // Sync holds or replays a late edit by the import's policy (ImportHooks.late), with the import's key.
     sync: { db: pool },
-    catalog: { spineRead, mediaBaseUrl: resolveMediaBaseUrl(env) },
+    // Display restrictions are rows of display_restriction (migration 0007), product subjects
+    // resolved to their heads through the same spine client.
+    catalog: {
+      spineRead,
+      mediaBaseUrl: resolveMediaBaseUrl(env),
+      restrictions: createDbDisplayRestrictionSource({ db: pool, resolveHeads: spineHeadResolver(spineRead) }),
+    },
     import: { db: pool, spineRead, occIdKey: resolveImportOccKey(env) },
   };
 }
@@ -133,7 +140,12 @@ export function registerConnect(app: FastifyInstance, options: ConnectOptions): 
   // The import's answers ride Push with the import's own key: one key mints and finds every copy.
   const imports = options.import === undefined ? undefined : createImportHooks(options.import.occIdKey);
   const syncRoutes = options.sync === undefined ? undefined : createSyncRoutes({ ...(imports !== undefined ? { imports } : {}), ...options.sync });
-  const catalogRoutes = options.catalog === undefined ? undefined : createCatalogRoutes(options.catalog);
+  // A display denial is logged on the app's logger, with the trace of the request it belonged to:
+  // info with its rules when something was withheld, debug when nothing was (catalog.proto).
+  const catalogRoutes =
+    options.catalog === undefined
+      ? undefined
+      : createCatalogRoutes({ displayLog: (level, event, message) => app.log[level](event, message), ...options.catalog });
   const importRoutes = options.import === undefined ? undefined : createImportRoutes(options.import);
 
   void app.register(fastifyConnectPlugin, {

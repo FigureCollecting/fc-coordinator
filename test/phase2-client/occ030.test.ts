@@ -19,8 +19,9 @@ const vectors = JSON.parse(installed('golden/key-vectors.json')) as KeyVectors;
 const SMOKE_FAMILIES = new Set(['occ/head', 'occ/status']);
 
 describe('the installed contract', () => {
-  it('is 0.3.x, the release that defines the occurrence keys', () => {
-    expect((JSON.parse(installed('package.json')) as { version: string }).version).toMatch(/^0\.3\.\d+$/);
+  it('is 0.3.0 or a later 0.x, the releases that define the occurrence keys', () => {
+    // 0.4.0 (ADDR-1: display restrictions, mask and grounding) leaves the key grammar untouched.
+    expect((JSON.parse(installed('package.json')) as { version: string }).version).toMatch(/^0\.([3-9]|[1-9]\d+)\.\d+$/);
   });
 });
 

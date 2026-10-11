@@ -40,8 +40,27 @@
 // unset by default — no derivative exists yet). Off means GetProductImages
 // answers an empty page without asking the spine. On means a row is returned
 // ONLY when its URL is exactly <base>/<derivative sha-256>.
+//
+// GetProductImages IS THE IMAGE-LIST CHOKEPOINT (ADDR-1, catalog.proto DISPLAY
+// RESTRICTIONS) and the one exception to page pass-through. Every row is
+// decided for the caller's viewer context (owner: every CatalogService call)
+// by src/display/restrictions.ts against the restriction set of the moment
+// (src/display/source.ts; unreadable = UNAVAILABLE, never an unevaluated
+// image). A withheld row, like a row not under the media base, is dropped
+// BEFORE the page is cut: the coordinator reads on into the spine's next pages
+// to fill one (at most MAX_SPINE_IMAGE_READS spine reads per call) and, when it
+// stops part-way through a spine page or owes a product its primary, hands the
+// client its OWN token ("c1." + base64url JSON {s: the spine token of the page
+// it stopped in, k: rows of that page already read, p: products owed a
+// primary}). With nothing to carry, the spine's token goes back unchanged. The
+// spine's image tokens are base64url and never contain a ".", so the two
+// cannot be confused. A withheld primary is replaced by the first image of its
+// product shown to the caller, on whatever page it falls; a restriction is
+// never named, and every denial is logged with its rules.
 // ============================================================================
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
+import { decideDisplay, PrimaryPromoter, type DisplayDecision, type ViewerContext } from '../display/restrictions.js';
+import { NO_DISPLAY_RESTRICTIONS, type DisplayRestrictionSet, type DisplayRestrictionSource, type HeadResolver } from '../display/source.js';
 import { create } from '@bufbuild/protobuf';
 import { BinaryReader, BinaryWriter, WireType } from '@bufbuild/protobuf/wire';
 import {
@@ -197,6 +216,28 @@ export interface CatalogRoutesDeps {
   entitlementHeaderFor?: (subject: string) => Promise<string | null>;
   /** The read path's clock: the spine's now_iso is stamped here, never by the client. */
   now?: () => Date;
+  /** The display restrictions of the moment. Production: the display_restriction table. */
+  restrictions?: DisplayRestrictionSource;
+  /** Where a display decision is logged; registerConnect points it at the app's logger. */
+  displayLog?: DisplayLog;
+  /**
+   * The viewer context every row is decided for. Default owner: every CatalogService call is the
+   * signed-in user in their own views (catalog.proto). A surface that serves these lists to a share
+   * link or to anyone sets its own; the golden lists run through here in each of the three.
+   */
+  viewerContext?: ViewerContext;
+}
+
+/** A denial at info with its rules; an evaluation that withheld nothing at debug. */
+export type DisplayLog = (level: 'info' | 'debug', event: DisplayEvent, message: string) => void;
+
+export interface DisplayEvent {
+  image_id: string;
+  head_id: string;
+  context: ViewerContext;
+  withheld: 'image' | 'mask' | null;
+  sources_known: boolean;
+  denials: { rule: string; scope: string }[];
 }
 
 /**
@@ -452,47 +493,146 @@ const pixels = (raw: unknown): number => {
   return n <= UINT32_MAX ? n : 0;
 };
 
+/** One spine image row, in the spine's order: the derivative a client may fetch, or null when it may not. */
+export interface ImageRow {
+  headId: string;
+  /** null = not a derivative under the media base: never sent, and a primary so lost is replaced. */
+  image: ProductImage | null;
+  /** The spine marked the row its product's primary. */
+  primary: boolean;
+  /** The sources the spine says the image was captured from; null = not sent or unreadable. */
+  sources: string[] | null;
+}
+
 /**
- * images_json -> the rows a client may fetch, or null when it cannot be read.
+ * images_json -> every row in the spine's order, or null when it cannot be read.
  *
- * A row survives ONLY when its derivative id is a lowercase sha-256 AND the
- * spine served it at exactly `${mediaBaseUrl}/${id}`. Exact, not a prefix: a
+ * A row's image is kept ONLY when its derivative id is a lowercase sha-256 AND
+ * the spine served it at exactly `${mediaBaseUrl}/${id}`. Exact, not a prefix: a
  * prefix test admits `<base>/../originals/x` and `<base>/<id>?raw=1`, and an
- * original's URL is precisely the thing that must never reach a phone. A
- * product left with no rows is omitted, as the contract says.
+ * original's URL is precisely the thing that must never reach a phone. Rows
+ * whose image is null still count as rows: a page is cut by its position in
+ * the spine's page.
  */
-export function readImagesPayload(json: string, mediaBaseUrl: string): ProductImages[] | null {
+export function readImageRows(json: string, mediaBaseUrl: string): ImageRow[] | null {
   const products = parseObject(json)?.['products'];
   if (!Array.isArray(products)) return null;
-  const out: ProductImages[] = [];
+  const out: ImageRow[] = [];
   for (const entry of products) {
     const product = asObject(entry);
     const headId = nonEmpty(product?.['productId']);
     const rows = product?.['images'];
     if (headId === null || !Array.isArray(rows)) return null;
-    const images: ProductImage[] = [];
     for (const row of rows) {
       const img = asObject(row);
-      const id = img?.['derivativeSha256'];
-      if (img === null || typeof id !== 'string' || !SHA256_HEX.test(id)) continue;
-      const url = `${mediaBaseUrl}/${id}`;
-      if (img['url'] !== url) continue;
-      images.push(
-        create(ProductImageSchema, {
-          derivativeId: id,
-          role: typeof img['role'] === 'string' ? img['role'] : '',
-          primary: img['primary'] === true,
-          contentType: typeof img['contentType'] === 'string' ? img['contentType'] : '',
-          width: pixels(img['width']),
-          height: pixels(img['height']),
-          url,
-        }),
-      );
+      out.push({
+        headId,
+        image: img === null ? null : toProductImage(img, mediaBaseUrl),
+        primary: img?.['primary'] === true,
+        sources: img === null ? null : sourcesOf(img['sources']),
+      });
     }
-    if (images.length > 0) out.push(create(ProductImagesSchema, { headId, images }));
   }
   return out;
 }
+
+function toProductImage(img: Json, mediaBaseUrl: string): ProductImage | null {
+  const id = img['derivativeSha256'];
+  if (typeof id !== 'string' || !SHA256_HEX.test(id)) return null;
+  const url = `${mediaBaseUrl}/${id}`;
+  if (img['url'] !== url) return null;
+  return create(ProductImageSchema, {
+    derivativeId: id,
+    role: typeof img['role'] === 'string' ? img['role'] : '',
+    primary: img['primary'] === true,
+    contentType: typeof img['contentType'] === 'string' ? img['contentType'] : '',
+    width: pixels(img['width']),
+    height: pixels(img['height']),
+    url,
+  });
+}
+
+/** A list of strings, or null: anything else is read as "not known", which fails closed. */
+const sourcesOf = (raw: unknown): string[] | null =>
+  Array.isArray(raw) && raw.every((x): x is string => typeof x === 'string') ? raw : null;
+
+/** The most GetProducts pages one resolution may read for one batch: a spine that never ends is a fault. */
+export const MAX_RESOLVE_PAGES = 10;
+
+/**
+ * Product ids -> the head each resolves to today, through the spine's ER (GetProducts with head_id
+ * refs, merged ids included). For the display restrictions only: no entitlement assertion is
+ * minted, since nothing gated is read. An id the spine does not resolve is absent from the map.
+ */
+export function spineHeadResolver(spineRead: SpineCatalog | null, now: () => Date = () => new Date()): HeadResolver {
+  return async (ids) => {
+    if (spineRead === null) throw new Error('spine read is not configured');
+    const heads = new Map<string, string>();
+    for (let i = 0; i < ids.length; i += MAX_CATALOG_REFS) {
+      const refs = ids.slice(i, i + MAX_CATALOG_REFS).map((productId) => ({ productId }));
+      let pageToken = '';
+      for (let pages = 0; ; pages += 1) {
+        if (pages === MAX_RESOLVE_PAGES) throw new Error(`spine GetProducts did not end within ${MAX_RESOLVE_PAGES} pages`);
+        const res = await spineRead.getProducts(refs, now().toISOString(), null, { pageSize: MAX_CATALOG_REFS, pageToken });
+        const read = readProductsPayload(res.productsJson);
+        if (read === null) throw new Error('spine GetProducts payload could not be read');
+        for (const card of read.products) {
+          for (const ref of card.requestedAs) if (ref.ref.case === 'headId') heads.set(ref.ref.value, card.headId);
+        }
+        pageToken = res.nextPageToken;
+        if (pageToken === '') break;
+      }
+    }
+    return heads;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// the image page token (see the header): the spine's own, or the coordinator's
+// ---------------------------------------------------------------------------
+export const MAX_SPINE_IMAGE_READS = 4;
+const DEFAULT_IMAGE_PAGE = 50;
+const MAX_IMAGE_PAGE = 200;
+const IMAGE_TOKEN_PREFIX = 'c1.';
+
+interface ImageCursor {
+  /** The spine token of the page to read ('' = the first). */
+  s: string;
+  /** Rows of that page already read. */
+  k: number;
+  /** Products owed a primary. */
+  p: string[];
+}
+
+const badToken = (): ConnectError => invalid('page_token was not issued for this batch');
+
+function decodeImageToken(token: string): ImageCursor {
+  if (!token.startsWith(IMAGE_TOKEN_PREFIX)) return { s: token, k: 0, p: [] };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(token.slice(IMAGE_TOKEN_PREFIX.length), 'base64url').toString('utf8'));
+  } catch {
+    throw badToken();
+  }
+  const c = asObject(parsed);
+  const { s, k, p } = c ?? {};
+  if (
+    typeof s !== 'string' ||
+    typeof k !== 'number' || !Number.isSafeInteger(k) || k < 0 ||
+    !Array.isArray(p) || p.length > MAX_CATALOG_REFS || !p.every((h) => typeof h === 'string')
+  ) {
+    throw badToken();
+  }
+  return { s, k, p: p as string[] };
+}
+
+function encodeImageToken(c: ImageCursor): string {
+  if (c.k === 0 && c.p.length === 0) return c.s;
+  return IMAGE_TOKEN_PREFIX + Buffer.from(JSON.stringify(c), 'utf8').toString('base64url');
+}
+
+const imagePageSize = (requested: number): number =>
+  requested === 0 ? DEFAULT_IMAGE_PAGE : Math.min(requested, MAX_IMAGE_PAGE);
 
 // ---------------------------------------------------------------------------
 // request validation — all of it before anything leaves the process
@@ -675,6 +815,43 @@ export function createCatalogRoutes(deps: CatalogRoutesDeps): (router: ConnectRo
     return create(GetProductsResponseSchema, { ...read, nextPageToken: upstream.nextPageToken });
   };
 
+  const restrictionSource = deps.restrictions ?? NO_DISPLAY_RESTRICTIONS;
+  const displayLog: DisplayLog = deps.displayLog ?? (() => {});
+  // Every CatalogService call is the signed-in user in their own views (catalog.proto).
+  const context: ViewerContext = deps.viewerContext ?? 'owner';
+
+  const logDecision = (row: ImageRow, image: ProductImage, decision: DisplayDecision): void => {
+    const withheld = !decision.image ? 'image' : decision.denials.length > 0 ? 'mask' : null;
+    const event: DisplayEvent = {
+      image_id: image.derivativeId,
+      head_id: row.headId,
+      context,
+      withheld,
+      sources_known: row.sources !== null,
+      denials: decision.denials.map((d) => ({ rule: d.rule, scope: d.scope })),
+    };
+    if (withheld === null) displayLog('debug', event, 'display evaluated');
+    else displayLog('info', event, 'display restriction withheld');
+  };
+
+  const decide = (row: ImageRow, set: DisplayRestrictionSet): boolean => {
+    if (row.image === null) return false;
+    const decision = decideDisplay(
+      {
+        imageId: row.image.derivativeId,
+        productIds: set.productIdsFor(row.headId),
+        sources: row.sources,
+        // Neither is on the spine's row yet, so no mask is sent and none is withheld.
+        hasMask: false,
+        hasOwnAlpha: false,
+      },
+      set.restrictions,
+      context,
+    );
+    logDecision(row, row.image, decision);
+    return decision.image;
+  };
+
   const getProductImages = async (
     request: GetProductImagesRequest,
     ctx: HandlerContext,
@@ -682,22 +859,62 @@ export function createCatalogRoutes(deps: CatalogRoutesDeps): (router: ConnectRo
     const ids = headIds(request.headIds);
     // Images off: nothing to show, so nothing to ask — not even OpenFGA.
     if (deps.mediaBaseUrl === null) return create(GetProductImagesResponseSchema, {});
+    const mediaBaseUrl = deps.mediaBaseUrl;
+    let cursor = decodeImageToken(request.pageToken);
     const client = spine();
-    const assertion = await assertionFor(ctx);
-
-    let upstream: { imagesJson: string; nextPageToken: string };
+    let set: DisplayRestrictionSet;
     try {
-      upstream = await client.getProductImages(ids, now().toISOString(), assertion, {
-        pageSize: request.pageSize,
-        pageToken: request.pageToken,
-      });
-    } catch (err) {
-      throw relay(err);
+      set = await restrictionSource.current();
+    } catch {
+      // No restriction set, no image: never an unevaluated list.
+      throw new ConnectError('display restrictions are unavailable', Code.Unavailable);
     }
+    const assertion = await assertionFor(ctx);
+    const want = imagePageSize(request.pageSize);
+    const promoter = new PrimaryPromoter(cursor.p);
+    const products: ProductImages[] = [];
+    let count = 0;
 
-    const products = readImagesPayload(upstream.imagesJson, deps.mediaBaseUrl);
-    if (products === null) throw unreadable('images');
-    return create(GetProductImagesResponseSchema, { products, nextPageToken: upstream.nextPageToken });
+    for (let reads = 1; ; reads += 1) {
+      let upstream: { imagesJson: string; nextPageToken: string };
+      try {
+        upstream = await client.getProductImages(ids, now().toISOString(), assertion, {
+          pageSize: want,
+          pageToken: cursor.s,
+        });
+      } catch (err) {
+        throw relay(err);
+      }
+      const rows = readImageRows(upstream.imagesJson, mediaBaseUrl);
+      if (rows === null) throw unreadable('images');
+
+      for (let j = cursor.k; j < rows.length; j += 1) {
+        if (count === want) {
+          return create(GetProductImagesResponseSchema, {
+            products,
+            nextPageToken: encodeImageToken({ s: cursor.s, k: j, p: promoter.pending() }),
+          });
+        }
+        const row = rows[j]!;
+        const primary = promoter.admit(row.headId, row.primary, decide(row, set));
+        if (primary === null) continue;
+        const image = row.image!;
+        image.primary = primary;
+        const last = products[products.length - 1];
+        if (last !== undefined && last.headId === row.headId) last.images.push(image);
+        else products.push(create(ProductImagesSchema, { headId: row.headId, images: [image] }));
+        count += 1;
+      }
+
+      if (upstream.nextPageToken === '') return create(GetProductImagesResponseSchema, { products, nextPageToken: '' });
+      cursor = { s: upstream.nextPageToken, k: 0, p: [] };
+      if (count === want || reads >= MAX_SPINE_IMAGE_READS) {
+        return create(GetProductImagesResponseSchema, {
+          products,
+          nextPageToken: encodeImageToken({ s: cursor.s, k: 0, p: promoter.pending() }),
+        });
+      }
+    }
   };
 
   const searchProducts = async (

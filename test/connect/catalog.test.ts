@@ -566,8 +566,12 @@ describe('(e) GetProductImages', () => {
   it('returns only the refs under the configured media base', async () => {
     harness = await start({
       mediaBaseUrl: MEDIA,
-      respondImages: () =>
-        create(WireImagesResponseSchema, {
+      // The rows dropped here leave the page short of 10, so the coordinator reads on (ADDR-1: rows
+      // are dropped before the page is cut); the spine's next page is empty and its last.
+      respondImages: (call) =>
+        call.request.pageToken === 'img-next'
+          ? create(WireImagesResponseSchema, { imagesJson: JSON.stringify({ products: [], coverage: {} }), nextPageToken: '' })
+          : create(WireImagesResponseSchema, {
           imagesJson: JSON.stringify({
             products: [
               {
@@ -605,7 +609,8 @@ describe('(e) GetProductImages', () => {
         width: 1200, height: 1600, url: `${MEDIA}/${SHA_A}`,
       }),
     ]);
-    expect(res.nextPageToken).toBe('img-next');
+    expect(res.nextPageToken).toBe('');
+    expect(harness.spine.imageCalls.map((c) => c.request.pageToken)).toEqual(['img-1', 'img-next']);
     const call = harness.spine.imageCalls[0];
     expect(call?.request.productIds).toEqual([CANNED_HEAD_ID]);
     expect(call?.request.nowIso).toBe(NOW.toISOString());

@@ -33,7 +33,7 @@ describe('migrations — numbered-SQL doctrine', () => {
     // refuses a back-dated prefix (exit 6), so this file can never be added
     // later to a database that has already applied 0001 — it is 0000 or it is a
     // hand-run psql nobody can prove.
-    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql', '0004_sync_transactions.sql', '0005_import.sql', '0006_import_reimport.sql']);
+    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql', '0004_sync_transactions.sql', '0005_import.sql', '0006_import_reimport.sql', '0007_display_restriction.sql']);
   });
 
   it('contains no transaction control — the runner owns the boundaries (psql -1)', () => {
@@ -101,10 +101,10 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     await pg?.stop();
   });
 
-  it('applies all seven migrations in one run and records them in the ledger', async () => {
+  it('applies all eight migrations in one run and records them in the ledger', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=7 skipped=0');
+    expect(run.output).toContain('applied=8 skipped=0');
 
     const ledger = await asMigratorDb('SELECT filename FROM schema_migrations ORDER BY filename');
     expect(ledger.stdout.trim().split('\n')).toEqual([
@@ -115,13 +115,14 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
       '0004_sync_transactions.sql',
       '0005_import.sql',
       '0006_import_reimport.sql',
+      '0007_display_restriction.sql',
     ]);
   });
 
   it('is a no-op on re-run', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=7');
+    expect(run.output).toContain('applied=0 skipped=8');
   });
 
   // ── The two-role split, proven rather than described ──────────────────────
@@ -345,6 +346,62 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
 
   // 0005: the import's server-internal state. Runs and frames are history (append-only); the
   // bases and the pending figure items are the import's current state, rewritten as it decides.
+  // 0007 (ADDR-1): display restrictions are data the coordinator READS. The writer's rules are the
+  // table's CHECKs (catalog.proto DISPLAY RESTRICTIONS: four scopes, three levels, a subject neither
+  // empty nor edged with white space); the app role may only read them.
+  describe('0007_display_restriction for the application role', () => {
+    const denied = (run: ExecResult): void => {
+      expect(run.exitCode).not.toBe(0);
+      expect(run.output).toMatch(/42501|permission denied/i);
+    };
+    const refused = (run: ExecResult): void => {
+      expect(run.exitCode).not.toBe(0);
+      expect(run.output).toMatch(/check constraint|violates/i);
+    };
+    const insert = (rule: string, level: string, subject: string, scope: string): Promise<ExecResult> =>
+      asMigratorDb(`INSERT INTO display_restriction (rule_id, level, subject, scope) VALUES ('${rule}', '${level}', E'${subject}', '${scope}')`);
+
+    it('takes a restriction at each level and scope from the writer, and lets the app read it', async () => {
+      for (const [i, [level, scope]] of ([
+        ['image', 'no_display'], ['product', 'owner_views_only'], ['source', 'no_share'], ['source', 'no_mask'],
+      ] as const).entries()) {
+        expect((await insert(`m7-ok-${i}`, level, 'amiami', scope)).exitCode).toBe(0);
+      }
+      const read = await asApp("SELECT rule_id, level, subject, scope FROM display_restriction WHERE rule_id LIKE 'm7-ok-%' ORDER BY rule_id");
+      expect(read.exitCode).toBe(0);
+      expect(read.stdout.trim().split('\n')).toEqual([
+        'm7-ok-0|image|amiami|no_display',
+        'm7-ok-1|product|amiami|owner_views_only',
+        'm7-ok-2|source|amiami|no_share',
+        'm7-ok-3|source|amiami|no_mask',
+      ]);
+    });
+
+    it('refuses the app every write: restrictions are not the service\'s to change', async () => {
+      denied(await asApp("INSERT INTO display_restriction (rule_id, level, subject, scope) VALUES ('m7-app', 'source', 'hlj', 'no_mask')"));
+      denied(await asApp("UPDATE display_restriction SET scope = 'no_mask' WHERE false"));
+      denied(await asApp('DELETE FROM display_restriction WHERE false'));
+    });
+
+    it.each([
+      ['an unrecognised scope', 'image', 'x', 'no-share'],
+      ['a scope in another case', 'image', 'x', 'No_display'],
+      ['an unrecognised level', 'Image', 'x', 'no_display'],
+      ['an empty subject', 'source', '', 'no_display'],
+      ['a subject that begins with a space', 'source', ' hlj', 'no_display'],
+      ['a subject that ends with a tab', 'source', 'hlj\\t', 'no_display'],
+    ])('refuses %s', async (_label, level, subject, scope) => {
+      refused(await insert(`m7-bad-${level}-${scope}-${subject.length}`, level, subject, scope));
+    });
+
+    it('keys a restriction by its rule id', async () => {
+      expect((await insert('m7-dup', 'source', 'hlj', 'no_mask')).exitCode).toBe(0);
+      const again = await insert('m7-dup', 'source', 'amiami', 'no_mask');
+      expect(again.exitCode).not.toBe(0);
+      expect(again.output).toMatch(/duplicate key/i);
+    });
+  });
+
   describe('0005_import for the application role', () => {
     const USER = '99999999-9999-4999-8999-999999999999';
     const HEAD = '5f0c2a9e-4b7d-4e21-9c3a-8d1e6f2b7a40';
@@ -522,7 +579,7 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
   it('still exits 0 on a correctly named directory', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=7');
+    expect(run.output).toContain('applied=0 skipped=8');
   });
 
   it('refuses the whole run when an applied migration has been edited on disk', async () => {
