@@ -10,7 +10,7 @@ import {
   CARD_TEXT_ALLOWLIST,
   CONTENT_LEVELS,
   MAX_CATALOG_REFS,
-  readImagesPayload,
+  readImageRows,
   readProductsPayload,
   resolveMediaBaseUrl,
   toProductCard,
@@ -382,7 +382,22 @@ describe('readProductsPayload', () => {
   });
 });
 
-describe('readImagesPayload', () => {
+// The rows a client may fetch, grouped by product as GetProductImages sends them when nothing is
+// withheld: a row that is not a derivative under the base is dropped, a product left empty is absent.
+const readImagesPayload = (json: string, base: string) => {
+  const rows = readImageRows(json, base);
+  if (rows === null) return null;
+  const out: { headId: string; images: NonNullable<(typeof rows)[number]['image']>[] }[] = [];
+  for (const r of rows) {
+    if (r.image === null) continue;
+    const last = out[out.length - 1];
+    if (last?.headId === r.headId) last.images.push(r.image);
+    else out.push({ headId: r.headId, images: [r.image] });
+  }
+  return out;
+};
+
+describe('readImageRows', () => {
   const image = (over: Record<string, unknown>): Record<string, unknown> => ({
     role: 'gallery',
     primary: false,

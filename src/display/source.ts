@@ -19,7 +19,6 @@
 // A failed read is never cached: the caller answers UNAVAILABLE and retries,
 // and an image is never served unevaluated.
 // ============================================================================
-import type { SqlClient } from '../sync/store.js';
 import { DISPLAY_LEVELS, foldAsciiCase, type DisplayRestriction } from './restrictions.js';
 
 export interface DisplayRestrictionSet {
@@ -48,6 +47,11 @@ export const NO_DISPLAY_RESTRICTIONS: DisplayRestrictionSource = Object.freeze({
   current: async () => setOf([], new Map()),
 });
 
+/** The one query this needs: the coordinator's pool satisfies it. */
+export interface RestrictionDb {
+  query(text: string): Promise<{ rows: readonly unknown[] }>;
+}
+
 interface RestrictionRow {
   rule_id: string;
   level: string;
@@ -58,7 +62,7 @@ interface RestrictionRow {
 const SELECT = 'SELECT rule_id, level, subject, scope FROM display_restriction ORDER BY rule_id';
 
 export function createDbDisplayRestrictionSource(options: {
-  db: SqlClient;
+  db: RestrictionDb;
   resolveHeads: HeadResolver;
   ttlMs?: number;
   now?: () => number;
@@ -69,7 +73,7 @@ export function createDbDisplayRestrictionSource(options: {
   let inFlight: Promise<DisplayRestrictionSet> | null = null;
 
   const load = async (): Promise<DisplayRestrictionSet> => {
-    const { rows } = await options.db.query<RestrictionRow>(SELECT);
+    const rows = (await options.db.query(SELECT)).rows as readonly RestrictionRow[];
     const restrictions = rows.map((r) => ({ rule: r.rule_id, level: r.level, subject: r.subject, scope: r.scope }));
     const subjects = new Set<string>();
     for (const r of restrictions) {

@@ -173,6 +173,14 @@ describe('the Connect options the process serves', () => {
     expect(on.catalog?.mediaBaseUrl).toBe('https://images.figurecollecting.com/d');
   });
 
+  it('give Catalog the display restrictions of the pool\'s display_restriction table', async () => {
+    const query = vi.fn(async () => ({ rows: [] }));
+    const opts = productionConnectOptions({ ...neverPool, query } as never, { MEDIA_PUBLIC_BASE_URL: 'https://images.figurecollecting.com/d' });
+    const set = await opts.catalog?.restrictions?.current();
+    expect(set?.restrictions).toEqual([]);
+    expect(String((query.mock.calls[0] as unknown[] | undefined)?.[0])).toMatch(/FROM display_restriction/);
+  });
+
   it('refuse to start on a media base that is not https', () => {
     expect(() => productionConnectOptions(neverPool, { MEDIA_PUBLIC_BASE_URL: 'http://images.test/d' })).toThrow(
       /MEDIA_PUBLIC_BASE_URL/,
