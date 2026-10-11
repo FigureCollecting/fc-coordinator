@@ -511,8 +511,13 @@ const CONVERSIONS: readonly (readonly [Kind, Kind])[] = [
  * first, lowest occ id; then removals (an origin before none, then the highest occ id); then
  * restoring a copy that is out, a tracked one first and one whose base is the kind first, then one
  * an import removed, lowest occ id; then new copies, each for the lowest-numbered row of the kind
- * at its lowest unused ordinal. A copy with no base is never changed, but for one an import
- * removed. Each field the rev found changed by MFC or disputed takes MFC's value.
+ * at its lowest unused ordinal. The user's own live copies of S (no base, or base out) are never
+ * changed, but each counts toward MFC's Count of its kind: a conversion, a restore or a new copy
+ * makes a copy of a kind only while the live copies of that kind are fewer than MFC's Count, so an
+ * answer never makes a copy of a kind beside the user's own that MFC's Count does not call for
+ * (WK-14d). They count toward no removal: a tracked copy goes only where the tracked ones exceed
+ * MFC's Count. A copy with no base is never changed, but for one an import removed. Each field the
+ * rev found changed by MFC or disputed takes MFC's value.
  */
 export function takeEffect(v: View, S: string, exp: readonly Row[], found: Comps, occId: OccIdOf): Effect {
   const cs = v.copiesOf(S);
@@ -520,15 +525,18 @@ export function takeEffect(v: View, S: string, exp: readonly Row[], found: Comps
   const M = zero();
   for (const r of exp) M[r.kind] += r.count;
   const tracked = cs.filter((c) => v.baseKind(c, S) !== OUT);
+  // The user's own live copies: take never changes them, but each counts toward MFC's Count of its kind.
+  const own = cs.filter((c) => !tracked.includes(c) && w.cur.get(c) !== OUT);
   const count = (k: Kind) => tracked.filter((c) => w.cur.get(c) === k).length + w.created.filter((c) => c.kind === k).length;
+  const live = (k: Kind) => count(k) + own.filter((c) => w.cur.get(c) === k).length;
   for (const [x, y] of CONVERSIONS) {
-    while (count(x) > M[x] && count(y) < M[y]) w.cur.set(tracked.find((c) => w.cur.get(c) === x)!, y);
+    while (count(x) > M[x] && live(y) < M[y]) w.cur.set(tracked.find((c) => w.cur.get(c) === x)!, y);
   }
   for (const x of KINDS) {
     while (count(x) > M[x]) w.remove(tracked.filter((c) => w.cur.get(c) === x).sort(removalOrder(v))[0]!);
   }
   for (const y of KINDS) {
-    while (count(y) < M[y]) {
+    while (live(y) < M[y]) {
       const out = cs.filter((c) => w.cur.get(c) === OUT && v.copies.get(c)!.head === S);
       const c =
         out.find((o) => tracked.includes(o) && v.baseKind(o, S) === y) ??
@@ -539,7 +547,7 @@ export function takeEffect(v: View, S: string, exp: readonly Row[], found: Comps
       w.restore(c, y);
     }
     const row = exp.filter((r) => r.kind === y).sort(byId)[0];
-    while (count(y) < M[y]) w.create(row!, y, occId);
+    while (live(y) < M[y]) w.create(row!, y, occId);
   }
   const e = workEffect(w, S);
   for (const f of FIELDS) {

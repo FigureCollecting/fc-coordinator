@@ -210,12 +210,12 @@ describe('planImport: conflicts (GR-Q1: surfaced, never written over)', () => {
     });
     expect(item['rev']).toMatch(/^i1\.[0-9a-f]{32}$/);
     const created = { occ: occ('119', 1), status: 'owned', head_id: S1, origin: { site: 'mfc', native_id: '119', ordinal: 1 } };
-    const second = { ...created, occ: occ('119', 2), origin: { ...created.origin, ordinal: 2 } };
-    // Each list in facet-key order, as the server would write it.
+    // Each list in facet-key order, as the server would write it. take binds the app's own owned
+    // copy as one of MFC's two and makes only the other (WK-14d), as keep does.
     expect(item['preview']).toEqual({
       keep: { copies: [created], fields: [{ head_id: S1, field: 'note', note: 'mfc' }] },
       take: {
-        copies: [created, second].sort((a, b) => (a.occ < b.occ ? -1 : 1)),
+        copies: [created],
         fields: [
           { head_id: S1, field: 'note', note: 'mfc' },
           { head_id: S1, field: 'score', score: 7 },
@@ -225,6 +225,16 @@ describe('planImport: conflicts (GR-Q1: surfaced, never written over)', () => {
     expect(p.items.set).toEqual([{ head: S1, rev: item['rev'], raised: 1, side: expect.any(String), comps: expect.objectContaining({ score: 'conflict', note: 'apply' }) }]);
     // The payload is written with its keys sorted at every level, so an unchanged item is byte-identical.
     expect(p.writes[0]!.payload).toBe(sortedJson(item));
+  });
+
+  it('previews every copy take makes beside the app\'s own copy, not one: MFC\'s Count 3 beside one owned copy previews two new copies (WK-14d)', () => {
+    const st = state([...appCopy(APP_A, S1, 'owned'), up(`uf/${S1}/score`, { score: 9, ...SHOWN })]);
+    const p = plan(st, [row('119', S1, 'owned', 3, { score: 7 })]);
+    expect(keys(p)).toEqual([`imp/mfc/figure/${S1}`]);
+    const item = JSON.parse(p.writes[0]!.payload) as { counts: unknown; preview: { take: { copies: unknown[] } } };
+    expect(item.counts).toMatchObject({ owned: { base: 0, app: 1, mfc: 3 } });
+    const made = (n: number) => ({ occ: occ('119', n), status: 'owned', head_id: S1, origin: { site: 'mfc', native_id: '119', ordinal: n } });
+    expect(item.preview.take.copies).toEqual([made(1), made(2)].sort((a, b) => (a.occ < b.occ ? -1 : 1)));
   });
 
   it('lists every pending item after the import, earlier ones of figures it did not decide included, in head order', () => {
