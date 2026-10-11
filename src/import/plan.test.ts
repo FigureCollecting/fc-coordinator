@@ -227,6 +227,16 @@ describe('planImport: conflicts (GR-Q1: surfaced, never written over)', () => {
     expect(p.writes[0]!.payload).toBe(sortedJson(item));
   });
 
+  it('previews every copy take makes beside the app\'s own copy, not one: MFC\'s Count 3 beside one owned copy previews two new copies (WK-14d)', () => {
+    const st = state([...appCopy(APP_A, S1, 'owned'), up(`uf/${S1}/score`, { score: 9, ...SHOWN })]);
+    const p = plan(st, [row('119', S1, 'owned', 3, { score: 7 })]);
+    expect(keys(p)).toEqual([`imp/mfc/figure/${S1}`]);
+    const item = JSON.parse(p.writes[0]!.payload) as { counts: unknown; preview: { take: { copies: unknown[] } } };
+    expect(item.counts).toMatchObject({ owned: { base: 0, app: 1, mfc: 3 } });
+    const made = (n: number) => ({ occ: occ('119', n), status: 'owned', head_id: S1, origin: { site: 'mfc', native_id: '119', ordinal: n } });
+    expect(item.preview.take.copies).toEqual([made(1), made(2)].sort((a, b) => (a.occ < b.occ ? -1 : 1)));
+  });
+
   it('lists every pending item after the import, earlier ones of figures it did not decide included, in head order', () => {
     const earlier = plan(state([up(`uf/${S2}/score`, { score: 9, ...SHOWN })]), [row('120', S2, 'owned', 0, { score: 7 })]);
     const standing = earlier.items.set[0]!;

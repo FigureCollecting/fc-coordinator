@@ -275,6 +275,12 @@ describe('takeEffect: the user\'s own copy of the figure counts before any copy 
     expect(three.created.map((c) => [c.kind, c.ordinal])).toEqual([['owned', 1]]);
   });
 
+  it('makes every copy MFC\'s Count lacks beside the user\'s own, not one: Count 3 beside one hand copy makes two, at the row\'s first two ordinals', () => {
+    const e = takeEffect(view(copy(O1, 'owned')), S, [row(3)], comps('conflict'), occId);
+    expect([...e.statuses]).toEqual([]);
+    expect(e.created.map((c) => [c.kind, c.ordinal])).toEqual([['owned', 1], ['owned', 2]]);
+  });
+
   it('binds a hand copy that is wished or ordered as it binds an owned one: take writes only MFC\'s value of the disputed field', () => {
     const wished = view([...copy(O1, 'wished'), up(`uf/${S}/wishability`, { wishability: 2, ...SHOWN })]);
     const w = takeEffect(wished, S, [row(1, 'wished', { wishability: 4 })], comps('alike', { wishability: 'conflict' }), occId);
