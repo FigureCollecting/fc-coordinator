@@ -178,6 +178,21 @@ describe('(a) a withheld image is absent and never named', () => {
     expect(shown(await harness.catalog.getProductImages({ headIds: [H1, H2] }))).toEqual([{ head: H2, images: ['c*:gallery'] }]);
   });
 
+  it('keeps two products on one page as two products, each image under its own head', async () => {
+    // The mobile asks for 200 heads a call, so a page of several products is the usual case.
+    harness = await start({
+      restrictions: sourceOf([r('r1', 'image', sha('b'), 'no_display')]),
+      respondImages: () => page([
+        { productId: H1, images: [row('a', { primary: true }), row('b')] },
+        { productId: H2, images: [row('c', { primary: true }), row('d')] },
+      ]),
+    });
+    expect(shown(await harness.catalog.getProductImages({ headIds: [H1, H2] }))).toEqual([
+      { head: H1, images: ['a*:gallery'] },
+      { head: H2, images: ['c*:gallery', 'd:gallery'] },
+    ]);
+  });
+
   it('evaluates every call as the owner: owner_views_only and no_share withhold nothing here', async () => {
     harness = await start({
       restrictions: sourceOf([r('r1', 'product', H1, 'owner_views_only'), r('r2', 'source', 'amiami', 'no_share')]),
