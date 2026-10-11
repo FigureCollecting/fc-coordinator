@@ -353,6 +353,23 @@ describe('takeEffect: the user\'s own copy of the figure counts before any copy 
     expect(w.created.map((c) => [c.id, c.kind])).toEqual([['120', 'wished']]);
   });
 
+  it('removes exactly the tracked copies over MFC\'s Count, and the user\'s own of the kind shield none and are never touched: Count 2 to 1 beside a hand copy removes the higher tracked one', () => {
+    const v = view([...copy(O1, 'owned', 1), ...copy(O2, 'owned', 2), ...copy(O3, 'owned')], [[O1, based('owned')], [O2, based('owned')]], [row(2)]);
+    const e = takeEffect(v, S, [row(1)], comps('conflict'), occId);
+    expect([...e.statuses]).toEqual([[O2, null]]);
+    expect(e.created).toEqual([]);
+    // Three tracked beside a copy REALIGN left the user's own (base out, the highest occ id with an
+    // origin), MFC now Count 1: the two tracked over it go, and the user's own stays.
+    const w = view(
+      [...copy(O1, 'owned', 1), ...copy(O2, 'owned', 2), ...copy(O3, 'owned', 3), ...copy(O4, 'owned', 4)],
+      [[O1, based('owned')], [O2, based('owned')], [O3, based('owned')], [O4, based('out')]],
+      [row(3)],
+    );
+    const two = takeEffect(w, S, [row(1)], comps('conflict'), occId);
+    expect(new Map(two.statuses)).toEqual(new Map([[O2, null], [O3, null]]));
+    expect(two.created).toEqual([]);
+  });
+
   it('counts a copy an import removed once, when take restores it: Count 2 restores it and makes one more', () => {
     const v = view(copy(O1, null, 1), [[O1, based('out', true)]], [row(0)]);
     const e = takeEffect(v, S, [row(2)], comps('conflict'), occId);
