@@ -966,6 +966,19 @@ describe('WK-14d: the import binds an MFC row to the user\'s own copy of the fig
     }
   });
 
+  it('Count 3 with one hand copy: take previews and adds the two copies the row lacks, at its first two ordinals, and the same export adds none', async () => {
+    const { a, x, hand, item, seen, payload } = await handThenImport(3);
+    const added = [1, 2]
+      .map((n) => ({ occ: importOccId(KEY, a.userId, x, n), status: 'owned', head_id: headFor(x), origin: { site: 'mfc', native_id: x, ordinal: n } }))
+      .sort((p, q) => Number(p.occ > q.occ) - Number(p.occ < q.occ));
+    expect((payload['preview'] as { take: { copies: unknown[] } }).take.copies).toEqual(added);
+    expect((await pushed(a, [answer(a, headFor(x), { item: 'figure', rev: item.rev, choice: 'take' }, seen)])).results[0]!.outcome).toBe(PushOutcome.APPLIED);
+    const three = ([[hand, 'owned'], ...added.map((c) => [c.occ, 'owned'])] as [string, string][]).sort(([p], [q]) => Number(p > q) - Number(p < q));
+    expect(await copiesOn(a, headFor(x))).toEqual(three);
+    expect(await imported(a, [row(x, 'Owned', { count: '3', score: '9/10' })])).toMatchObject({ occurrencesAdded: 0, conflictsPending: 0 });
+    expect(await copiesOn(a, headFor(x))).toEqual(three);
+  });
+
   it('Count 2 with one hand copy and nothing disputed: the import binds the hand copy and adds one', async () => {
     const a = await SyncCaller.enrol(h);
     const x = nextId();
