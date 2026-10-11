@@ -163,3 +163,29 @@ describe('PrimaryPromoter across pages', () => {
     expect(p.pending()).toEqual([]);
   });
 });
+
+describe('denials are sorted by rule id, then scope', () => {
+  it('orders two scopes under one rule id, and keeps a repeated pair', () => {
+    const img: ImageFacts = { imageId: 'img-a', productIds: ['p'], sources: ['s'], hasMask: true, hasOwnAlpha: false };
+    const rs = [
+      { rule: 'r1', level: 'image', subject: 'img-a', scope: 'owner_views_only' },
+      { rule: 'r1', level: 'image', subject: 'img-a', scope: 'no_share' },
+      { rule: 'r0', level: 'image', subject: 'img-a', scope: 'no_share' },
+      { rule: 'r0', level: 'image', subject: 'img-a', scope: 'no_share' },
+    ];
+    expect(decideDisplay(img, rs, 'share_link').denials).toEqual([
+      { rule: 'r0', scope: 'no_share' },
+      { rule: 'r0', scope: 'no_share' },
+      { rule: 'r1', scope: 'no_share' },
+      { rule: 'r1', scope: 'owner_views_only' },
+    ]);
+  });
+});
+
+describe('displayList keys a product by its head, the first product id', () => {
+  it('treats images with no product id as one product', () => {
+    const img = (id: string, primary: boolean) => ({ facts: { imageId: id, productIds: [], sources: [], hasMask: false, hasOwnAlpha: false }, primary });
+    const got = displayList([img('a', true), img('b', false)], [{ rule: 'r1', level: 'image', subject: 'a', scope: 'no_display' }], 'owner');
+    expect(got.map((g) => [g.entry.facts.imageId, g.primary])).toEqual([['b', true]]);
+  });
+});
