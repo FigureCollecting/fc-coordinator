@@ -92,11 +92,12 @@ describe('scripts/mask-store.sh revoke', () => {
 describe('scripts/mask-store.sh restore', () => {
   it('names the other restrictions on the store, which it never touches', async () => {
     expect((await sql("INSERT INTO display_restriction (rule_id, level, subject, scope) VALUES ('takedown-7', 'source', 'Shop-A', 'no_display')")).exitCode).toBe(0);
+    expect((await sql("INSERT INTO display_restriction (rule_id, level, subject, scope) VALUES ('legal-1', 'product', 'shop-a', 'no_share')")).exitCode).toBe(0);
     const dry = await run(['restore', 'shop-a']);
     expect(dry.exitCode).toBe(0);
-    expect(dry.stdout).toContain('other restrictions naming shop-a stay: takedown-7 (source, no_display)');
+    expect(dry.stdout).toContain('other restrictions naming shop-a stay: legal-1 (product, no_share); takedown-7 (source, no_display)\n');
     expect(dry.stdout).toContain('DRY RUN: --apply would remove rule mask-store:shop-a');
-    expect(await rows()).toHaveLength(3);
+    expect(await rows()).toHaveLength(4);
   });
 
   it('removes only the store\'s revocation with --apply', async () => {
@@ -104,6 +105,7 @@ describe('scripts/mask-store.sh restore', () => {
     expect(done.exitCode).toBe(0);
     expect(done.stdout).toContain('RESTORED shop-a: rule mask-store:shop-a removed');
     expect(await rows()).toEqual([
+      'legal-1|product|shop-a|no_share|',
       "mask-store:shop-b|source|shop-b|no_mask|store's letter, ref 42; see desk",
       'takedown-7|source|Shop-A|no_display|',
     ]);
@@ -115,7 +117,7 @@ describe('scripts/mask-store.sh restore', () => {
     expect(again.stdout).toContain('shop-a was not revoked: nothing removed');
     const dry = await run(['restore', 'shop-a']);
     expect(dry.stdout).toContain('DRY RUN: not revoked, --apply would remove nothing');
-    expect(await rows()).toHaveLength(2);
+    expect(await rows()).toHaveLength(3);
   });
 });
 
