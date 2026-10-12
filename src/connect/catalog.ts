@@ -57,6 +57,19 @@
 // cannot be confused. A withheld primary is replaced by the first image of its
 // product shown to the caller, on whatever page it falls; a restriction is
 // never named, and every denial is logged with its rules.
+//
+// THE MASK, ITS GROUNDING AND THE APPEARANCE (contract 0.4.0 ProductImage;
+// the spine's rows since fc-aggregation 0032) describe the image AS THIS
+// CALLER IS SHOWN IT, so the decision applies them: the mask is sent only when
+// no restriction withholds it and the spine serves it at exactly
+// <base>/<mask id> (the derivative's rule); the grounding is the mask's, else
+// the derivative's own alpha's, else unset; the thumbhash and colour are the
+// ones with the mask applied only when the mask is sent. A withheld mask
+// therefore never reaches the caller through a field derived from it, and a
+// store's revocation (MASK-G: a source no_mask row, scripts/mask-store.sh)
+// leaves its images' clean copies in the list without their masks, which is
+// how a phone's next owned sync drops the masks it kept. top_margin_frac and
+// the opaque box stay on the spine until CONTRACT-1 gives them fields.
 // ============================================================================
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
 import { decideDisplay, PrimaryPromoter, type DisplayDecision, type ViewerContext } from '../display/restrictions.js';
@@ -66,8 +79,10 @@ import { BinaryReader, BinaryWriter, WireType } from '@bufbuild/protobuf/wire';
 import {
   CardTextSchema,
   CatalogService,
+  ContactBandSchema,
   GetProductImagesResponseSchema,
   GetProductsResponseSchema,
+  ImageMaskSchema,
   ProductCardSchema,
   ProductImageSchema,
   ProductImagesSchema,
@@ -79,6 +94,7 @@ import {
   type GetProductImagesResponse,
   type GetProductsRequest,
   type GetProductsResponse,
+  type ImageMask,
   type ProductCard,
   type ProductImage,
   type ProductImages,
@@ -502,7 +518,34 @@ export interface ImageRow {
   primary: boolean;
   /** The sources the spine says the image was captured from; null = not sent or unreadable. */
   sources: string[] | null;
+  /** The spine's mask for the image, kept only when it is served at exactly <base>/<mask id>; null = none. */
+  mask: MaskFacts | null;
+  /** The derivative as it is: grounding on its own alpha (null = none measured) and its plain appearance. */
+  own: SurfaceFacts;
 }
+
+/** Grounding as the contract carries it: measured on one alpha channel. */
+export interface Grounding {
+  bottomMarginFrac: number;
+  contactBand: { centerXFrac: number; widthFrac: number };
+}
+
+/** The placeholder look: an empty thumbhash or colour is unknown, as the contract sends it. */
+export interface Appearance {
+  thumbhash: Uint8Array;
+  dominantColor: string;
+}
+
+export interface SurfaceFacts {
+  grounding: Grounding | null;
+  appearance: Appearance;
+}
+
+export interface MaskFacts extends SurfaceFacts {
+  mask: ImageMask;
+}
+
+const NO_SURFACE: SurfaceFacts = Object.freeze({ grounding: null, appearance: Object.freeze({ thumbhash: new Uint8Array(0), dominantColor: '' }) });
 
 /**
  * images_json -> every row in the spine's order, or null when it cannot be read.
@@ -530,6 +573,8 @@ export function readImageRows(json: string, mediaBaseUrl: string): ImageRow[] | 
         image: img === null ? null : toProductImage(img, mediaBaseUrl),
         primary: img?.['primary'] === true,
         sources: img === null ? null : sourcesOf(img['sources']),
+        mask: img === null ? null : maskOf(img['mask'], mediaBaseUrl),
+        own: img === null ? NO_SURFACE : surfaceOf(img),
       });
     }
   }
@@ -550,6 +595,81 @@ function toProductImage(img: Json, mediaBaseUrl: string): ProductImage | null {
     height: pixels(img['height']),
     url,
   });
+}
+
+/**
+ * The mask the spine sends with a row (fc-aggregation read/products.ts ImageMaskRef), or null. Kept on
+ * the derivative's terms: its id a lowercase sha-256 and its url exactly `${mediaBaseUrl}/${id}`, so a
+ * mask can never name anything the derivative rule would refuse.
+ */
+function maskOf(raw: unknown, mediaBaseUrl: string): MaskFacts | null {
+  const m = asObject(raw);
+  const id = m?.['maskSha256'];
+  if (m === null || typeof id !== 'string' || !SHA256_HEX.test(id)) return null;
+  const url = `${mediaBaseUrl}/${id}`;
+  if (m['url'] !== url) return null;
+  return {
+    mask: create(ImageMaskSchema, { maskId: id, contentType: typeof m['contentType'] === 'string' ? m['contentType'] : '', url }),
+    ...surfaceOf(m),
+  };
+}
+
+/** The grounding and appearance an image row or a mask carries, each field read as unknown unless it is what the spine writes. */
+const surfaceOf = (o: Json): SurfaceFacts => ({
+  grounding: groundingOf(o['grounding']),
+  appearance: {
+    thumbhash: thumbhashOf(o['thumbhash']),
+    dominantColor: typeof o['dominantColor'] === 'string' && DOMINANT_COLOR.test(o['dominantColor']) ? o['dominantColor'] : '',
+  },
+});
+
+/** PostgreSQL's numeric text for a fraction: digits, at most one point, no sign or exponent. */
+const DECIMAL = /^(?:0|[1-9]\d*)(?:\.\d+)?$/;
+const DOMINANT_COLOR = /^#[0-9a-f]{6}$/;
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/** A fraction from 0 to 1 (catalog.proto), or null. */
+const fraction = (raw: unknown): number | null => {
+  if (typeof raw !== 'string' || !DECIMAL.test(raw)) return null;
+  const n = Number(raw);
+  return n <= 1 ? n : null;
+};
+
+/** All three numbers or none: a half-read grounding would stand a figure on a number nobody measured. */
+function groundingOf(raw: unknown): Grounding | null {
+  const g = asObject(raw);
+  const band = asObject(g?.['contactBand']);
+  const bottomMarginFrac = fraction(g?.['bottomMarginFrac']);
+  const centerXFrac = fraction(band?.['centerXFrac']);
+  const widthFrac = fraction(band?.['widthFrac']);
+  if (bottomMarginFrac === null || centerXFrac === null || widthFrac === null) return null;
+  return { bottomMarginFrac, contactBand: { centerXFrac, widthFrac } };
+}
+
+/** A ThumbHash in standard base64, 5 (its header) to 64 bytes as the spine stores it; else unknown. */
+function thumbhashOf(raw: unknown): Uint8Array {
+  if (typeof raw !== 'string' || !BASE64.test(raw)) return new Uint8Array(0);
+  const bytes = Buffer.from(raw, 'base64');
+  return bytes.length >= 5 && bytes.length <= 64 ? new Uint8Array(bytes) : new Uint8Array(0);
+}
+
+/**
+ * The image as this caller is shown it. decideDisplay grounds and describes an image by its mask
+ * exactly when the mask is sent, and otherwise by the derivative's own alpha when it has one: so the
+ * surface is the sent mask's, else the derivative's own, and a mask sent with no readable grounding
+ * leaves the grounding unset rather than borrowing the unmasked one.
+ */
+export function presentImage(image: ProductImage, row: ImageRow, decision: DisplayDecision): ProductImage {
+  const shown = decision.mask ? row.mask : null;
+  const surface = shown ?? row.own;
+  if (shown !== null) image.mask = shown.mask;
+  if (surface.grounding !== null) {
+    image.bottomMarginFrac = surface.grounding.bottomMarginFrac;
+    image.contactBand = create(ContactBandSchema, surface.grounding.contactBand);
+  }
+  image.thumbhash = surface.appearance.thumbhash;
+  image.dominantColor = surface.appearance.dominantColor;
+  return image;
 }
 
 /** A list of strings, or null: anything else is read as "not known", which fails closed. */
@@ -841,14 +961,14 @@ export function createCatalogRoutes(deps: CatalogRoutesDeps): (router: ConnectRo
         imageId: row.image.derivativeId,
         productIds: set.productIdsFor(row.headId),
         sources: row.sources,
-        // Neither is on the spine's row yet, so no mask is sent and none is withheld.
-        hasMask: false,
-        hasOwnAlpha: false,
+        hasMask: row.mask !== null,
+        hasOwnAlpha: row.own.grounding !== null,
       },
       set.restrictions,
       context,
     );
     logDecision(row, row.image, decision);
+    if (decision.image) presentImage(row.image, row, decision);
     return decision.image;
   };
 
