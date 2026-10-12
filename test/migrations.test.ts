@@ -680,11 +680,13 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     });
 
     it('is idempotent: the file run again by its owner changes nothing', async () => {
-      const acl = `SELECT datacl::text FROM pg_database WHERE datname = '${DB}'`;
-      const before = (await psqlAs('postgres', DB, acl)).stdout.trim();
-      const again = await pg.exec(['psql', '-X', '-U', MIGRATOR, '-d', DB, '-q', '-v', 'ON_ERROR_STOP=1', '-1', '-f', FILE]);
+      // On the database it ran on with every role it names present (CNPG's shape): the same ACL after.
+      const acl = "SELECT datacl::text FROM pg_database WHERE datname = 'fccoord_cnpg'";
+      const before = (await psqlAs('postgres', 'fccoord_cnpg', acl)).stdout.trim();
+      const again = await pg.exec(['psql', '-X', '-U', MIGRATOR, '-d', 'fccoord_cnpg', '-q', '-v', 'ON_ERROR_STOP=1', '-1', '-f', FILE]);
       expect(again.exitCode).toBe(0);
-      expect((await psqlAs('postgres', DB, acl)).stdout.trim()).toBe(before);
+      expect((await psqlAs('postgres', 'fccoord_cnpg', acl)).stdout.trim()).toBe(before);
+      expect(before).toContain('cnpg_metrics_exporter=c/');
       expect(before).not.toMatch(/(^|[{,])=/);
     });
 
