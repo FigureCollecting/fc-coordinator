@@ -230,12 +230,12 @@ describe('(a) a withheld image is absent and never named', () => {
     harness = await start({
       restrictions: sourceOf([r('r1', 'source', 'hlj', 'no_display')]),
       respondImages: () => page([
-        { productId: H1, images: [row('a', { primary: true }), row('b', { sources: 'hlj' }), row('c', { sources: ['amiami', 7] })] },
+        { productId: H1, images: [row('a', { primary: true }), row('b', { sources: 'hlj' }), row('c', { sources: ['amiami', 7] }), row('e', { sources: [] })] },
         { productId: H2, images: [row('d', { primary: true, sources: ['amiami'] })] },
       ]),
     });
     expect(shown(await harness.catalog.getProductImages({ headIds: [H1, H2] }))).toEqual([{ head: H2, images: ['d*:gallery'] }]);
-    expect(denials(harness.lines).map((l) => l['sources_known'])).toEqual([false, false, false]);
+    expect(denials(harness.lines).map((l) => l['sources_known'])).toEqual([false, false, false, false]);
   });
 });
 
@@ -627,8 +627,8 @@ const storeGolden = JSON.parse(
 const maskOf = (imageId: string): string => String.fromCharCode(0x30 + imageId.charCodeAt(0) - 0x61);
 
 describe('(h) MASK-G: a store\'s revocation, through GetProductImages', () => {
-  it('reads all 14 lists', () => {
-    expect(storeGolden.lists).toHaveLength(14);
+  it('reads all 15 lists', () => {
+    expect(storeGolden.lists).toHaveLength(15);
   });
 
   it.each(storeGolden.lists.map((l) => [l.name, l] as const))('%s', async (_name, l) => {
@@ -681,7 +681,7 @@ describe('(h) MASK-G: a store\'s revocation, through GetProductImages', () => {
           ...e,
           level: 'info',
           context: l.context,
-          sources_known: l.images.find((i) => i.image_id === e.image_id)!.sources !== null,
+          sources_known: (l.images.find((i) => i.image_id === e.image_id)!.sources ?? []).length > 0,
         })),
       });
     }

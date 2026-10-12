@@ -506,6 +506,19 @@ describe('readImageRows — the mask, the grounding and the appearance', () => {
     expect(r.own).toEqual({ grounding: { bottomMarginFrac: 0, contactBand: { centerXFrac: 0.5383, widthFrac: 0.4267 } }, appearance: { thumbhash: Uint8Array.from([9, 8, 7, 6, 5]), dominantColor: '#fafaf8' } });
   });
 
+  // MASK-G: an image's sources decide a store's revocation. A list the spine could not have meant (it always
+  // names the image's own capture) is read as unknown, so a revocation in force applies (fail closed).
+  it.each([
+    ['an empty list', [], null],
+    ['no list', undefined, null],
+    ['a list holding a non-string', ['amiami', 7], null],
+    ['a string', 'amiami', null],
+    ['one site key', ['amiami'], ['amiami']],
+    ['two site keys', ['amiami', 'hlj'], ['amiami', 'hlj']],
+  ])('reads sources sent as %s', (_label, sources, want) => {
+    expect(one(sources === undefined ? {} : { sources }).sources).toEqual(want);
+  });
+
   it('reads no mask, no own grounding and an unknown appearance from a row that has none', () => {
     const r = one({});
     expect(r.mask).toBeNull();
@@ -542,6 +555,9 @@ describe('readImageRows — the mask, the grounding and the appearance', () => {
     ['a margin written in exponent form', grounding({ bottomMarginFrac: '5e-2' })],
     ['a margin sent as a JSON number', grounding({ bottomMarginFrac: 0.05 })],
     ['a margin with a leading zero run', grounding({ bottomMarginFrac: '00.5' })],
+    ['a margin with a point and no digit after it', grounding({ bottomMarginFrac: '1.' })],
+    ['a zero with a point and no digit after it', grounding({ bottomMarginFrac: '0.' })],
+    ['a margin with a point and no digit before it', grounding({ bottomMarginFrac: '.5' })],
     ['an empty margin', grounding({ bottomMarginFrac: '' })],
     ['no margin', grounding({ bottomMarginFrac: undefined })],
     ['no contact band', grounding({ contactBand: undefined })],
@@ -568,11 +584,19 @@ describe('readImageRows — the mask, the grounding and the appearance', () => {
     ['shorter than a thumbhash header', Buffer.from([1, 2, 3, 4]).toString('base64')],
     ['longer than 64 bytes', Buffer.alloc(65, 1).toString('base64')],
     ['not a string', 12],
+    // Standard base64 only, as the spine encodes it (encode(..., 'base64')): Buffer would also decode the
+    // url-safe alphabet, so the grammar is what refuses it. '+/+/AQID' (read below) with one character swapped:
+    ['url-safe base64 with a hyphen', '-/+/AQID'],
+    ['url-safe base64 with an underscore', '+_+/AQID'],
   ])('reads a thumbhash that is %s as unknown', (_label, th) => {
     expect(one({ thumbhash: th, mask: mask({ thumbhash: th }) })).toMatchObject({
       own: { appearance: { thumbhash: new Uint8Array(0) } },
       mask: { appearance: { thumbhash: new Uint8Array(0) } },
     });
+  });
+
+  it('reads a thumbhash whose standard base64 uses + and /', () => {
+    expect(one({ thumbhash: '+/+/AQID' }).own.appearance.thumbhash).toEqual(Uint8Array.from([0xfb, 0xff, 0xbf, 1, 2, 3]));
   });
 
   it('reads thumbhashes of 5 and of 64 bytes', () => {

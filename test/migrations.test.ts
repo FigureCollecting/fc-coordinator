@@ -359,6 +359,8 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
 
     it('takes a store\'s revocation in its one shape, and lets the app read it', async () => {
       expect((await insert('mask-store:m8-shop', 'source', 'm8-shop', 'no_mask')).exitCode).toBe(0);
+      expect((await insert('mask-store:7net', 'source', '7net', 'no_mask')).exitCode).toBe(0);
+      expect((await insert('mask-store:a1-b2-c3', 'source', 'a1-b2-c3', 'no_mask')).exitCode).toBe(0);
       const read = await asApp("SELECT rule_id, level, subject, scope FROM display_restriction WHERE rule_id = 'mask-store:m8-shop'");
       expect(read.stdout.trim()).toBe('mask-store:m8-shop|source|m8-shop|no_mask');
     });
@@ -370,6 +372,15 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
       ['a site key in upper case', 'mask-store:M8-D', 'source', 'M8-D', 'no_mask'],
       ['a site key with one upper-case letter', 'mask-store:m8-E', 'source', 'm8-E', 'no_mask'],
       ['an empty site key', 'mask-store:', 'source', '', 'no_mask'],
+      // The spine's site-key grammar, ^[a-z0-9]+(-[a-z0-9]+)*$, as scripts/mask-store.sh holds it: a hand-written
+      // row cannot name a key no source.site has, whose revocation would withhold nothing.
+      ['a domain for a site key', 'mask-store:amiami.com', 'source', 'amiami.com', 'no_mask'],
+      ['a site key with white space inside', 'mask-store:ami ami', 'source', 'ami ami', 'no_mask'],
+      ['a site key with an underscore', 'mask-store:m8_h', 'source', 'm8_h', 'no_mask'],
+      ['a site key that starts with a hyphen', 'mask-store:-m8', 'source', '-m8', 'no_mask'],
+      ['a site key that ends with a hyphen', 'mask-store:m8-', 'source', 'm8-', 'no_mask'],
+      ['a site key with two hyphens in a row', 'mask-store:m8--i', 'source', 'm8--i', 'no_mask'],
+      ['a site key with a letter outside ASCII', 'mask-store:m8-\u00e9', 'source', 'm8-\u00e9', 'no_mask'],
     ])('refuses a revocation row with %s', async (_label, rule, level, subject, scope) => {
       const run = await insert(rule, level, subject, scope);
       expect(run.exitCode).not.toBe(0);

@@ -67,8 +67,12 @@ describe('scripts/mask-store.sh revoke', () => {
   it('writes the store\'s one row with --apply, its site key trimmed and folded, and says how soon it takes', async () => {
     const done = await run(['revoke', '  Shop-A\t', '--apply']);
     expect(done.exitCode).toBe(0);
-    expect(done.stdout).toContain('REVOKED shop-a: rule mask-store:shop-a written');
-    expect(done.stdout).toMatch(/within the coordinator's restriction cache period \(30 s\)/);
+    expect(done.stdout).toContain('REVOKED shop-a: rule mask-store:shop-a written;');
+    expect(done.stdout).toMatch(/each coordinator reads it within its restriction cache period \(30 s\)/);
+    // The script cannot see the spine, so it says what it wrote and never that a store's images are withheld:
+    // that holds only when the key is a spine source.site, which the runbook checks before --apply.
+    expect(done.stdout).not.toMatch(/withholds/);
+    expect(done.stdout).toContain('only for images whose spine sources include shop-a');
     expect(await rows()).toEqual(['mask-store:shop-a|source|shop-a|no_mask|a store asked for its cut-outs to be removed (MASK-G)']);
   });
 
@@ -130,6 +134,18 @@ describe('scripts/mask-store.sh refuses', () => {
     ['a source with white space inside', ['revoke', 'shop c']],
     ['a source with a control character', ['revoke', 'shop\u0001c']],
     ['a source too long for its rule id', ['revoke', 'x'.repeat(118)]],
+    // The spine's site-key grammar (every source.site: akimomo, amiami, hobby-genki, ...): ^[a-z0-9]+(-[a-z0-9]+)*$
+    // after the fold. Anything else can never equal a source.site, so its revocation would withhold nothing.
+    ['a domain where the site key goes', ['revoke', 'amiami.com', '--apply']],
+    ['an option where the site key goes', ['revoke', '--apply', '--apply']],
+    ['a site key with a quote and a backslash', ['revoke', "o'brien\\x", '--apply']],
+    ['a site key with an underscore', ['revoke', 'shop_c', '--apply']],
+    ['a site key that starts with a hyphen', ['revoke', '-shop', '--apply']],
+    ['a site key that ends with a hyphen', ['revoke', 'shop-', '--apply']],
+    ['a site key with two hyphens in a row', ['revoke', 'shop--c', '--apply']],
+    ['a site key with a letter outside ASCII', ['revoke', 'sh\u00f6p', '--apply']],
+    ['a site key with a slash', ['revoke', 'shop/c', '--apply']],
+    ['a domain on a restore', ['restore', 'amiami.com', '--apply']],
     ['an unknown option', ['revoke', 'shop-c', '--force']],
     ['a reason with no text', ['revoke', 'shop-c', '--reason']],
     ['an empty reason', ['revoke', 'shop-c', '--reason', '']],
@@ -140,6 +156,20 @@ describe('scripts/mask-store.sh refuses', () => {
     expect(refused.exitCode).toBe(2);
     expect(refused.stderr).toMatch(/^mask-store: ERROR: /);
     expect(await rows()).toEqual(before);
+  });
+
+  it('names the grammar it holds a site key to', async () => {
+    const refused = await run(['revoke', 'amiami.com', '--apply']);
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr).toContain("'amiami.com' is not a site key");
+    expect(refused.stderr).toContain('^[a-z0-9]+(-[a-z0-9]+)*$');
+  });
+
+  it('takes site keys of digits, and of several hyphenated parts', async () => {
+    for (const key of ['7net', 'a1-b2-c3']) {
+      expect(await run(['revoke', key, '--apply'])).toMatchObject({ exitCode: 0 });
+      expect(await run(['restore', key, '--apply'])).toMatchObject({ exitCode: 0 });
+    }
   });
 
   it('takes a source of exactly 117 characters, the most a rule id holds', async () => {

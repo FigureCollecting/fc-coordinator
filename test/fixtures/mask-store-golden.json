@@ -3,7 +3,7 @@
     "MASK-G (Ross 2026-10-11, option b): every store's listing photos may get cut-out masks, and each store is revocable.",
     "A revocation is ONE display_restriction row: rule 'mask-store:<site key>', level 'source', subject the site key, scope 'no_mask'",
     "(migration 0008, scripts/mask-store.sh). These lists read through GetProductImages in their viewer context.",
-    "images: one product's rows as the spine sends them, in its order: sources (null = not sent), whether it sends a mask, whether",
+    "images: one product's rows as the spine sends them, in its order: sources (null = not sent; [] is read as unknown, like null), whether it sends a mask, whether",
     "the derivative has its own alpha. expect.images: what the caller is sent, in order: the mask or not, where the grounding comes",
     "from (mask | own_alpha | unset) and the appearance (masked | plain). expect.denials: the info lines, in order."
   ],
@@ -222,6 +222,22 @@
       "context": "owner",
       "images": [
         { "image_id": "a", "primary": true, "sources": null, "mask": true, "own_alpha": false },
+        { "image_id": "b", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": false }
+      ],
+      "restrictions": [{ "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" }],
+      "expect": {
+        "images": [
+          { "image_id": "a", "primary": true, "mask": false, "grounding": "unset", "appearance": "plain" },
+          { "image_id": "b", "primary": false, "mask": true, "grounding": "mask", "appearance": "masked" }
+        ],
+        "denials": [{ "image_id": "a", "withheld": "mask", "rules": ["mask-store:amiami"] }]
+      }
+    },
+    {
+      "name": "the spine sent an empty source list: read as unknown, a revocation in force withholds the mask (fail closed)",
+      "context": "owner",
+      "images": [
+        { "image_id": "a", "primary": true, "sources": [], "mask": true, "own_alpha": false },
         { "image_id": "b", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": false }
       ],
       "restrictions": [{ "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" }],
