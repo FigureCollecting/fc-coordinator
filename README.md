@@ -474,7 +474,7 @@ transaction control in a pending file, `6` out-of-order file.
 | `0005_import.sql` | the MFC import's state: `import_run` and `import_frame` (append-only), the row, copy and field bases, and `import_figure_item` (pending conflicts) |
 | `0006_import_reimport.sql` | `import_copy_base.import_removed` (a copy an import removed), `import_kept_copy` (knowing keeps), `import_export_row` (the latest export's rows, for the discrepancy report), `import_frame.before` (each figure as the import found it) and, append-only, `import_late_edit` (the late edits a Push replayed and APPLIED) and `import_revision` (the revisions that changed a figure) |
 | `0007_display_restriction.sql` | `display_restriction` (rule id, level image/product/source, subject, scope no_display/owner_views_only/no_share/no_mask): data the coordinator reads at the image-list chokepoint; the CHECKs are the writer's rules; the app role may only read it |
-| `0008_mask_store_revocation.sql` | MASK-G: a store's cut-out revocation is one `display_restriction` row, held to one shape by a CHECK: rule `mask-store:<site key>`, level `source`, the site key in lower case, scope `no_mask` (written by `scripts/mask-store.sh`) |
+| `0008_mask_store_revocation.sql` | MASK-G: a store's cut-out revocation is one `display_restriction` row, held to one shape by a CHECK: rule `mask-store:<site key>`, level `source`, the site key in the spine's grammar `^[a-z0-9]+(-[a-z0-9]+)*$`, scope `no_mask` (written by `scripts/mask-store.sh`) |
 
 ### A store asks for its cut-outs to be removed (MASK-G)
 
@@ -488,6 +488,14 @@ sh scripts/mask-store.sh revoke <site key>                   # dry run: what it 
 sh scripts/mask-store.sh revoke <site key> --reason '<ref>' --apply
 sh scripts/mask-store.sh restore <site key> [--apply]        # the undo
 ```
+
+The site key is the spine's `source.site` (`amiami`, `hobby-genki`), never a
+domain: the script refuses (exit `2`) anything outside `^[a-z0-9]+(-[a-z0-9]+)*$`
+once trimmed and folded, and 0008's CHECK refuses the same rows. The grammar is
+all it can check: it cannot see the spine, so before `--apply` confirm with a
+read-only SELECT that the key is a `source.site` (fc-infra's runbook gives the
+command). A key no source has writes a row that withholds nothing, which is why
+the script reports only that the rule was written.
 
 `revoke` writes one row (`mask-store:<site key>`, level `source`, scope
 `no_mask`; a second run writes nothing). From then on GetProductImages sends
