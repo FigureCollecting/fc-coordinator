@@ -475,6 +475,21 @@ transaction control in a pending file, `6` out-of-order file.
 | `0006_import_reimport.sql` | `import_copy_base.import_removed` (a copy an import removed), `import_kept_copy` (knowing keeps), `import_export_row` (the latest export's rows, for the discrepancy report), `import_frame.before` (each figure as the import found it) and, append-only, `import_late_edit` (the late edits a Push replayed and APPLIED) and `import_revision` (the revisions that changed a figure) |
 | `0007_display_restriction.sql` | `display_restriction` (rule id, level image/product/source, subject, scope no_display/owner_views_only/no_share/no_mask): data the coordinator reads at the image-list chokepoint; the CHECKs are the writer's rules; the app role may only read it |
 | `0008_mask_store_revocation.sql` | MASK-G: a store's cut-out revocation is one `display_restriction` row, held to one shape by a CHECK: rule `mask-store:<site key>`, level `source`, the site key in the spine's grammar `^[a-z0-9]+(-[a-z0-9]+)*$`, scope `no_mask` (written by `scripts/mask-store.sh`) |
+| `0009_revoke_public_connect.sql` | PGHBA-1: `REVOKE CONNECT, TEMPORARY ON DATABASE <this database> FROM PUBLIC`, so a login role with no grant of its own (the spine's role on pg-spine, say) can no longer open a session here; the app role keeps CONNECT through 0000's grant, the owner keeps everything, and `cnpg_metrics_exporter` gets CONNECT where the role exists. The file checks its outcome and rolls itself back (exit 3) if PUBLIC still holds either privilege or the app role would hold no CONNECT |
+
+### The roll that ships 0009 (PGHBA-1)
+
+Production's ledger holds 0000-0008 after ROLL-2, so the next coordinator roll's
+migrate Job prints `applied=1 skipped=9`: one upgrade step, ten files in the
+ledger. A fresh database prints `applied=10 skipped=0`, a re-run
+`applied=0 skipped=10`. fc-infra's apply sheet and acceptance A3 move from nine
+to ten migrations on that roll, not before.
+
+0009 is the database's half of PGHBA-1; fc-infra's `pg_hba` block on pg-spine is
+the other (each role is admitted to its own database and rejected everywhere
+else). The maintenance database `postgres` gets no migration: it is not this
+repo's database, and those pg_hba rejects already keep `coordinator`,
+`coordinator_migrator` and `spine` out of it.
 
 ### A store asks for its cut-outs to be removed (MASK-G)
 
