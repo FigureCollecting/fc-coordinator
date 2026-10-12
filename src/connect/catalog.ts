@@ -654,21 +654,22 @@ function thumbhashOf(raw: unknown): Uint8Array {
 }
 
 /**
- * The image as this caller is shown it. decideDisplay grounds and describes an image by its mask
- * exactly when the mask is sent, and otherwise by the derivative's own alpha when it has one: so the
- * surface is the sent mask's, else the derivative's own, and a mask sent with no readable grounding
- * leaves the grounding unset rather than borrowing the unmasked one.
+ * The image as this caller is shown it, as decideDisplay decided it: the mask only when it is sent,
+ * the grounding of the surface the decision names (the mask, the derivative's own alpha, or none:
+ * a sent mask with no readable grounding leaves it unset rather than borrowing the unmasked one),
+ * and the appearance with the mask applied only when the mask is sent.
  */
 export function presentImage(image: ProductImage, row: ImageRow, decision: DisplayDecision): ProductImage {
-  const shown = decision.mask ? row.mask : null;
-  const surface = shown ?? row.own;
-  if (shown !== null) image.mask = shown.mask;
-  if (surface.grounding !== null) {
-    image.bottomMarginFrac = surface.grounding.bottomMarginFrac;
-    image.contactBand = create(ContactBandSchema, surface.grounding.contactBand);
+  const mask = decision.mask ? row.mask : null;
+  if (mask !== null) image.mask = mask.mask;
+  const grounding = { mask, own_alpha: row.own, unset: null }[decision.groundingFrom]?.grounding;
+  if (grounding !== null && grounding !== undefined) {
+    image.bottomMarginFrac = grounding.bottomMarginFrac;
+    image.contactBand = create(ContactBandSchema, grounding.contactBand);
   }
-  image.thumbhash = surface.appearance.thumbhash;
-  image.dominantColor = surface.appearance.dominantColor;
+  const look = ((decision.appearanceMasked ? mask : null) ?? row.own).appearance;
+  image.thumbhash = look.thumbhash;
+  image.dominantColor = look.dominantColor;
   return image;
 }
 

@@ -519,6 +519,7 @@ describe('readImageRows — the mask, the grounding and the appearance', () => {
     ['whose id is not a sha-256', { maskSha256: 'abc', url: `${MEDIA}/abc` }],
     ['whose id is upper case', { maskSha256: MASK.toUpperCase(), url: `${MEDIA}/${MASK.toUpperCase()}` }],
     ['whose id is not a string', { maskSha256: 7 }],
+    ['whose id is a list holding a sha-256', { maskSha256: [MASK] }],
   ])('reads no mask from one %s', (_label, over) => {
     expect(one({ mask: mask(over) }).mask).toBeNull();
   });
