@@ -33,7 +33,7 @@ describe('migrations — numbered-SQL doctrine', () => {
     // refuses a back-dated prefix (exit 6), so this file can never be added
     // later to a database that has already applied 0001 — it is 0000 or it is a
     // hand-run psql nobody can prove.
-    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql', '0004_sync_transactions.sql', '0005_import.sql', '0006_import_reimport.sql', '0007_display_restriction.sql']);
+    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql', '0004_sync_transactions.sql', '0005_import.sql', '0006_import_reimport.sql', '0007_display_restriction.sql', '0008_mask_store_revocation.sql']);
   });
 
   it('contains no transaction control — the runner owns the boundaries (psql -1)', () => {
@@ -101,10 +101,10 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     await pg?.stop();
   });
 
-  it('applies all eight migrations in one run and records them in the ledger', async () => {
+  it('applies all nine migrations in one run and records them in the ledger', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=8 skipped=0');
+    expect(run.output).toContain('applied=9 skipped=0');
 
     const ledger = await asMigratorDb('SELECT filename FROM schema_migrations ORDER BY filename');
     expect(ledger.stdout.trim().split('\n')).toEqual([
@@ -116,13 +116,14 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
       '0005_import.sql',
       '0006_import_reimport.sql',
       '0007_display_restriction.sql',
+      '0008_mask_store_revocation.sql',
     ]);
   });
 
   it('is a no-op on re-run', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=8');
+    expect(run.output).toContain('applied=0 skipped=9');
   });
 
   // ── The two-role split, proven rather than described ──────────────────────
@@ -340,6 +341,65 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
       ].entries()) {
         expect([i, run.exitCode]).not.toEqual([i, 0]);
         expect(run.output).toMatch(/check constraint/i);
+      }
+    });
+  });
+
+  // 0008 (MASK-G): a store's cut-out revocation is ONE row in the 'mask-store:' namespace, of one shape:
+  // rule 'mask-store:<site key>', level source, the site key in lower case, scope no_mask. Rows outside
+  // the namespace are untouched; scripts/mask-store.sh writes and removes the namespace's rows
+  // (test/display/mask-store.test.ts).
+  describe('0008_mask_store_revocation for the writer', () => {
+    const insert = (rule: string, level: string, subject: string, scope: string): Promise<ExecResult> =>
+      asMigratorDb(`INSERT INTO display_restriction (rule_id, level, subject, scope) VALUES ('${rule}', '${level}', '${subject}', '${scope}')`);
+    const refused = (run: ExecResult): void => {
+      expect(run.exitCode).not.toBe(0);
+      expect(run.output).toMatch(/display_restriction_mask_store/);
+    };
+
+    it('takes a store\'s revocation in its one shape, and lets the app read it', async () => {
+      expect((await insert('mask-store:m8-shop', 'source', 'm8-shop', 'no_mask')).exitCode).toBe(0);
+      expect((await insert('mask-store:7net', 'source', '7net', 'no_mask')).exitCode).toBe(0);
+      expect((await insert('mask-store:a1-b2-c3', 'source', 'a1-b2-c3', 'no_mask')).exitCode).toBe(0);
+      const read = await asApp("SELECT rule_id, level, subject, scope FROM display_restriction WHERE rule_id = 'mask-store:m8-shop'");
+      expect(read.stdout.trim()).toBe('mask-store:m8-shop|source|m8-shop|no_mask');
+    });
+
+    it.each([
+      ['another level', 'mask-store:m8-a', 'product', 'm8-a', 'no_mask'],
+      ['another scope', 'mask-store:m8-b', 'source', 'm8-b', 'no_display'],
+      ['a rule id naming another store', 'mask-store:m8-c', 'source', 'm8-other', 'no_mask'],
+      ['a site key in upper case', 'mask-store:M8-D', 'source', 'M8-D', 'no_mask'],
+      ['a site key with one upper-case letter', 'mask-store:m8-E', 'source', 'm8-E', 'no_mask'],
+      ['an empty site key', 'mask-store:', 'source', '', 'no_mask'],
+      // The spine's site-key grammar, ^[a-z0-9]+(-[a-z0-9]+)*$, as scripts/mask-store.sh holds it: a hand-written
+      // row cannot name a key no source.site has, whose revocation would withhold nothing.
+      ['a domain for a site key', 'mask-store:amiami.com', 'source', 'amiami.com', 'no_mask'],
+      ['a site key with white space inside', 'mask-store:ami ami', 'source', 'ami ami', 'no_mask'],
+      ['a site key with an underscore', 'mask-store:m8_h', 'source', 'm8_h', 'no_mask'],
+      ['a site key that starts with a hyphen', 'mask-store:-m8', 'source', '-m8', 'no_mask'],
+      ['a site key that ends with a hyphen', 'mask-store:m8-', 'source', 'm8-', 'no_mask'],
+      ['a site key with two hyphens in a row', 'mask-store:m8--i', 'source', 'm8--i', 'no_mask'],
+      ['a site key with a letter outside ASCII', 'mask-store:m8-\u00e9', 'source', 'm8-\u00e9', 'no_mask'],
+    ])('refuses a revocation row with %s', async (_label, rule, level, subject, scope) => {
+      const run = await insert(rule, level, subject, scope);
+      expect(run.exitCode).not.toBe(0);
+      expect(run.output).toMatch(/display_restriction_mask_store|display_restriction_subject_check/);
+    });
+
+    it('refuses an update that moves a revocation out of its shape', async () => {
+      expect((await insert('mask-store:m8-f', 'source', 'm8-f', 'no_mask')).exitCode).toBe(0);
+      refused(await asMigratorDb("UPDATE display_restriction SET scope = 'no_display' WHERE rule_id = 'mask-store:m8-f'"));
+      refused(await asMigratorDb("UPDATE display_restriction SET subject = 'm8-g' WHERE rule_id = 'mask-store:m8-f'"));
+    });
+
+    it('leaves rules outside the namespace alone, whatever they restrict', async () => {
+      for (const [rule, level, subject, scope] of [
+        ['m8-takedown', 'source', 'm8-shop', 'no_display'],
+        ['Mask-Store:m8-shop', 'image', 'M8', 'no_share'],
+        ['mask-store-m8', 'product', 'm8', 'no_mask'],
+      ] as const) {
+        expect((await insert(rule, level, subject, scope)).exitCode).toBe(0);
       }
     });
   });
@@ -579,7 +639,7 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
   it('still exits 0 on a correctly named directory', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=8');
+    expect(run.output).toContain('applied=0 skipped=9');
   });
 
   it('refuses the whole run when an applied migration has been edited on disk', async () => {
