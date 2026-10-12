@@ -690,20 +690,21 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
       expect(before).not.toMatch(/(^|[{,])=/);
     });
 
-    it('refuses, and keeps nothing, when PUBLIC still holds CONNECT through a grantor other than the owner', async () => {
-      // REVOKE by the owner removes only what the owner granted. A CONNECT a delegate granted to
+    it.each(['CONNECT', 'TEMPORARY'])('refuses, and keeps nothing, when PUBLIC still holds %s through a grantor other than the owner', async (priv) => {
+      // REVOKE by the owner removes only what the owner granted. A privilege a delegate granted to
       // PUBLIC would survive it silently, so the file checks the outcome and rolls itself back.
-      await atEight('fccoord_grantor');
-      expect((await asSuper("CREATE ROLE delegate LOGIN PASSWORD 'delegate-pw' NOSUPERUSER")).exitCode).toBe(0);
-      expect((await psqlAs(MIGRATOR, 'fccoord_grantor', 'GRANT CONNECT ON DATABASE fccoord_grantor TO delegate WITH GRANT OPTION')).exitCode).toBe(0);
-      expect((await psqlAs('delegate', 'fccoord_grantor', 'GRANT CONNECT ON DATABASE fccoord_grantor TO PUBLIC')).exitCode).toBe(0);
+      const db = `fccoord_grantor_${priv.toLowerCase()}`;
+      await atEight(db);
+      await asSuper(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'delegate') THEN CREATE ROLE delegate LOGIN NOSUPERUSER; END IF; END $$`);
+      expect((await psqlAs(MIGRATOR, db, `GRANT ${priv} ON DATABASE ${db} TO delegate WITH GRANT OPTION`)).exitCode).toBe(0);
+      expect((await psqlAs('delegate', db, `GRANT ${priv} ON DATABASE ${db} TO PUBLIC`)).exitCode).toBe(0);
 
-      const run = await migrate({ PGDATABASE: 'fccoord_grantor' });
+      const run = await migrate({ PGDATABASE: db });
       expect(run.exitCode).toBe(3);
       expect(run.output).toMatch(/PUBLIC still holds CONNECT or TEMPORARY/);
-      expect(await ledgerOf('fccoord_grantor')).not.toContain('0009_revoke_public_connect.sql');
-      // Rolled back whole: the owner's own PUBLIC TEMPORARY is still there.
-      expect((await privileges('fccoord_grantor', 'public')).stdout.trim()).toBe('true|true');
+      expect(await ledgerOf(db)).not.toContain('0009_revoke_public_connect.sql');
+      // Rolled back whole: the owner's own PUBLIC CONNECT and TEMPORARY are still there.
+      expect((await privileges(db, 'public')).stdout.trim()).toBe('true|true');
     });
 
     it('refuses, and keeps nothing, when the app role holds no CONNECT of its own', async () => {
