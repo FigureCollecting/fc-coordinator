@@ -33,7 +33,7 @@ describe('migrations — numbered-SQL doctrine', () => {
     // refuses a back-dated prefix (exit 6), so this file can never be added
     // later to a database that has already applied 0001 — it is 0000 or it is a
     // hand-run psql nobody can prove.
-    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql', '0004_sync_transactions.sql', '0005_import.sql', '0006_import_reimport.sql', '0007_display_restriction.sql', '0008_mask_store_revocation.sql']);
+    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql', '0004_sync_transactions.sql', '0005_import.sql', '0006_import_reimport.sql', '0007_display_restriction.sql', '0008_mask_store_revocation.sql', '0009_revoke_public_connect.sql']);
   });
 
   it('contains no transaction control — the runner owns the boundaries (psql -1)', () => {
@@ -101,10 +101,10 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     await pg?.stop();
   });
 
-  it('applies all nine migrations in one run and records them in the ledger', async () => {
+  it('applies all ten migrations in one run and records them in the ledger', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=9 skipped=0');
+    expect(run.output).toContain('applied=10 skipped=0');
 
     const ledger = await asMigratorDb('SELECT filename FROM schema_migrations ORDER BY filename');
     expect(ledger.stdout.trim().split('\n')).toEqual([
@@ -117,13 +117,14 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
       '0006_import_reimport.sql',
       '0007_display_restriction.sql',
       '0008_mask_store_revocation.sql',
+      '0009_revoke_public_connect.sql',
     ]);
   });
 
   it('is a no-op on re-run', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=9');
+    expect(run.output).toContain('applied=0 skipped=10');
   });
 
   // ── The two-role split, proven rather than described ──────────────────────
@@ -606,6 +607,119 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     });
   });
 
+  // ── 0009: the database is closed to PUBLIC, never to its own roles (PGHBA-1) ─────────────
+  // PostgreSQL gives PUBLIC CONNECT and TEMPORARY on every new database, so until 0009 any login
+  // role on the cluster (the spine's own role included) could open a session here, read the whole
+  // catalog and create temp tables. pg_hba on pg-spine (fc-infra) is the brace; this is the belt.
+  // The app role keeps CONNECT through 0000's own grant; the owner keeps everything implicitly.
+  describe('0009_revoke_public_connect: the database is closed to PUBLIC', () => {
+    const FILE = '/repo/migrations/0009_revoke_public_connect.sql';
+    const psqlAs = (user: string, db: string, sql: string): Promise<ExecResult> =>
+      pg.exec(['psql', '-X', '-U', user, '-d', db, '-At', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
+    const privileges = (db: string, role: string): Promise<ExecResult> =>
+      psqlAs('postgres', db,
+        `SELECT has_database_privilege('${role}', '${db}', 'CONNECT') || '|' || has_database_privilege('${role}', '${db}', 'TEMPORARY')`);
+    const ledgerOf = async (db: string): Promise<string[]> =>
+      (await psqlAs('postgres', db, 'SELECT filename FROM schema_migrations ORDER BY filename')).stdout.trim().split('\n');
+    // A database migrated to 0008 with the real runner: prod's state before the roll that ships 0009.
+    const atEight = async (db: string): Promise<void> => {
+      expect((await asSuper(`CREATE DATABASE ${db} OWNER ${MIGRATOR}`)).exitCode).toBe(0);
+      await pg.exec(['sh', '-c', 'rm -rf /tmp/upto8 && mkdir -p /tmp/upto8 && cp /repo/migrations/000[0-8]_*.sql /tmp/upto8/']);
+      const run = await migrate({ PGDATABASE: db }, '/tmp/upto8');
+      expect(run.output).toContain('applied=9 skipped=0');
+    };
+
+    beforeAll(async () => {
+      // A login role with no grant of its own anywhere: what the spine's role is to this database.
+      expect((await asSuper("CREATE ROLE stranger LOGIN PASSWORD 'stranger-pw' NOSUPERUSER")).exitCode).toBe(0);
+    });
+
+    it('takes CONNECT and TEMPORARY from PUBLIC, and leaves the app role its CONNECT', async () => {
+      expect((await privileges(DB, 'public')).stdout.trim()).toBe('false|false');
+      // CONNECT through 0000's explicit grant; TEMPORARY it only ever had through PUBLIC, and it
+      // creates no temp table (src/ has none).
+      expect((await privileges(DB, APP)).stdout.trim()).toBe('true|false');
+      // The owner holds both implicitly: the migrate Job and mask-store.sh are untouched.
+      expect((await privileges(DB, MIGRATOR)).stdout.trim()).toBe('true|true');
+      const app = await asApp('SELECT current_user');
+      expect(app.exitCode).toBe(0);
+      expect(app.stdout.trim()).toBe(APP);
+    });
+
+    it('refuses a login role that holds no grant of its own', async () => {
+      const run = await psqlAs('stranger', DB, 'SELECT 1');
+      expect(run.exitCode).not.toBe(0);
+      expect(run.output).toMatch(/permission denied for database/);
+    });
+
+    it('upgrades a database at 0008 in one step, applied=1 skipped=9, and only then refuses the stranger', async () => {
+      await atEight('fccoord_upgrade');
+      expect((await psqlAs('stranger', 'fccoord_upgrade', 'SELECT 1')).exitCode).toBe(0);
+
+      const run = await migrate({ PGDATABASE: 'fccoord_upgrade' });
+      expect(run.exitCode).toBe(0);
+      expect(run.output).toContain('applied=1 skipped=9');
+      const after = await psqlAs('stranger', 'fccoord_upgrade', 'SELECT 1');
+      expect(after.exitCode).not.toBe(0);
+      expect(after.output).toMatch(/permission denied for database/);
+    });
+
+    it('keeps the CNPG metrics exporter connected where that role exists', async () => {
+      // CNPG creates cnpg_metrics_exporter on every cluster, and its per-database queries reach a
+      // database only through CONNECT, which until now came from PUBLIC alone. The grant is made
+      // only where the role exists, so a plain Postgres (this suite, a developer's) still migrates.
+      expect((await asSuper("CREATE ROLE cnpg_metrics_exporter LOGIN PASSWORD 'exporter-pw' NOSUPERUSER")).exitCode).toBe(0);
+      expect((await asSuper(`CREATE DATABASE fccoord_cnpg OWNER ${MIGRATOR}`)).exitCode).toBe(0);
+      expect((await migrate({ PGDATABASE: 'fccoord_cnpg' })).output).toContain('applied=10 skipped=0');
+
+      expect((await privileges('fccoord_cnpg', 'cnpg_metrics_exporter')).stdout.trim()).toBe('true|false');
+      expect((await psqlAs('cnpg_metrics_exporter', 'fccoord_cnpg', 'SELECT 1')).exitCode).toBe(0);
+      expect((await privileges('fccoord_cnpg', 'public')).stdout.trim()).toBe('false|false');
+      // fccoord migrated before the role existed: no grant was made, and none was needed.
+      expect((await privileges(DB, 'cnpg_metrics_exporter')).stdout.trim()).toBe('false|false');
+    });
+
+    it('is idempotent: the file run again by its owner changes nothing', async () => {
+      // On the database it ran on with every role it names present (CNPG's shape): the same ACL after.
+      const acl = "SELECT datacl::text FROM pg_database WHERE datname = 'fccoord_cnpg'";
+      const before = (await psqlAs('postgres', 'fccoord_cnpg', acl)).stdout.trim();
+      const again = await pg.exec(['psql', '-X', '-U', MIGRATOR, '-d', 'fccoord_cnpg', '-q', '-v', 'ON_ERROR_STOP=1', '-1', '-f', FILE]);
+      expect(again.exitCode).toBe(0);
+      expect((await psqlAs('postgres', 'fccoord_cnpg', acl)).stdout.trim()).toBe(before);
+      expect(before).toContain('cnpg_metrics_exporter=c/');
+      expect(before).not.toMatch(/(^|[{,])=/);
+    });
+
+    it.each(['CONNECT', 'TEMPORARY'])('refuses, and keeps nothing, when PUBLIC still holds %s through a grantor other than the owner', async (priv) => {
+      // REVOKE by the owner removes only what the owner granted. A privilege a delegate granted to
+      // PUBLIC would survive it silently, so the file checks the outcome and rolls itself back.
+      const db = `fccoord_grantor_${priv.toLowerCase()}`;
+      await atEight(db);
+      await asSuper(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'delegate') THEN CREATE ROLE delegate LOGIN NOSUPERUSER; END IF; END $$`);
+      expect((await psqlAs(MIGRATOR, db, `GRANT ${priv} ON DATABASE ${db} TO delegate WITH GRANT OPTION`)).exitCode).toBe(0);
+      expect((await psqlAs('delegate', db, `GRANT ${priv} ON DATABASE ${db} TO PUBLIC`)).exitCode).toBe(0);
+
+      const run = await migrate({ PGDATABASE: db });
+      expect(run.exitCode).toBe(3);
+      expect(run.output).toMatch(/PUBLIC still holds CONNECT or TEMPORARY/);
+      expect(await ledgerOf(db)).not.toContain('0009_revoke_public_connect.sql');
+      // Rolled back whole: the owner's own PUBLIC CONNECT and TEMPORARY are still there.
+      expect((await privileges(db, 'public')).stdout.trim()).toBe('true|true');
+    });
+
+    it('refuses, and keeps nothing, when the app role holds no CONNECT of its own', async () => {
+      // Without 0000's grant the revoke would lock the service out at its next new connection.
+      await atEight('fccoord_noapp');
+      expect((await psqlAs(MIGRATOR, 'fccoord_noapp', `REVOKE CONNECT ON DATABASE fccoord_noapp FROM ${APP}`)).exitCode).toBe(0);
+
+      const run = await migrate({ PGDATABASE: 'fccoord_noapp' });
+      expect(run.exitCode).toBe(3);
+      expect(run.output).toMatch(/would lock the application role coordinator out/);
+      expect(await ledgerOf('fccoord_noapp')).not.toContain('0009_revoke_public_connect.sql');
+      expect((await privileges('fccoord_noapp', 'public')).stdout.trim()).toBe('true|true');
+    });
+  });
+
   it('refuses to run as a SUPERUSER', async () => {
     const run = await migrate({ PGUSER: 'postgres', PGPASSWORD: 'postgres' });
     expect(run.exitCode).toBe(2);
@@ -639,7 +753,7 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
   it('still exits 0 on a correctly named directory', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=9');
+    expect(run.output).toContain('applied=0 skipped=10');
   });
 
   it('refuses the whole run when an applied migration has been edited on disk', async () => {
