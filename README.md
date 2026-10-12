@@ -156,6 +156,11 @@ records the content type and HTTP version of every stream.
   the caller; a withheld primary is replaced by the first image shown. Dropped
   rows do not shorten a page: the coordinator reads on (at most 4 spine pages)
   and resumes mid-page from its own `c1.` token. Denials are logged at info.
+  A row's mask (only when served at exactly `<base>/<mask sha-256>`), its
+  grounding and its thumbhash and colour describe the image as the caller is
+  shown it: a withheld mask is not sent, and the grounding and appearance are
+  then the derivative's own (no grounding for an opaque one). The spine's
+  `topMarginFrac` and opaque box are not sent until CONTRACT-1 adds the fields.
 - **SearchProducts** passes one page through to `SpineRead.SearchProducts`
   (WK-17) with the assertion minted as for GetProducts. The query goes as
   typed; an empty one, or one over 256 code points once NFKC-normalized and
@@ -469,6 +474,33 @@ transaction control in a pending file, `6` out-of-order file.
 | `0005_import.sql` | the MFC import's state: `import_run` and `import_frame` (append-only), the row, copy and field bases, and `import_figure_item` (pending conflicts) |
 | `0006_import_reimport.sql` | `import_copy_base.import_removed` (a copy an import removed), `import_kept_copy` (knowing keeps), `import_export_row` (the latest export's rows, for the discrepancy report), `import_frame.before` (each figure as the import found it) and, append-only, `import_late_edit` (the late edits a Push replayed and APPLIED) and `import_revision` (the revisions that changed a figure) |
 | `0007_display_restriction.sql` | `display_restriction` (rule id, level image/product/source, subject, scope no_display/owner_views_only/no_share/no_mask): data the coordinator reads at the image-list chokepoint; the CHECKs are the writer's rules; the app role may only read it |
+| `0008_mask_store_revocation.sql` | MASK-G: a store's cut-out revocation is one `display_restriction` row, held to one shape by a CHECK: rule `mask-store:<site key>`, level `source`, the site key in lower case, scope `no_mask` (written by `scripts/mask-store.sh`) |
+
+### A store asks for its cut-outs to be removed (MASK-G)
+
+The coordinator's step of the runbook (media-manager's README has the
+media-manager step, fc-infra's docs the whole sequence). Run it as the
+coordinator MIGRATOR, with the environment the migrate Job gives
+`scripts/migrate.sh`:
+
+```
+sh scripts/mask-store.sh revoke <site key>                   # dry run: what it would write
+sh scripts/mask-store.sh revoke <site key> --reason '<ref>' --apply
+sh scripts/mask-store.sh restore <site key> [--apply]        # the undo
+```
+
+`revoke` writes one row (`mask-store:<site key>`, level `source`, scope
+`no_mask`; a second run writes nothing). From then on GetProductImages sends
+every image captured from that store, a picture it shares with another store
+included, with its clean copy and without its mask, grounded and described
+without it; the denial is logged at info under the rule `mask-store:<site key>`.
+It takes effect within the restriction cache period (30 s per coordinator
+process), and a phone drops the masks it kept at its next owned image sync
+(fc-mobile, ADDR-1). `restore` removes that row and no other: a takedown or any
+other restriction naming the store stays, and the script lists them. Exit
+codes: `0` done or nothing to do, `2` refused before connecting, `3` the
+database refused or could not be reached (the app role is refused: it may only
+read restrictions).
 
 ## Shared baseline
 
