@@ -1,0 +1,247 @@
+{
+  "about": [
+    "MASK-G (Ross 2026-10-11, option b): every store's listing photos may get cut-out masks, and each store is revocable.",
+    "A revocation is ONE display_restriction row: rule 'mask-store:<site key>', level 'source', subject the site key, scope 'no_mask'",
+    "(migration 0008, scripts/mask-store.sh). These lists read through GetProductImages in their viewer context.",
+    "images: one product's rows as the spine sends them, in its order: sources (null = not sent), whether it sends a mask, whether",
+    "the derivative has its own alpha. expect.images: what the caller is sent, in order: the mask or not, where the grounding comes",
+    "from (mask | own_alpha | unset) and the appearance (masked | plain). expect.denials: the info lines, in order."
+  ],
+  "lists": [
+    {
+      "name": "granted: every store's mask is sent, the image grounded on it and described with it",
+      "context": "owner",
+      "images": [
+        { "image_id": "a", "primary": true, "sources": ["amiami"], "mask": true, "own_alpha": false },
+        { "image_id": "b", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": false },
+        { "image_id": "c", "primary": false, "sources": ["amiami"], "mask": false, "own_alpha": false }
+      ],
+      "restrictions": [],
+      "expect": {
+        "images": [
+          { "image_id": "a", "primary": true, "mask": true, "grounding": "mask", "appearance": "masked" },
+          { "image_id": "b", "primary": false, "mask": true, "grounding": "mask", "appearance": "masked" },
+          { "image_id": "c", "primary": false, "mask": false, "grounding": "unset", "appearance": "plain" }
+        ],
+        "denials": []
+      }
+    },
+    {
+      "name": "revoke: the store's images keep their clean copy and lose the mask, grounded and described without it",
+      "context": "owner",
+      "images": [
+        { "image_id": "a", "primary": true, "sources": ["amiami"], "mask": true, "own_alpha": false },
+        { "image_id": "b", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": false },
+        { "image_id": "c", "primary": false, "sources": ["amiami"], "mask": false, "own_alpha": false }
+      ],
+      "restrictions": [{ "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" }],
+      "expect": {
+        "images": [
+          { "image_id": "a", "primary": true, "mask": false, "grounding": "unset", "appearance": "plain" },
+          { "image_id": "b", "primary": false, "mask": true, "grounding": "mask", "appearance": "masked" },
+          { "image_id": "c", "primary": false, "mask": false, "grounding": "unset", "appearance": "plain" }
+        ],
+        "denials": [{ "image_id": "a", "withheld": "mask", "rules": ["mask-store:amiami"] }]
+      }
+    },
+    {
+      "name": "restore: with the store's row gone its masks are sent again, and another store's revocation stays",
+      "context": "owner",
+      "images": [
+        { "image_id": "a", "primary": true, "sources": ["amiami"], "mask": true, "own_alpha": false },
+        { "image_id": "b", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": false }
+      ],
+      "restrictions": [{ "rule": "mask-store:hlj", "level": "source", "subject": "hlj", "scope": "no_mask" }],
+      "expect": {
+        "images": [
+          { "image_id": "a", "primary": true, "mask": true, "grounding": "mask", "appearance": "masked" },
+          { "image_id": "b", "primary": false, "mask": false, "grounding": "unset", "appearance": "plain" }
+        ],
+        "denials": [{ "image_id": "b", "withheld": "mask", "rules": ["mask-store:hlj"] }]
+      }
+    },
+    {
+      "name": "a revoked store beside a granted one on the same product, in a shared link",
+      "context": "share_link",
+      "images": [
+        { "image_id": "a", "primary": true, "sources": ["hlj"], "mask": true, "own_alpha": false },
+        { "image_id": "b", "primary": false, "sources": ["amiami"], "mask": true, "own_alpha": false },
+        { "image_id": "c", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": false }
+      ],
+      "restrictions": [{ "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" }],
+      "expect": {
+        "images": [
+          { "image_id": "a", "primary": true, "mask": true, "grounding": "mask", "appearance": "masked" },
+          { "image_id": "b", "primary": false, "mask": false, "grounding": "unset", "appearance": "plain" },
+          { "image_id": "c", "primary": false, "mask": true, "grounding": "mask", "appearance": "masked" }
+        ],
+        "denials": [{ "image_id": "b", "withheld": "mask", "rules": ["mask-store:amiami"] }]
+      }
+    },
+    {
+      "name": "a revoked store beside a granted one on the same product, for an anonymous viewer",
+      "context": "anonymous",
+      "images": [
+        { "image_id": "a", "primary": true, "sources": ["hlj"], "mask": true, "own_alpha": false },
+        { "image_id": "b", "primary": false, "sources": ["amiami"], "mask": true, "own_alpha": false }
+      ],
+      "restrictions": [{ "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" }],
+      "expect": {
+        "images": [
+          { "image_id": "a", "primary": true, "mask": true, "grounding": "mask", "appearance": "masked" },
+          { "image_id": "b", "primary": false, "mask": false, "grounding": "unset", "appearance": "plain" }
+        ],
+        "denials": [{ "image_id": "b", "withheld": "mask", "rules": ["mask-store:amiami"] }]
+      }
+    },
+    {
+      "name": "a picture captured from the revoked store and from a granted one is covered by the revocation",
+      "context": "owner",
+      "images": [
+        { "image_id": "a", "primary": true, "sources": ["hlj", "amiami"], "mask": true, "own_alpha": false },
+        { "image_id": "b", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": false }
+      ],
+      "restrictions": [{ "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" }],
+      "expect": {
+        "images": [
+          { "image_id": "a", "primary": true, "mask": false, "grounding": "unset", "appearance": "plain" },
+          { "image_id": "b", "primary": false, "mask": true, "grounding": "mask", "appearance": "masked" }
+        ],
+        "denials": [{ "image_id": "a", "withheld": "mask", "rules": ["mask-store:amiami"] }]
+      }
+    },
+    {
+      "name": "a revoked image whose derivative has its own alpha is grounded on that alpha",
+      "context": "owner",
+      "images": [
+        { "image_id": "a", "primary": true, "sources": ["amiami"], "mask": true, "own_alpha": true },
+        { "image_id": "b", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": true }
+      ],
+      "restrictions": [{ "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" }],
+      "expect": {
+        "images": [
+          { "image_id": "a", "primary": true, "mask": false, "grounding": "own_alpha", "appearance": "plain" },
+          { "image_id": "b", "primary": false, "mask": true, "grounding": "mask", "appearance": "masked" }
+        ],
+        "denials": [{ "image_id": "a", "withheld": "mask", "rules": ["mask-store:amiami"] }]
+      }
+    },
+    {
+      "name": "precedence: a no_display on the revoked store withholds its images; only no_display is logged",
+      "context": "owner",
+      "images": [
+        { "image_id": "a", "primary": true, "sources": ["amiami"], "mask": true, "own_alpha": false },
+        { "image_id": "b", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": false }
+      ],
+      "restrictions": [
+        { "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" },
+        { "rule": "takedown-1", "level": "source", "subject": "amiami", "scope": "no_display" }
+      ],
+      "expect": {
+        "images": [{ "image_id": "b", "primary": true, "mask": true, "grounding": "mask", "appearance": "masked" }],
+        "denials": [{ "image_id": "a", "withheld": "image", "rules": ["takedown-1"] }]
+      }
+    },
+    {
+      "name": "precedence: a product no_share withholds every image from a shared link; only no_share is logged",
+      "context": "share_link",
+      "images": [
+        { "image_id": "a", "primary": true, "sources": ["amiami"], "mask": true, "own_alpha": false },
+        { "image_id": "b", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": false }
+      ],
+      "restrictions": [
+        { "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" },
+        { "rule": "share-1", "level": "product", "subject": "p-head", "scope": "no_share" }
+      ],
+      "expect": {
+        "images": [],
+        "denials": [
+          { "image_id": "a", "withheld": "image", "rules": ["share-1"] },
+          { "image_id": "b", "withheld": "image", "rules": ["share-1"] }
+        ]
+      }
+    },
+    {
+      "name": "precedence: the same product no_share for the owner withholds only the revoked store's mask",
+      "context": "owner",
+      "images": [
+        { "image_id": "a", "primary": true, "sources": ["amiami"], "mask": true, "own_alpha": false },
+        { "image_id": "b", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": false }
+      ],
+      "restrictions": [
+        { "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" },
+        { "rule": "share-1", "level": "product", "subject": "p-head", "scope": "no_share" }
+      ],
+      "expect": {
+        "images": [
+          { "image_id": "a", "primary": true, "mask": false, "grounding": "unset", "appearance": "plain" },
+          { "image_id": "b", "primary": false, "mask": true, "grounding": "mask", "appearance": "masked" }
+        ],
+        "denials": [{ "image_id": "a", "withheld": "mask", "rules": ["mask-store:amiami"] }]
+      }
+    },
+    {
+      "name": "precedence: an image no_mask on a granted store's image and the revocation each withhold their own mask",
+      "context": "owner",
+      "images": [
+        { "image_id": "a", "primary": true, "sources": ["amiami"], "mask": true, "own_alpha": false },
+        { "image_id": "b", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": false },
+        { "image_id": "c", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": false }
+      ],
+      "restrictions": [
+        { "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" },
+        { "rule": "image-1", "level": "image", "subject": "b", "scope": "no_mask" }
+      ],
+      "expect": {
+        "images": [
+          { "image_id": "a", "primary": true, "mask": false, "grounding": "unset", "appearance": "plain" },
+          { "image_id": "b", "primary": false, "mask": false, "grounding": "unset", "appearance": "plain" },
+          { "image_id": "c", "primary": false, "mask": true, "grounding": "mask", "appearance": "masked" }
+        ],
+        "denials": [
+          { "image_id": "a", "withheld": "mask", "rules": ["mask-store:amiami"] },
+          { "image_id": "b", "withheld": "mask", "rules": ["image-1"] }
+        ]
+      }
+    },
+    {
+      "name": "precedence: a second revocation of the same store under another rule is logged with both",
+      "context": "owner",
+      "images": [{ "image_id": "a", "primary": true, "sources": ["amiami"], "mask": true, "own_alpha": false }],
+      "restrictions": [
+        { "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" },
+        { "rule": "legacy-amiami", "level": "source", "subject": "amiami", "scope": "no_mask" }
+      ],
+      "expect": {
+        "images": [{ "image_id": "a", "primary": true, "mask": false, "grounding": "unset", "appearance": "plain" }],
+        "denials": [{ "image_id": "a", "withheld": "mask", "rules": ["legacy-amiami", "mask-store:amiami"] }]
+      }
+    },
+    {
+      "name": "the spine sent no sources: a revocation in force withholds the mask (fail closed)",
+      "context": "owner",
+      "images": [
+        { "image_id": "a", "primary": true, "sources": null, "mask": true, "own_alpha": false },
+        { "image_id": "b", "primary": false, "sources": ["hlj"], "mask": true, "own_alpha": false }
+      ],
+      "restrictions": [{ "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" }],
+      "expect": {
+        "images": [
+          { "image_id": "a", "primary": true, "mask": false, "grounding": "unset", "appearance": "plain" },
+          { "image_id": "b", "primary": false, "mask": true, "grounding": "mask", "appearance": "masked" }
+        ],
+        "denials": [{ "image_id": "a", "withheld": "mask", "rules": ["mask-store:amiami"] }]
+      }
+    },
+    {
+      "name": "a source the spine spells in another case is still the revoked store",
+      "context": "owner",
+      "images": [{ "image_id": "a", "primary": true, "sources": ["AmiAmi"], "mask": true, "own_alpha": false }],
+      "restrictions": [{ "rule": "mask-store:amiami", "level": "source", "subject": "amiami", "scope": "no_mask" }],
+      "expect": {
+        "images": [{ "image_id": "a", "primary": true, "mask": false, "grounding": "unset", "appearance": "plain" }],
+        "denials": [{ "image_id": "a", "withheld": "mask", "rules": ["mask-store:amiami"] }]
+      }
+    }
+  ]
+}

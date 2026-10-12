@@ -467,6 +467,126 @@ describe('readImageRows', () => {
   });
 });
 
+// The mask, its grounding and the appearance the spine sends with each row (fc-aggregation 0032, raw
+// tokens): read into facts the display decision then applies. A token that is not what the spine writes
+// is read as "not measured", so a field is left unset rather than filled with a guess.
+describe('readImageRows — the mask, the grounding and the appearance', () => {
+  const MASK = 'd'.repeat(64);
+  const grounding = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    bottomMarginFrac: '0.0500',
+    contactBand: { centerXFrac: '0.5383', widthFrac: '0.4267' },
+    topMarginFrac: '0.0618',
+    opaqueBox: { top: '0.0618', bottom: '0.95', left: '0.05', right: '0.95' },
+    ...over,
+  });
+  const mask = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    maskSha256: MASK,
+    contentType: 'image/png',
+    pipelineVersion: 'mask-v2',
+    generatedAt: '2026-10-11 00:00:00+00',
+    url: `${MEDIA}/${MASK}`,
+    grounding: grounding(),
+    thumbhash: Buffer.from([1, 2, 3, 4, 5, 6]).toString('base64'),
+    dominantColor: '#3a2b4c',
+    ...over,
+  });
+  const one = (over: Record<string, unknown>) => {
+    const rows = readImageRows(
+      JSON.stringify({ products: [{ productId: CANNED_HEAD_ID, images: [{ role: 'gallery', primary: true, derivativeSha256: SHA, url: `${MEDIA}/${SHA}`, ...over }] }] }),
+      MEDIA,
+    );
+    return rows![0]!;
+  };
+
+  it('reads the mask served at exactly <base>/<mask id>, its grounding as numbers and its appearance', () => {
+    const r = one({ mask: mask(), thumbhash: Buffer.from([9, 8, 7, 6, 5]).toString('base64'), dominantColor: '#fafaf8', grounding: grounding({ bottomMarginFrac: '0' }) });
+    expect(r.mask?.mask).toMatchObject({ maskId: MASK, contentType: 'image/png', url: `${MEDIA}/${MASK}` });
+    expect(r.mask?.grounding).toEqual({ bottomMarginFrac: 0.05, contactBand: { centerXFrac: 0.5383, widthFrac: 0.4267 } });
+    expect(r.mask?.appearance).toEqual({ thumbhash: Uint8Array.from([1, 2, 3, 4, 5, 6]), dominantColor: '#3a2b4c' });
+    expect(r.own).toEqual({ grounding: { bottomMarginFrac: 0, contactBand: { centerXFrac: 0.5383, widthFrac: 0.4267 } }, appearance: { thumbhash: Uint8Array.from([9, 8, 7, 6, 5]), dominantColor: '#fafaf8' } });
+  });
+
+  it('reads no mask, no own grounding and an unknown appearance from a row that has none', () => {
+    const r = one({});
+    expect(r.mask).toBeNull();
+    expect(r.own).toEqual({ grounding: null, appearance: { thumbhash: new Uint8Array(0), dominantColor: '' } });
+  });
+
+  it.each([
+    ['under another host', { url: `https://images.store.example/d/${MASK}` }],
+    ['with a query after <base>/<id>', { url: `${MEDIA}/${MASK}?raw=1` }],
+    ['with no url', { url: undefined }],
+    ['whose id is not a sha-256', { maskSha256: 'abc', url: `${MEDIA}/abc` }],
+    ['whose id is upper case', { maskSha256: MASK.toUpperCase(), url: `${MEDIA}/${MASK.toUpperCase()}` }],
+    ['whose id is not a string', { maskSha256: 7 }],
+  ])('reads no mask from one %s', (_label, over) => {
+    expect(one({ mask: mask(over) }).mask).toBeNull();
+  });
+
+  it('reads no mask from a mask that is not an object', () => {
+    expect(one({ mask: 'mask' }).mask).toBeNull();
+    expect(one({ mask: null }).mask).toBeNull();
+  });
+
+  it('reads an unknown content type as empty, and a mask with no readable grounding as ungrounded', () => {
+    const r = one({ mask: mask({ contentType: 7, grounding: undefined }) });
+    expect(r.mask?.mask.contentType).toBe('');
+    expect(r.mask?.grounding).toBeNull();
+  });
+
+  it.each([
+    ['a margin over 1', grounding({ bottomMarginFrac: '1.5' })],
+    ['a negative margin', grounding({ bottomMarginFrac: '-0.1' })],
+    ['a margin that is not a decimal', grounding({ bottomMarginFrac: 'abc' })],
+    ['a margin written in exponent form', grounding({ bottomMarginFrac: '5e-2' })],
+    ['a margin sent as a JSON number', grounding({ bottomMarginFrac: 0.05 })],
+    ['a margin with a leading zero run', grounding({ bottomMarginFrac: '00.5' })],
+    ['an empty margin', grounding({ bottomMarginFrac: '' })],
+    ['no margin', grounding({ bottomMarginFrac: undefined })],
+    ['no contact band', grounding({ contactBand: undefined })],
+    ['a contact band that is not an object', grounding({ contactBand: '0.5' })],
+    ['a band centre over 1', grounding({ contactBand: { centerXFrac: '1.01', widthFrac: '0.2' } })],
+    ['a band width that is not a decimal', grounding({ contactBand: { centerXFrac: '0.5', widthFrac: 'wide' } })],
+    ['no band width', grounding({ contactBand: { centerXFrac: '0.5' } })],
+    ['a grounding that is not an object', '0.05'],
+  ])('reads %s as no grounding, on the mask and on the derivative', (_label, g) => {
+    const r = one({ mask: mask({ grounding: g }), grounding: g });
+    expect(r.mask?.grounding).toBeNull();
+    expect(r.own.grounding).toBeNull();
+  });
+
+  it('reads the bounds 0 and 1 as measurements', () => {
+    const g = grounding({ bottomMarginFrac: '1', contactBand: { centerXFrac: '0', widthFrac: '1.0' } });
+    expect(one({ grounding: g }).own.grounding).toEqual({ bottomMarginFrac: 1, contactBand: { centerXFrac: 0, widthFrac: 1 } });
+  });
+
+  it.each([
+    ['not base64', '!!!!'],
+    ['base64 of the wrong length', 'AQIDBAU'],
+    ['base64 with a character past the padding', 'AQIDBAU=A'],
+    ['shorter than a thumbhash header', Buffer.from([1, 2, 3, 4]).toString('base64')],
+    ['longer than 64 bytes', Buffer.alloc(65, 1).toString('base64')],
+    ['not a string', 12],
+  ])('reads a thumbhash that is %s as unknown', (_label, th) => {
+    expect(one({ thumbhash: th, mask: mask({ thumbhash: th }) })).toMatchObject({
+      own: { appearance: { thumbhash: new Uint8Array(0) } },
+      mask: { appearance: { thumbhash: new Uint8Array(0) } },
+    });
+  });
+
+  it('reads thumbhashes of 5 and of 64 bytes', () => {
+    expect(one({ thumbhash: Buffer.alloc(5, 7).toString('base64') }).own.appearance.thumbhash).toEqual(new Uint8Array(5).fill(7));
+    expect(one({ thumbhash: Buffer.alloc(64, 7).toString('base64') }).own.appearance.thumbhash).toEqual(new Uint8Array(64).fill(7));
+  });
+
+  it.each([['#3A2B4C'], ['red'], ['#3a2b4c00'], [' #3a2b4c'], ['#3a2b4'], [null]])('reads the colour %s as unknown', (dc) => {
+    expect(one({ dominantColor: dc, mask: mask({ dominantColor: dc }) })).toMatchObject({
+      own: { appearance: { dominantColor: '' } },
+      mask: { appearance: { dominantColor: '' } },
+    });
+  });
+});
+
 describe('resolveMediaBaseUrl', () => {
   it.each([
     ['unset', {}],

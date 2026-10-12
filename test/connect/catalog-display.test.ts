@@ -8,7 +8,11 @@
 //   (e) the coordinator fails closed: no restriction set, no image (UNAVAILABLE); unknown sources
 //       count as every source;
 //   (f) the contract's golden lists (golden/display-vectors.json) read through THIS chokepoint, in
-//       each list's viewer context, at page sizes 0 (the default), 1 and 2.
+//       each list's viewer context, at page sizes 0 (the default), 1 and 2;
+//   (g) the spine's mask, grounding and appearance reach the caller as the decision says: a mask only
+//       when it is not withheld and is served at exactly <base>/<mask id>, the grounding and the
+//       appearance computed without it otherwise;
+//   (h) MASK-G: a store's revocation (test/fixtures/mask-store-golden.json) through THIS chokepoint.
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import type { AddressInfo } from 'node:net';
@@ -47,6 +51,7 @@ interface Row {
   derivativeSha256: string;
   url?: string;
   sources?: unknown;
+  [extra: string]: unknown;
 }
 const row = (c: string, extra: Partial<Row> = {}): Row => ({ role: 'gallery', primary: false, derivativeSha256: sha(c), url: `${MEDIA}/${sha(c)}`, ...extra });
 const page = (products: { productId: string; images: Row[] }[], nextPageToken = '') =>
@@ -454,6 +459,231 @@ describe('(f) the golden lists, through GetProductImages', () => {
         if (pageToken === '') break;
       }
       expect({ pageSize, images: got }).toEqual({ pageSize, images: l.expect.images });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (g) and (h): the mask, its grounding and the appearance (contract 0.4.0 ProductImage), and MASK-G.
+// ---------------------------------------------------------------------------
+const MASKED_TH = Uint8Array.from([0x3c, 0x18, 0x06, 0x06, 0x0a, 0x7f, 0x86, 0x88, 0x76, 0x88, 0xd8, 0xf8, 0xaa]);
+const PLAIN_TH = Uint8Array.from([0x2b, 0x08, 0x06, 0x06, 0x0a, 0x7f, 0x86, 0x88, 0x76, 0x88, 0xd8, 0xf8]);
+const b64 = (u: Uint8Array): string => Buffer.from(u).toString('base64');
+// The spine's raw tokens (fc-aggregation read/products.ts ImageGrounding), the CONTRACT-1 fields included.
+const MASK_GROUNDING = {
+  bottomMarginFrac: '0.05758426966292135',
+  contactBand: { centerXFrac: '0.5383', widthFrac: '0.4267' },
+  topMarginFrac: '0.0618',
+  opaqueBox: { top: '0.0618', bottom: '0.94241573033707865', left: '0.0517', right: '0.9517' },
+};
+const OWN_GROUNDING = {
+  bottomMarginFrac: '0.03',
+  contactBand: { centerXFrac: '0.499', widthFrac: '0.118' },
+  topMarginFrac: '0.08',
+  opaqueBox: { top: '0.08', bottom: '0.97', left: '0.4', right: '0.6' },
+};
+const spineMask = (m: string, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+  maskSha256: sha(m),
+  contentType: 'image/png',
+  pipelineVersion: 'mask-v2',
+  generatedAt: '2026-10-11 00:00:00+00',
+  url: `${MEDIA}/${sha(m)}`,
+  grounding: MASK_GROUNDING,
+  thumbhash: b64(MASKED_TH),
+  dominantColor: '#3a2b4c',
+  ...over,
+});
+/** A spine row with its plain appearance, its own alpha's grounding when asked, and a mask when given. */
+const maskedRow = (c: string, o: { primary?: boolean; sources?: unknown; mask?: Record<string, unknown> | null; ownAlpha?: boolean; extra?: Record<string, unknown> } = {}): Row =>
+  row(c, {
+    primary: o.primary ?? false,
+    ...(o.sources === undefined ? {} : { sources: o.sources }),
+    thumbhash: b64(PLAIN_TH),
+    dominantColor: '#fafaf8',
+    ...(o.ownAlpha === true ? { grounding: OWN_GROUNDING } : {}),
+    ...(o.mask === undefined || o.mask === null ? {} : { mask: o.mask }),
+    ...o.extra,
+  });
+
+interface SentImage {
+  derivativeId: string;
+  primary: boolean;
+  url: string;
+  mask?: { maskId: string; contentType: string; url: string } | undefined;
+  bottomMarginFrac?: number | undefined;
+  contactBand?: { centerXFrac: number; widthFrac: number } | undefined;
+  thumbhash: Uint8Array;
+  dominantColor: string;
+}
+const sent = (i: SentImage) => ({
+  id: i.derivativeId,
+  primary: i.primary,
+  url: i.url,
+  mask: i.mask === undefined ? undefined : { maskId: i.mask.maskId, contentType: i.mask.contentType, url: i.mask.url },
+  bottomMarginFrac: i.bottomMarginFrac,
+  contactBand: i.contactBand === undefined ? undefined : { centerXFrac: i.contactBand.centerXFrac, widthFrac: i.contactBand.widthFrac },
+  thumbhash: [...i.thumbhash],
+  dominantColor: i.dominantColor,
+});
+const imagesOf = (res: { products: { images: SentImage[] }[] }) => res.products.flatMap((p) => p.images.map(sent));
+const DESCRIBED = {
+  mask: { bottomMarginFrac: 0.05758426966292135, contactBand: { centerXFrac: 0.5383, widthFrac: 0.4267 } },
+  own_alpha: { bottomMarginFrac: 0.03, contactBand: { centerXFrac: 0.499, widthFrac: 0.118 } },
+  unset: { bottomMarginFrac: undefined, contactBand: undefined },
+} as const;
+const LOOK = {
+  masked: { thumbhash: [...MASKED_TH], dominantColor: '#3a2b4c' },
+  plain: { thumbhash: [...PLAIN_TH], dominantColor: '#fafaf8' },
+} as const;
+const sentMask = (m: string) => ({ maskId: sha(m), contentType: 'image/png', url: `${MEDIA}/${sha(m)}` });
+
+describe('(g) the mask, its grounding and the appearance are sent as the decision says', () => {
+  it('sends the spine\'s mask, the grounding measured on it and the appearance with it applied', async () => {
+    harness = await start({
+      restrictions: sourceOf([]),
+      respondImages: () => page([{ productId: H1, images: [maskedRow('a', { primary: true, sources: ['amiami'], mask: spineMask('1') })] }]),
+    });
+    expect(imagesOf(await harness.catalog.getProductImages({ headIds: [H1] }))).toEqual([
+      { id: sha('a'), primary: true, url: `${MEDIA}/${sha('a')}`, mask: sentMask('1'), ...DESCRIBED.mask, ...LOOK.masked },
+    ]);
+    expect(denials(harness.lines)).toEqual([]);
+  });
+
+  it('describes an image with no mask by its own alpha when it has one, else leaves the grounding unset', async () => {
+    harness = await start({
+      restrictions: sourceOf([]),
+      respondImages: () => page([{ productId: H1, images: [maskedRow('a', { primary: true, ownAlpha: true }), maskedRow('b')] }]),
+    });
+    expect(imagesOf(await harness.catalog.getProductImages({ headIds: [H1] }))).toEqual([
+      { id: sha('a'), primary: true, url: `${MEDIA}/${sha('a')}`, mask: undefined, ...DESCRIBED.own_alpha, ...LOOK.plain },
+      { id: sha('b'), primary: false, url: `${MEDIA}/${sha('b')}`, mask: undefined, ...DESCRIBED.unset, ...LOOK.plain },
+    ]);
+  });
+
+  it.each([
+    ['a mask under another host', spineMask('1', { url: `https://images.store.example/d/${sha('1')}` })],
+    ['a mask url that only starts with <base>/<id>', spineMask('1', { url: `${MEDIA}/${sha('1')}?raw=1` })],
+    ['a mask with no url', spineMask('1', { url: undefined })],
+    ['a mask id that is not a sha-256', spineMask('1', { maskSha256: 'abc', url: `${MEDIA}/abc` })],
+    ['an upper-case mask id', spineMask('1', { maskSha256: sha('A'), url: `${MEDIA}/${sha('A')}` })],
+    ['a mask that is not an object', 'mask' as unknown as Record<string, unknown>],
+  ])('sends no mask for %s, describes the image without it and logs nothing withheld', async (_label, mask) => {
+    harness = await start({
+      restrictions: sourceOf([r('mask-store:hlj', 'source', 'hlj', 'no_mask')]),
+      respondImages: () => page([{ productId: H1, images: [maskedRow('a', { primary: true, sources: ['amiami'], mask })] }]),
+    });
+    expect(imagesOf(await harness.catalog.getProductImages({ headIds: [H1] }))).toEqual([
+      { id: sha('a'), primary: true, url: `${MEDIA}/${sha('a')}`, mask: undefined, ...DESCRIBED.unset, ...LOOK.plain },
+    ]);
+    expect(denials(harness.lines)).toEqual([]);
+  });
+
+  it('withholds a revoked store\'s mask in every page of a long list, the clean copies all kept', async () => {
+    const images = ['a', 'b', 'c', 'd', 'e'].map((c, n) =>
+      maskedRow(c, { primary: n === 0, sources: [n % 2 === 0 ? 'amiami' : 'hlj'], mask: spineMask(String(n)) }));
+    harness = await start({
+      restrictions: sourceOf([r('mask-store:amiami', 'source', 'amiami', 'no_mask')]),
+      respondImages: () => page([{ productId: H1, images }]),
+    });
+    const got: { id: string; mask: boolean }[] = [];
+    let pageToken = '';
+    for (let calls = 0; calls < 10; calls += 1) {
+      const res = await harness.catalog.getProductImages({ headIds: [H1], pageSize: 2, pageToken });
+      got.push(...imagesOf(res).map((i) => ({ id: i.id[0]!, mask: i.mask !== undefined })));
+      pageToken = res.nextPageToken;
+      if (pageToken === '') break;
+    }
+    expect(got).toEqual([
+      { id: 'a', mask: false },
+      { id: 'b', mask: true },
+      { id: 'c', mask: false },
+      { id: 'd', mask: true },
+      { id: 'e', mask: false },
+    ]);
+  });
+});
+
+interface StoreGoldenImage {
+  image_id: string;
+  primary: boolean;
+  sources: string[] | null;
+  mask: boolean;
+  own_alpha: boolean;
+}
+interface StoreGoldenList {
+  name: string;
+  context: ViewerContext;
+  images: StoreGoldenImage[];
+  restrictions: DisplayRestriction[];
+  expect: {
+    images: { image_id: string; primary: boolean; mask: boolean; grounding: keyof typeof DESCRIBED; appearance: keyof typeof LOOK }[];
+    denials: { image_id: string; withheld: 'image' | 'mask'; rules: string[] }[];
+  };
+}
+const storeGolden = JSON.parse(
+  readFileSync(new URL('../fixtures/mask-store-golden.json', import.meta.url), 'utf8'),
+) as { lists: StoreGoldenList[] };
+/** Image a's mask is 0, b's is 1, and so on: a mask's address is never its image's. */
+const maskOf = (imageId: string): string => String.fromCharCode(0x30 + imageId.charCodeAt(0) - 0x61);
+
+describe('(h) MASK-G: a store\'s revocation, through GetProductImages', () => {
+  it('reads all 14 lists', () => {
+    expect(storeGolden.lists).toHaveLength(14);
+  });
+
+  it.each(storeGolden.lists.map((l) => [l.name, l] as const))('%s', async (_name, l) => {
+    const subject = (x: string): string => (x === 'p-head' ? H1 : /^[a-f]$/.test(x) ? sha(x) : x);
+    harness = await start({
+      viewerContext: l.context,
+      restrictions: sourceOf(l.restrictions.map((x) => r(x.rule, x.level, subject(x.subject), x.scope))),
+      respondImages: () => page([{
+        productId: H1,
+        images: l.images.map((i) => maskedRow(i.image_id, {
+          primary: i.primary,
+          ...(i.sources === null ? {} : { sources: i.sources }),
+          mask: i.mask ? spineMask(maskOf(i.image_id)) : null,
+          ownAlpha: i.own_alpha,
+        })),
+      }]),
+    });
+    const want = l.expect.images.map((e) => ({
+      id: sha(e.image_id),
+      primary: e.primary,
+      url: `${MEDIA}/${sha(e.image_id)}`,
+      mask: e.mask ? sentMask(maskOf(e.image_id)) : undefined,
+      ...DESCRIBED[e.grounding],
+      ...LOOK[e.appearance],
+    }));
+    for (const pageSize of [0, 1, 2]) {
+      harness.lines.length = 0;
+      const got: ReturnType<typeof sent>[] = [];
+      let pageToken = '';
+      for (let calls = 0; calls < 10; calls += 1) {
+        const res = await harness.catalog.getProductImages({ headIds: [H1], pageSize, pageToken });
+        got.push(...imagesOf(res));
+        pageToken = res.nextPageToken;
+        if (pageToken === '') break;
+      }
+      expect({ pageSize, images: got }).toEqual({ pageSize, images: want });
+      expect({
+        pageSize,
+        denials: denials(harness.lines).map((d) => ({
+          image_id: String(d['image_id'])[0],
+          withheld: d['withheld'],
+          rules: (d['denials'] as { rule: string }[]).map((x) => x.rule),
+          level: d['level'],
+          context: d['context'],
+          sources_known: d['sources_known'],
+        })),
+      }).toEqual({
+        pageSize,
+        denials: l.expect.denials.map((e) => ({
+          ...e,
+          level: 'info',
+          context: l.context,
+          sources_known: l.images.find((i) => i.image_id === e.image_id)!.sources !== null,
+        })),
+      });
     }
   });
 });
