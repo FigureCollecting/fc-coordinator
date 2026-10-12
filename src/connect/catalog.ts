@@ -673,9 +673,13 @@ export function presentImage(image: ProductImage, row: ImageRow, decision: Displ
   return image;
 }
 
-/** A list of strings, or null: anything else is read as "not known", which fails closed. */
+/**
+ * A non-empty list of strings, or null: anything else is read as "not known", which fails closed. An
+ * empty list too: the spine always names the image's own capture, so [] is a fault, never "no store",
+ * and reading it as "no store" would let a store's revocation miss the image.
+ */
 const sourcesOf = (raw: unknown): string[] | null =>
-  Array.isArray(raw) && raw.every((x): x is string => typeof x === 'string') ? raw : null;
+  Array.isArray(raw) && raw.length > 0 && raw.every((x): x is string => typeof x === 'string') ? raw : null;
 
 /** The most GetProducts pages one resolution may read for one batch: a spine that never ends is a fault. */
 export const MAX_RESOLVE_PAGES = 10;

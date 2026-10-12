@@ -9,8 +9,11 @@
 --                                        another restriction naming the store (a takedown's no_display)
 --   level    'source'                   every image captured from the store, a picture it shares with
 --                                        another store included (catalog.proto DISPLAY RESTRICTIONS)
---   subject  the store's site key (the spine's source.site), with no upper-case letter: the evaluator
---            folds A-Z, so one spelling per store keeps a second row for the same store out
+--   subject  the store's site key (the spine's source.site), in its grammar ^[a-z0-9]+(-[a-z0-9]+)*$
+--            (amiami, hobby-genki): no upper-case letter, since the evaluator folds A-Z and one
+--            spelling per store keeps a second row for the same store out; and never a domain or any
+--            other spelling, which no source.site can equal, so its row would withhold nothing.
+--            scripts/mask-store.sh refuses the same keys before it connects.
 --   scope    'no_mask'                  the clean copy stays; the mask, and the grounding and appearance
 --                                        derived from it, are withheld from every viewer context
 --
@@ -22,4 +25,5 @@
 
 ALTER TABLE display_restriction ADD CONSTRAINT display_restriction_mask_store
   CHECK (rule_id NOT LIKE 'mask-store:%'
-         OR (level = 'source' AND scope = 'no_mask' AND subject !~ '[A-Z]' AND rule_id = 'mask-store:' || subject));
+         OR (level = 'source' AND scope = 'no_mask' AND subject ~ '^[a-z0-9]+(-[a-z0-9]+)*$'
+             AND rule_id = 'mask-store:' || subject));

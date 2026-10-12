@@ -7,13 +7,17 @@
 #   sh scripts/mask-store.sh restore <source> [--apply]
 #
 # <source> is the store's site key (the spine's source.site, media-manager's gallery source): white
-# space around it is dropped and A-Z folded to a-z, as the coordinator matches it. Without --apply it
-# only prints what it would do. A revocation is one display_restriction row (migration 0008):
+# space around it is dropped and A-Z folded to a-z, as the coordinator matches it, and what is left
+# must be a site key, ^[a-z0-9]+(-[a-z0-9]+)*$ (amiami, hobby-genki), or it is refused: a domain or
+# any other spelling can never equal a source.site, so its row would withhold nothing. The grammar is
+# all the script can check. It cannot see the spine, so whether the key IS a source.site is the
+# runbook's read-only SELECT before --apply. Without --apply it only prints what it would do.
+# A revocation is one display_restriction row (migration 0008, whose CHECK holds the same grammar):
 # rule mask-store:<source>, level source, scope no_mask. GetProductImages then sends every image
-# captured from the store with its clean copy and without its mask (and the grounding and appearance
-# that come from it), within the coordinator's restriction cache period (30 s, src/display/source.ts);
-# a phone drops the masks it kept at its next owned sync. restore removes that row and nothing else:
-# any other restriction naming the store stays, and is listed.
+# whose spine sources include the store with its clean copy and without its mask (and the grounding
+# and appearance that come from it), within the coordinator's restriction cache period (30 s,
+# src/display/source.ts); a phone drops the masks it kept at its next owned sync. restore removes
+# that row and nothing else: any other restriction naming the store stays, and is listed.
 #
 # Connection: the libpq environment, as scripts/migrate.sh takes it (PGDATABASE and PGUSER required;
 # PGHOST, PGPORT, PGPASSWORD, PGSSLMODE, ...). Run it as the coordinator MIGRATOR: the app role may
@@ -55,10 +59,15 @@ while [ $# -gt 0 ]; do
 done
 
 # The site key as the coordinator matches it: surrounding white space dropped, A-Z folded, nothing else.
+# shellcheck disable=SC2018,SC2019 # ASCII only on purpose, as foldAsciiCase (src/display/restrictions.ts)
 key=$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr 'A-Z' 'a-z')
 [ -n "$key" ] || die 2 "the source is empty"
+# The spine's site-key grammar, ^[a-z0-9]+(-[a-z0-9]+)*$, as a pattern list (LC_ALL=C: bytes, so a
+# letter outside ASCII is outside a-z): only a-z, 0-9 and '-', and no '-' at either end or twice in a row.
 case $key in
-  *[[:space:]]* | *[[:cntrl:]]*) die 2 "a site key has no white space or control character inside it" ;;
+  *[!a-z0-9-]* | -* | *- | *--*)
+    die 2 "'$key' is not a site key: a spine source.site matches ^[a-z0-9]+(-[a-z0-9]+)*$ (amiami, hobby-genki), never a domain or a URL"
+    ;;
 esac
 # rule_id holds 128 characters (0007), 11 of them 'mask-store:'.
 [ ${#key} -le 117 ] || die 2 "the source is longer than 117 characters"
@@ -67,7 +76,7 @@ rule="mask-store:$key"
 [ -n "${PGDATABASE:-}" ] || die 2 "set PGDATABASE to the coordinator's database"
 [ -n "${PGUSER:-}" ] || die 2 "set PGUSER to the coordinator migrator role"
 command -v psql >/dev/null 2>&1 || die 2 "psql not on PATH"
-export PGAPPNAME=${PGAPPNAME:-fccoord-mask-store}
+export PGAPPNAME="${PGAPPNAME:-fccoord-mask-store}"
 
 q() { psql -X -q -At -v ON_ERROR_STOP=1 -v key="$key" -v rule="$rule" -v reason="$reason" -f - 2>&1; }
 
@@ -95,7 +104,7 @@ if [ -n "$since" ]; then say "$key: revoked since $since"; else say "$key: not r
 
 if [ "$apply" -eq 0 ]; then
   case $action:$since in
-    revoke:) say "DRY RUN: --apply would add rule $rule (level source, scope no_mask): every image captured from $key keeps its clean copy and loses its mask" ;;
+    revoke:) say "DRY RUN: --apply would add rule $rule (level source, scope no_mask): images whose spine sources include $key keep their clean copy and lose their mask" ;;
     revoke:*) say "DRY RUN: already revoked, --apply would write nothing" ;;
     restore:) say "DRY RUN: not revoked, --apply would remove nothing" ;;
     restore:*) say "DRY RUN: --apply would remove rule $rule" ;;
@@ -112,7 +121,7 @@ RETURNING 'written';
 SQL
   ) || die 3 "the revocation was not written: $done"
   if [ "$done" = written ]; then
-    say "REVOKED $key: rule $rule written; GetProductImages withholds its masks within the coordinator's restriction cache period (30 s), and a phone drops the masks it kept at its next owned sync"
+    say "REVOKED $key: rule $rule written; each coordinator reads it within its restriction cache period (30 s), and it applies only for images whose spine sources include $key (a phone drops their masks at its next owned sync)"
   else
     say "$key was already revoked (since $since): nothing written"
   fi
