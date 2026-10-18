@@ -243,6 +243,33 @@ describe('(b) GetProducts maps through the display-key allowlist', () => {
     expect(card.derivativeIds).toEqual([]);
   });
 
+  it('carries the height the fake spine states, and leaves the width and depth it does not unset', async () => {
+    harness = await start();
+
+    // The fake's record states a height of '245' and nothing else.
+    const card = (await harness.catalog.getProducts({ refs: [gtinRef()] })).products[0]!;
+    expect(card.heightMm).toBe(245);
+    expect(card.widthMm).toBeUndefined();
+    expect(card.depthMm).toBeUndefined();
+  });
+
+  it('carries the Elsa shape end to end: a height and a depth, a half rounded up, no width on the wire', async () => {
+    const record = cannedProductRecord([{ gtin14: GTIN }], true);
+    Object.assign(record['display'] as Record<string, unknown>, { heightMm: '60', depthMm: '190.5' });
+    harness = await start({
+      respondProducts: () =>
+        create(WireProductsResponseSchema, {
+          productsJson: productsJson({ products: [record], unresolved: [], coverage: {} }),
+        }),
+    });
+
+    const card = (await harness.catalog.getProducts({ refs: [gtinRef()] })).products[0]!;
+    expect(card.heightMm).toBe(60);
+    expect(card.widthMm).toBeUndefined();
+    expect(card.depthMm).toBe(191);
+    expect(toJsonString(ProductCardSchema, card)).not.toContain('widthMm');
+  });
+
   it('carries as_of PER FIELD, canonicalised to UTC with six fractional digits', async () => {
     harness = await start();
 
@@ -776,6 +803,19 @@ describe('(f) SearchProducts — field mapping', () => {
     for (const leak of ['images.store.example', 'originals', 'SHOULD-NEVER-SHIP', 'mysteryKey', 'imageUrl', 'stockOnHand']) {
       expect(wire).not.toContain(leak);
     }
+  });
+
+  it('carries the physical size the spine states on a hit, and leaves an unstated one unset', async () => {
+    const sized = hit(CANNED_HEAD_ID);
+    Object.assign(sized['display'] as Record<string, unknown>, { heightMm: '270', widthMm: '335', depthMm: '335' });
+    harness = await start({
+      respondSearch: () => create(WireSearchResponseSchema, { productsJson: searchJson([sized, hit(hitId(2))]) }),
+    });
+
+    const [first, second] = (await harness.catalog.searchProducts({ query: 'takarabako' })).products;
+    expect([first?.heightMm, first?.widthMm, first?.depthMm]).toEqual([270, 335, 335]);
+    // The fake's own record states a height only.
+    expect([second?.heightMm, second?.widthMm, second?.depthMm]).toEqual([245, undefined, undefined]);
   });
 
   it('gives a hit an EMPTY requested_as, even when the spine echoes a ref: this request named none', async () => {
