@@ -432,6 +432,18 @@ const refList = (value: unknown): ProductRef[] =>
   (Array.isArray(value) ? value : []).map(coordinatorRef).filter((r): r is ProductRef => r !== null);
 
 /**
+ * A spine dimension (display.heightMm, widthMm, depthMm) as the card's uint32
+ * millimetres: rounded half up from a decimal the spine sends as a string (or a
+ * number). The contract reads unset as unknown, never 0, so anything that is not
+ * a positive decimal that fits a uint32 once rounded is left unset.
+ */
+const millimetres = (raw: unknown): number | undefined => {
+  const n = typeof raw === 'string' && DECIMAL.test(raw) ? Number(raw) : raw;
+  const mm = typeof n === 'number' ? Math.round(n) : 0;
+  return mm > 0 && mm <= UINT32_MAX ? mm : undefined;
+};
+
+/**
  * One spine ProductRecord -> one ProductCard, through the allowlist. `null`
  * when the record names no product: a card without a head cannot be keyed,
  * and dropping it silently would make the client's row count lie.
@@ -463,6 +475,9 @@ export function toProductCard(record: unknown): ProductCard | null {
     releaseYm: text('releaseYm'),
     gtin14s,
     contentLevel: contentLevelOf(r['attrs']),
+    heightMm: millimetres(display['heightMm']),
+    widthMm: millimetres(display['widthMm']),
+    depthMm: millimetres(display['depthMm']),
     // The spine's display record carries no derivative; GetProductImages does.
     derivativeIds: [],
   });
@@ -623,7 +638,7 @@ const surfaceOf = (o: Json): SurfaceFacts => ({
   },
 });
 
-/** PostgreSQL's numeric text for a fraction: digits, at most one point, no sign or exponent. */
+/** PostgreSQL's numeric text for a fraction or a length: digits, at most one point, no sign or exponent. */
 const DECIMAL = /^(?:0|[1-9]\d*)(?:\.\d+)?$/;
 const DOMINANT_COLOR = /^#[0-9a-f]{6}$/;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;

@@ -5,6 +5,7 @@
  * kinds, junk identifiers, a malformed image row — and the allowlist ITSELF.
  */
 import { describe, expect, it } from 'vitest';
+import { fromBinary, isFieldSet, toBinary } from '@bufbuild/protobuf';
 import { ProductCardSchema } from '@figurecollecting/fc-api-contract';
 import {
   CARD_TEXT_ALLOWLIST,
@@ -12,6 +13,7 @@ import {
   MAX_CATALOG_REFS,
   readImageRows,
   readProductsPayload,
+  readSearchPayload,
   resolveMediaBaseUrl,
   toProductCard,
 } from '../../src/connect/catalog.js';
@@ -179,6 +181,103 @@ describe('toProductCard — as_of', () => {
   ])('is empty, never raw, when the claim time is %s', (_label, asOf) => {
     const card = toProductCard(record({ character: facet({ value: 'Miku', asOf }) }));
     expect(card?.character).toMatchObject({ value: 'Miku', asOf: '' });
+  });
+});
+
+describe('toProductCard — dimensions', () => {
+  // catalog.proto: whole millimetres, rounded half up from the spine's value; unset means unknown, never 0.
+  const MM_FIELDS = ['heightMm', 'widthMm', 'depthMm'] as const;
+  type MmField = (typeof MM_FIELDS)[number];
+
+  // Presence, not value: a 0 on the wire would read as a stated size of nothing.
+  const isSet = (card: NonNullable<ReturnType<typeof toProductCard>>, field: MmField): boolean =>
+    isFieldSet(card, ProductCardSchema.field[field]);
+
+  it('carries the Elsa shape: a height and a depth, and no width', () => {
+    const card = toProductCard(record({}, { heightMm: '60', depthMm: '190' }))!;
+    expect(card.heightMm).toBe(60);
+    expect(card.depthMm).toBe(190);
+    expect(card.widthMm).toBeUndefined();
+    expect(isSet(card, 'widthMm')).toBe(false);
+  });
+
+  it('carries all three, as the spine sends them: numeric strings', () => {
+    const card = toProductCard(record({}, { heightMm: '270', widthMm: '335', depthMm: '335' }))!;
+    expect([card.heightMm, card.widthMm, card.depthMm]).toEqual([270, 335, 335]);
+  });
+
+  it('carries all three when the spine sends numbers', () => {
+    const card = toProductCard(record({}, { heightMm: 270, widthMm: 335, depthMm: 190 }))!;
+    expect([card.heightMm, card.widthMm, card.depthMm]).toEqual([270, 335, 190]);
+  });
+
+  it.each(MM_FIELDS)('reads %s on its own, leaving the other two unset', (field) => {
+    const card = toProductCard(record({}, { [field]: '150' }))!;
+    for (const f of MM_FIELDS) {
+      expect(card[f]).toBe(f === field ? 150 : undefined);
+      expect(isSet(card, f)).toBe(f === field);
+    }
+  });
+
+  it('leaves all three unset when the display record names none', () => {
+    const card = toProductCard(record({}, { name: 'No size' }))!;
+    for (const f of MM_FIELDS) expect(isSet(card, f)).toBe(false);
+  });
+
+  it.each([
+    ['zero', '0'],
+    ['zero as a number', 0],
+    ['a negative', '-5'],
+    ['a negative number', -5],
+    ['a decimal that rounds to zero', '0.4'],
+    ['empty', ''],
+    ['blank', ' '],
+    ['not numeric', 'abc'],
+    ['a number with a unit', '60mm'],
+    ['an exponent', '1e3'],
+    ['hexadecimal', '0x10'],
+    ['padded', ' 60 '],
+    ['a leading plus', '+60'],
+    ['a leading zero', '060'],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['null', null],
+    ['a boolean', true],
+    ['an object', { mm: 60 }],
+    ['a list', ['60']],
+    ['past uint32 as a string', '4294967296'],
+    ['past uint32 as a number', 4_294_967_296],
+    ['rounding up past uint32', '4294967295.5'],
+  ])('leaves a dimension unset for %s, never 0', (_label, value) => {
+    const card = toProductCard(record({}, { heightMm: value, widthMm: value, depthMm: value }))!;
+    for (const f of MM_FIELDS) {
+      expect(card[f]).toBeUndefined();
+      expect(isSet(card, f)).toBe(false);
+    }
+  });
+
+  it.each([
+    ['190.5', 191],
+    ['190.4', 190],
+    ['190.49', 190],
+    ['0.5', 1],
+    ['59.999', 60],
+    ['60.0', 60],
+    [190.5, 191],
+    [190.4, 190],
+    ['1', 1],
+    ['4294967294.5', 4_294_967_295],
+    ['4294967295', 4_294_967_295],
+  ])('rounds %j half up to %i', (value, expected) => {
+    const card = toProductCard(record({}, { heightMm: value, widthMm: value, depthMm: value }))!;
+    expect([card.heightMm, card.widthMm, card.depthMm]).toEqual([expected, expected, expected]);
+  });
+
+  it('reaches the wire as a stated size, and an unset one stays off it', () => {
+    const card = toProductCard(record({}, { heightMm: '60', depthMm: '190' }))!;
+    const back = fromBinary(ProductCardSchema, toBinary(ProductCardSchema, card));
+    expect([back.heightMm, back.depthMm]).toEqual([60, 190]);
+    expect(isSet(back, 'widthMm')).toBe(false);
   });
 });
 
@@ -379,6 +478,22 @@ describe('readProductsPayload', () => {
 
   it('refuses a payload with a product it cannot identify', () => {
     expect(readProductsPayload(JSON.stringify({ products: [record({}), { productId: null }] }))).toBeNull();
+  });
+});
+
+// GetProducts and SearchProducts both build their cards with toProductCard; each path is pinned here
+// so one cannot be rewired off it without a red test. test/connect/catalog.test.ts takes both over the wire.
+describe('the product paths carry the dimensions', () => {
+  const sized = record({}, { heightMm: '60', depthMm: '190' });
+
+  it('readProductsPayload (GetProducts)', () => {
+    const card = readProductsPayload(JSON.stringify({ products: [sized] }))?.products[0];
+    expect([card?.heightMm, card?.widthMm, card?.depthMm]).toEqual([60, undefined, 190]);
+  });
+
+  it('readSearchPayload (SearchProducts)', () => {
+    const card = readSearchPayload(JSON.stringify({ products: [sized] }))?.[0];
+    expect([card?.heightMm, card?.widthMm, card?.depthMm]).toEqual([60, undefined, 190]);
   });
 });
 
