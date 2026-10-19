@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { fromBinary, isFieldSet, toBinary } from '@bufbuild/protobuf';
-import { ProductCardSchema } from '@figurecollecting/fc-api-contract';
+import { ProductCardSchema, ProductKind } from '@figurecollecting/fc-api-contract';
 import {
   CARD_TEXT_ALLOWLIST,
   CONTENT_LEVELS,
@@ -181,6 +181,83 @@ describe('toProductCard — as_of', () => {
   ])('is empty, never raw, when the claim time is %s', (_label, asOf) => {
     const card = toProductCard(record({ character: facet({ value: 'Miku', asOf }) }));
     expect(card?.character).toMatchObject({ value: 'Miku', asOf: '' });
+  });
+});
+
+describe('toProductCard — category and kind', () => {
+  // catalog.proto 0.5.0: `category` is the source's own name, `kind` what the spine's table made of it; unset kind means unknown, never UNSPECIFIED.
+  const kindSet = (card: NonNullable<ReturnType<typeof toProductCard>>): boolean => isFieldSet(card, ProductCardSchema.field['kind']);
+
+  it('carries the towel shape: the category Linens as the spine shows it, dated by its claim, and the goods kind', () => {
+    const card = toProductCard(
+      record({ category: facet({ value: 'Linens', asOf: '2026-09-02 11:00:00+00' }) }, { category: 'Linens', kind: 'goods' }),
+    )!;
+    expect(card.category).toMatchObject({ value: 'Linens', asOf: '2026-09-02T11:00:00.000000Z' });
+    expect(card.kind).toBe(ProductKind.GOODS);
+  });
+
+  it('carries a category the display shows with no claim behind it, undated', () => {
+    const card = toProductCard(record({}, { category: 'Prepainted', kind: 'figure' }))!;
+    expect(card.category).toMatchObject({ value: 'Prepainted', asOf: '' });
+    expect(card.kind).toBe(ProductKind.FIGURE);
+  });
+
+  it.each([
+    ['figure', ProductKind.FIGURE],
+    ['goods', ProductKind.GOODS],
+    ['media', ProductKind.MEDIA],
+  ] as const)('reads the spine kind %s as the contract kind', (spine, expected) => {
+    expect(toProductCard(record({}, { kind: spine }))?.kind).toBe(expected);
+  });
+
+  it('leaves the category and the kind unset when the display record names neither', () => {
+    const card = toProductCard(record({}, { name: 'No category' }))!;
+    expect(card.category).toBeUndefined();
+    expect(kindSet(card)).toBe(false);
+  });
+
+  it.each([
+    ['empty', ''],
+    ['blank', ' '],
+    ['another case (the spine sends lower case)', 'FIGURE'],
+    ['padded', ' goods '],
+    ['the contract spelling', 'PRODUCT_KIND_GOODS'],
+    ['a name nobody has defined', 'toy'],
+    ['unspecified', 'unspecified'],
+    ['an object property name', 'constructor'],
+    ['the prototype key', '__proto__'],
+    ['an inherited method name', 'toString'],
+    ['a number', 2],
+    ['null', null],
+    ['a boolean', true],
+    ['an object', { kind: 'goods' }],
+    ['a list', ['goods']],
+  ])('leaves the kind unset for %s, never UNSPECIFIED on the wire', (_label, value) => {
+    const card = toProductCard(record({}, { category: 'Mystery Box', kind: value }))!;
+    expect(card.kind).toBeUndefined();
+    expect(kindSet(card)).toBe(false);
+    // the category is the source's own name and travels whether or not the kind is known
+    expect(card.category?.value).toBe('Mystery Box');
+  });
+
+  it('shows a category whose kind the spine could not place', () => {
+    const card = toProductCard(record({ category: facet({ value: 'Mystery Box' }) }, { category: 'Mystery Box' }))!;
+    expect(card.category?.value).toBe('Mystery Box');
+    expect(kindSet(card)).toBe(false);
+  });
+
+  it('never shows a bare term uuid as the category', () => {
+    const uuid = '0d6f6e1a-1111-4222-8333-444455556666';
+    const card = toProductCard(record({ category: facet({ kind: 'term', value: uuid }) }, { category: uuid }))!;
+    expect(card.category).toBeUndefined();
+  });
+
+  it('reaches the wire as a stated kind and category, and an unknown kind stays off it', () => {
+    const goods = fromBinary(ProductCardSchema, toBinary(ProductCardSchema, toProductCard(record({}, { category: 'Linens', kind: 'goods' }))!));
+    expect([goods.kind, goods.category?.value]).toEqual([ProductKind.GOODS, 'Linens']);
+    const odd = fromBinary(ProductCardSchema, toBinary(ProductCardSchema, toProductCard(record({}, { category: 'Mystery Box' }))!));
+    expect(kindSet(odd)).toBe(false);
+    expect(odd.category?.value).toBe('Mystery Box');
   });
 });
 

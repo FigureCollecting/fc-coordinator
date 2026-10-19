@@ -85,6 +85,7 @@ import {
   ImageMaskSchema,
   ProductCardSchema,
   ProductImageSchema,
+  ProductKind,
   ProductImagesSchema,
   ProductRefSchema,
   SearchProductsResponseSchema,
@@ -157,6 +158,7 @@ export const CARD_TEXT_ALLOWLIST = {
   scale: { display: 'scale', claim: 'scale' },
   releaseYm: { display: 'releaseYm', claim: null },
   contentLevel: { display: null, claim: 'contentLevel' },
+  category: { display: 'category', claim: 'category' },
 } as const satisfies Record<string, { display: string | null; claim: string | null }>;
 
 /**
@@ -444,6 +446,20 @@ const millimetres = (raw: unknown): number | undefined => {
 };
 
 /**
+ * The spine's display.kind (figure | goods | media, from its one category table)
+ * as the contract's ProductKind. Exact lower-case names only: anything else, and
+ * an absent kind, stays unset, because unset is how the contract says "unknown"
+ * and a client then treats the product as a figure; UNSPECIFIED is never sent.
+ */
+const KIND_BY_SPINE_NAME: Readonly<Record<string, ProductKind>> = {
+  figure: ProductKind.FIGURE,
+  goods: ProductKind.GOODS,
+  media: ProductKind.MEDIA,
+};
+const kindOf = (raw: unknown): ProductKind | undefined =>
+  typeof raw === 'string' && Object.hasOwn(KIND_BY_SPINE_NAME, raw) ? KIND_BY_SPINE_NAME[raw] : undefined;
+
+/**
  * One spine ProductRecord -> one ProductCard, through the allowlist. `null`
  * when the record names no product: a card without a head cannot be keyed,
  * and dropping it silently would make the client's row count lie.
@@ -478,6 +494,8 @@ export function toProductCard(record: unknown): ProductCard | null {
     heightMm: millimetres(display['heightMm']),
     widthMm: millimetres(display['widthMm']),
     depthMm: millimetres(display['depthMm']),
+    category: text('category'),
+    kind: kindOf(display['kind']),
     // The spine's display record carries no derivative; GetProductImages does.
     derivativeIds: [],
   });

@@ -32,7 +32,7 @@ import {
   GetProductsResponseSchema as WireProductsResponseSchema,
   SearchProductsResponseSchema as WireSearchResponseSchema,
 } from '@figurecollecting/ingest-contract/read';
-import { CatalogService, CompareService, ProductCardSchema } from '@figurecollecting/fc-api-contract';
+import { CatalogService, CompareService, ProductCardSchema, ProductKind } from '@figurecollecting/fc-api-contract';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../../src/app.js';
 import { SpineReadClient } from '../../src/spine/spineReadClient.js';
@@ -268,6 +268,30 @@ describe('(b) GetProducts maps through the display-key allowlist', () => {
     expect(card.widthMm).toBeUndefined();
     expect(card.depthMm).toBe(191);
     expect(toJsonString(ProductCardSchema, card)).not.toContain('widthMm');
+  });
+
+  it('carries the towel end to end: the category Linens and the goods kind, and a figure beside it', async () => {
+    const towel = cannedProductRecord([{ gtin14: GTIN }], true);
+    Object.assign(towel['display'] as Record<string, unknown>, { category: 'Linens', kind: 'goods' });
+    harness = await start({
+      respondProducts: () =>
+        create(WireProductsResponseSchema, {
+          productsJson: productsJson({ products: [towel], unresolved: [], coverage: {} }),
+        }),
+    });
+
+    const card = (await harness.catalog.getProducts({ refs: [gtinRef()] })).products[0]!;
+    expect(card.category?.value).toBe('Linens');
+    expect(card.kind).toBe(ProductKind.GOODS);
+  });
+
+  it('leaves the kind off the wire when the fake spine states none, as for any product before the spine knew it', async () => {
+    harness = await start();
+
+    const card = (await harness.catalog.getProducts({ refs: [gtinRef()] })).products[0]!;
+    expect(card.kind).toBeUndefined();
+    expect(card.category).toBeUndefined();
+    expect(toJsonString(ProductCardSchema, card)).not.toContain('kind');
   });
 
   it('carries as_of PER FIELD, canonicalised to UTC with six fractional digits', async () => {
@@ -816,6 +840,18 @@ describe('(f) SearchProducts — field mapping', () => {
     expect([first?.heightMm, first?.widthMm, first?.depthMm]).toEqual([270, 335, 335]);
     // The fake's own record states a height only.
     expect([second?.heightMm, second?.widthMm, second?.depthMm]).toEqual([245, undefined, undefined]);
+  });
+
+  it('carries the category and the kind the spine states on a hit, and leaves an unstated one unset', async () => {
+    const towel = hit(CANNED_HEAD_ID);
+    Object.assign(towel['display'] as Record<string, unknown>, { category: 'Linens', kind: 'goods' });
+    harness = await start({
+      respondSearch: () => create(WireSearchResponseSchema, { productsJson: searchJson([towel, hit(hitId(2))]) }),
+    });
+
+    const [first, second] = (await harness.catalog.searchProducts({ query: 'towel' })).products;
+    expect([first?.category?.value, first?.kind]).toEqual(['Linens', ProductKind.GOODS]);
+    expect([second?.category, second?.kind]).toEqual([undefined, undefined]);
   });
 
   it('gives a hit an EMPTY requested_as, even when the spine echoes a ref: this request named none', async () => {
