@@ -18,14 +18,15 @@
     "test:coverage": "vitest run --coverage",
     "migrate": "sh scripts/migrate.sh",
     "proto:generate": "buf generate",
-    "phase2": "tsx scripts/phase2-client/cli.ts"
+    "phase2": "tsx scripts/phase2-client/cli.ts",
+    "gk2-import": "tsx scripts/gk2-import/cli.ts"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.15.0",
     "@connectrpc/connect": "^2.2.0",
     "@connectrpc/connect-fastify": "^2.2.0",
     "@connectrpc/connect-node": "^2.2.0",
-    "@figurecollecting/fc-api-contract": "^0.5.0",
+    "@figurecollecting/fc-api-contract": "^0.6.0",
     "@figurecollecting/fc-shared": "^1.7.0",
     "@figurecollecting/ingest-contract": "^0.9.0",
     "@opentelemetry/api": "^1.9.1",

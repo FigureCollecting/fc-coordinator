@@ -386,7 +386,7 @@ describe('Push', () => {
     expect(feed.events.map((e) => e.facetKey)).toEqual([statusKey, headKey]);
   });
 
-  it('applies one edit of every 0.3.0 user-owned family, and Delta serves each byte for byte', async () => {
+  it('applies one edit of every user-owned family, and Delta serves each byte for byte', async () => {
     const caller = await SyncCaller.enrol(h);
     const [occ, head, tag, coll] = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
     const edits: [string, object][] = [
@@ -398,6 +398,8 @@ describe('Push', () => {
       [ufFacetKey(head, 'score'), { score: 9 }],
       [ufFacetKey(head, 'note'), { note: 'boxed' }],
       [ufFacetKey(head, 'wishability'), { wishability: 3 }],
+      [ufFacetKey(head, 'label'), { name: 'Yor Forger', maker: 'Atlas Studio', scale: '1/6' }],
+      [ufFacetKey(head, 'refs'), { links: [{ url: 'https://www.gkloot.com/_p16584.html', label: 'GKLoot' }] }],
       [ufTagKey(head, tag), {}],
       [ufKindTagKey(head, 'wished', tag), {}],
       [collNameKey('former', coll), { name: 'Sold on' }],
