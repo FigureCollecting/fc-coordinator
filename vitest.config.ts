@@ -36,6 +36,8 @@ export default defineConfig({
         // out, nothing else. Every decision is in main.ts, which is covered; this file is run
         // for real by test/phase2-client/main.test.ts as a child process.
         'scripts/phase2-client/cli.ts',
+        // The GK2 import's entrypoint, on the same terms: argv in, exit code out; the decisions are in main.ts.
+        'scripts/gk2-import/cli.ts',
       ],
       thresholds: {
         // PER FILE, not a repo-wide average. The estate standard is 85% on
