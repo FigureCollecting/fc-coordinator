@@ -207,6 +207,8 @@ function keyFor(family: Family, i: number): string {
     case 'uf/score':
     case 'uf/note':
     case 'uf/wishability':
+    case 'uf/label':
+    case 'uf/refs':
       return ufFacetKey(pick(HEADS, i), family.slice(3) as 'score');
     case 'uf/tag':
       return ufTagKey(pick(HEADS, i), pick(TAGS, i));
@@ -256,6 +258,10 @@ function payloadFor(family: Family, n: number): string {
         return { note: `note ${n}` };
       case 'uf/wishability':
         return { wishability: 1 + (n % 5) };
+      case 'uf/label':
+        return { name: `figure ${n}` };
+      case 'uf/refs':
+        return { links: [{ url: `https://shop.example/${n}` }] };
       case 'coll/name':
       case 'tag/name':
         return { name: `name ${n}` };

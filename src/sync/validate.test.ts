@@ -138,6 +138,16 @@ describe('validateEvent', () => {
     'uf/score': { key: ufFacetKey(HEAD, 'score'), valid: { score: 10 }, invalid: { score: 11 } },
     'uf/note': { key: ufFacetKey(HEAD, 'note'), valid: { note: 'x'.repeat(10_000) }, invalid: { note: 'x'.repeat(10_001) } },
     'uf/wishability': { key: ufFacetKey(HEAD, 'wishability'), valid: { wishability: 5 }, invalid: { wishability: 6 } },
+    'uf/label': {
+      key: ufFacetKey(HEAD, 'label'),
+      valid: { name: 'Atlas Studio - Yor Forger - 1/6', maker: 'Atlas Studio', scale: '1/6', edition: 'Luxury ver' },
+      invalid: { name: '' },
+    },
+    'uf/refs': {
+      key: ufFacetKey(HEAD, 'refs'),
+      valid: { links: [{ url: 'https://www.gkloot.com/_p16584.html', label: 'GKLoot' }] },
+      invalid: { links: [{ url: 'javascript:alert(1)' }] },
+    },
     'uf/tag': { key: ufTagKey(HEAD, TAG), valid: {}, invalid: { tag: TAG } },
     'uf/ktag': { key: ufKindTagKey(HEAD, 'ordered', TAG), valid: {}, invalid: { kind: 'ordered' } },
     'coll/name': { key: collNameKey('wished', 'default'), valid: { name: 'Grails' }, invalid: { name: '' } },
@@ -183,7 +193,9 @@ describe('validateEvent', () => {
   it.each(USER_FACET_FAMILIES.flatMap((sent) => USER_FACET_FAMILIES.filter((under) => under !== sent).map((under) => [sent, under])))(
     "checks %s's payload under %s against the key's own schema",
     (sent, under) => {
-      expect(check(FAMILIES[under].key, FAMILIES[sent].valid).ok).toBe(rules(sent) === rules(under));
+      // The one overlap by design: a label needs only its name, so a collection's or a tag's name payload is a valid label.
+      const aLabel = under === 'uf/label' && (sent === 'coll/name' || sent === 'tag/name');
+      expect(check(FAMILIES[under].key, FAMILIES[sent].valid).ok).toBe(rules(sent) === rules(under) || aLabel);
     },
   );
 
