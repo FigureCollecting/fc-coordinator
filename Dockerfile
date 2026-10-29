@@ -10,10 +10,10 @@
 # ============================================================================
 # Base Stage
 # ============================================================================
-FROM node:24.21.0-slim AS base
+FROM node:24.22.1-slim AS base
 
 # Cache-bust ARG to invalidate layers when security patches are needed.
-ARG CACHE_BUST=2026-09-14-node24.21.0-npm11.19.1
+ARG CACHE_BUST=2026-10-29-node24.22.1-npm11.19.1
 
 WORKDIR /app
 
@@ -57,9 +57,9 @@ RUN npm run build
 # ============================================================================
 # Production Stage — minimal runtime
 # ============================================================================
-FROM node:24.21.0-slim AS production
+FROM node:24.22.1-slim AS production
 
-ARG CACHE_BUST=2026-09-14-node24.21.0-npm11.19.1
+ARG CACHE_BUST=2026-10-29-node24.22.1-npm11.19.1
 ARG GITHUB_ORG=FigureCollecting
 ARG GITHUB_REPO=fc-coordinator
 ARG SERVICE_VERSION=0.0.0
