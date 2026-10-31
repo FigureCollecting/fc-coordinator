@@ -71,7 +71,7 @@ export const MAX_QUEUED_PUSHES = 8;
 /**
  * The largest request body read, before any handler runs. 200 notes of 10,000 U+0001, which
  * JSON.stringify writes as \u0001 and the JSON envelope escapes again, each with the longest
- * basis (the cursor of the largest seq), are 14,073,154 bytes.
+ * basis (the cursor of the largest seq) and a well-formed origin_trace, are 14,082,954 bytes.
  */
 export const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 

@@ -983,7 +983,8 @@ describe('a user whose Pushes queue behind its lock', () => {
 
 // 200 events of the largest payload JSON.stringify writes for a valid facet: a 10,000 code point
 // note of U+0001 is \u0001 each, 7 bytes once the JSON envelope escapes the backslash. Each
-// carries the longest basis there is, the cursor of the largest seq.
+// carries the longest basis there is, the cursor of the largest seq, and a well-formed
+// origin_trace (0.7.0), 49 bytes more.
 describe('the Connect read cap', () => {
   const CAP = 16 * 1024 * 1024;
 
@@ -995,11 +996,12 @@ describe('the Connect read cap', () => {
       ({
         ...upsert(ufFacetKey(randomUUID(), 'note'), canonicalVersion({ instant: at, counter: 9_999_999_999 - i, deviceId: caller.deviceId }), payload),
         basis: encodeCursor(MAX_SEQ),
+        originTrace: randomUUID().replaceAll('-', ''),
       }),
     );
     const request = { clientId: '~'.repeat(128), events };
     const bytes = Buffer.byteLength(toJsonString(PushRequestSchema, create(PushRequestSchema, request)));
-    expect(bytes).toBe(14_073_154);
+    expect(bytes).toBe(14_082_954);
     expect(bytes).toBeLessThan(CAP);
 
     const res = ok(await caller.push(request));
