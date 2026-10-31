@@ -1,6 +1,7 @@
 // The sync log seam (LGMOB C2a) through the real app on a real database: one sync.push line per
 // Push, written only once its transaction has committed, carrying the request's trace, the
-// outcome counts and replay, and nothing the client sent.
+// outcome counts and replay, and nothing the client sent. LGMOB C2b adds what the server measures
+// of a placed Push on that same line: each event's age bucket, the oldest, and resend_stale.
 import { randomBytes, randomUUID } from 'node:crypto';
 import {
   MAX_FUTURE_SKEW_MS,
@@ -13,7 +14,7 @@ import {
 } from '@figurecollecting/fc-api-contract';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startTelemetry, type Telemetry } from '../../src/platform/telemetry.js';
-import { SYNC_LOG_FIELDS } from '../../src/sync/pushLog.js';
+import { AGE_BUCKETS, SYNC_LOG_FIELDS } from '../../src/sync/pushLog.js';
 import type { HoldPolicy } from '../../src/sync/service.js';
 import { DISPLAY, ok, startSyncApp, SyncCaller, type SyncApp } from '../helpers/syncClient.js';
 import { startSyncDatabase, type SyncDatabase } from '../helpers/syncDatabase.js';
@@ -162,6 +163,117 @@ describe('the sync.push line', () => {
       expect(line).not.toHaveProperty('replay');
       expect(line).not.toHaveProperty('applied');
     }
+  });
+});
+
+const HOUR_MS = 3_600_000;
+
+describe('the sync delay on the sync.push line', () => {
+  it('counts each event by the age of its version, names the oldest, labelled as read from the version, with the request\'s trace', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const { traceId, traceparent } = trace();
+    caller.headers = { traceparent };
+    const mark = log.mark();
+    const res = ok(
+      await caller.push({
+        clientId: randomUUID(),
+        events: [
+          upsert(occFacetKey(randomUUID(), 'status'), mint(caller, -3 * HOUR_MS), status('owned')),
+          upsert(occFacetKey(randomUUID(), 'status'), mint(caller, -30_000), status('owned')),
+          // A phone whose clock runs 2 s ahead: within its offset error, so not ahead.
+          upsert(occFacetKey(randomUUID(), 'status'), mint(caller, 2_000), status('owned')),
+          upsert(ufFacetKey(randomUUID(), 'score'), mint(caller, MAX_FUTURE_SKEW_MS + 60_000), JSON.stringify({ score: 8, ...DISPLAY })),
+          upsert(occFacetKey(randomUUID(), 'status'), 'not a version', status('owned')),
+        ],
+      }),
+    );
+    expect(res.results.map((r) => r.outcome)).toEqual([PushOutcome.APPLIED, PushOutcome.APPLIED, PushOutcome.APPLIED, PushOutcome.REJECTED, PushOutcome.REJECTED]);
+
+    const lines = log.sync(mark);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      msg: 'sync.push',
+      events: 5,
+      reasons: { version_future: 1, version_malformed: 1 },
+      age_basis: 'version',
+      // The version_future reject is aged ahead; the malformed version is not aged.
+      ages: { '<6h': 1, '<1m': 1, '<10s': 1, ahead: 1 },
+      oldest_age: '<6h',
+      resend_stale: 0,
+    });
+    expect(Object.keys(lines[0]!['ages'] as object).sort()).toEqual(['<10s', '<1m', '<6h', 'ahead']);
+    expect(traceIdOf(lines[0]!)).toBe(traceId);
+  });
+
+  it('ages nothing on a replay: its edits arrived with the Push it repeats', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const batch = { clientId: randomUUID(), events: [upsert(occFacetKey(randomUUID(), 'status'), mint(caller, -3 * HOUR_MS), status('owned'))] };
+    const mark = log.mark();
+    ok(await caller.push(batch));
+    ok(await caller.push(batch));
+
+    const lines = log.sync(mark);
+    expect(lines).toEqual([
+      expect.objectContaining({ replay: false, age_basis: 'version', ages: { '<6h': 1 }, oldest_age: '<6h', resend_stale: 0 }),
+      expect.objectContaining({ replay: true, duplicate: 1, age_basis: 'version', ages: {}, oldest_age: 'none', resend_stale: 0 }),
+    ]);
+  });
+
+  it('carries no age on a Push that failed: its edits are aged when a retry places them', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const mark = log.mark();
+    await caller.push({ clientId: 'a client id', events: [upsert(occFacetKey(randomUUID(), 'status'), mint(caller, -3 * HOUR_MS), status('owned'))] });
+    const lines = log.sync(mark);
+    expect(lines).toEqual([expect.objectContaining({ outcome: 'error', events: 1 })]);
+    for (const field of ['age_basis', 'ages', 'oldest_age', 'resend_stale']) expect(lines[0]).not.toHaveProperty(field);
+  });
+
+  it('is only ever a bucket name and a count, never a delay or an instant', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const versions = [mint(caller, -3 * HOUR_MS - 4_321), mint(caller, -26 * HOUR_MS)];
+    const mark = log.mark();
+    ok(await caller.push({ clientId: randomUUID(), events: versions.map((v) => upsert(occFacetKey(randomUUID(), 'status'), v, status('owned'))) }));
+
+    const [line] = log.sync(mark);
+    expect(AGE_BUCKETS).toContain(line!['oldest_age']);
+    for (const [bucket, count] of Object.entries(line!['ages'] as Record<string, unknown>)) {
+      expect(AGE_BUCKETS).toContain(bucket);
+      expect(Number.isInteger(count)).toBe(true);
+    }
+    const own = JSON.stringify(Object.fromEntries(Object.entries(line!).filter(([field]) => !LOGGER_FIELDS.has(field))));
+    expect(own).not.toMatch(/\d{4}-\d{2}-\d{2}T|\d{5,}/);
+  });
+});
+
+describe('resend_stale on the sync.push line, a client-bug detector that should read 0', () => {
+  it('counts an identical edit sent again under a new client_id, and not an edit merely older than the stored one', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const resent = upsert(occFacetKey(randomUUID(), 'status'), mint(caller, -60_000), status('owned'));
+    const olderKey = occFacetKey(randomUUID(), 'status');
+    ok(await caller.push({ clientId: randomUUID(), events: [resent, upsert(olderKey, mint(caller, -30_000), status('owned'))] }));
+
+    const mark = log.mark();
+    const res = ok(await caller.push({ clientId: randomUUID(), events: [resent, upsert(olderKey, mint(caller, -90_000), status('wished'))] }));
+    expect(res.results.map((r) => r.outcome)).toEqual([PushOutcome.STALE, PushOutcome.STALE]);
+    expect(log.sync(mark)).toEqual([expect.objectContaining({ replay: false, stale: 2, resend_stale: 1 })]);
+  });
+
+  it('counts the same edit twice in one batch', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const twice = upsert(occFacetKey(randomUUID(), 'status'), mint(caller), status('owned'));
+    const mark = log.mark();
+    const res = ok(await caller.push({ clientId: randomUUID(), events: [twice, twice] }));
+    expect(res.results.map((r) => r.outcome)).toEqual([PushOutcome.APPLIED, PushOutcome.STALE]);
+    expect(log.sync(mark)).toEqual([expect.objectContaining({ applied: 1, stale: 1, resend_stale: 1 })]);
+  });
+
+  it('reads 0 on the ordinary resend, the same batch under its own client_id: that is replay=true', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const batch = { clientId: randomUUID(), events: [upsert(occFacetKey(randomUUID(), 'status'), mint(caller), status('owned'))] };
+    ok(await caller.push(batch));
+    const mark = log.mark();
+    ok(await caller.push(batch));
+    expect(log.sync(mark)).toEqual([expect.objectContaining({ replay: true, duplicate: 1, resend_stale: 0 })]);
   });
 });
 
