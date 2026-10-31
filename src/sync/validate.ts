@@ -14,6 +14,7 @@ import {
   USER_FACET_PAYLOAD_SCHEMAS,
   parseUserFacetKey,
   parseVersion,
+  type ParsedVersion,
   type PushRejectReason,
   type SyncEvent,
   type UserFacetFamily,
@@ -38,13 +39,20 @@ export interface EventContext {
   nowMicros: bigint;
 }
 
-export type Verdict =
+type Outcome =
   /** basisSeq: the seq the event's basis names, 0 for '' (no transaction applied yet). */
   | { ok: true; basisSeq: bigint }
   /** userOwned: the key is one of rule 6's user-owned forms, so `current` may be returned. */
   | { ok: false; reason: string; userOwned: boolean };
 
-const reject = (code: PushRejectReason, detail: string, userOwned = true): Verdict => ({
+/**
+ * micros: the version's instant in epoch microseconds, on every verdict whose version is in the
+ * grammar (a refused one too, so a version_future reject is aged ahead); undefined when it is not.
+ * The sync delay is measured from it (./pushLog.ts), so the version is parsed once.
+ */
+export type Verdict = Outcome & { micros: bigint | undefined };
+
+const reject = (code: PushRejectReason, detail: string, userOwned = true): Outcome => ({
   ok: false,
   reason: `${code}: ${detail}`,
   userOwned,
@@ -53,7 +61,12 @@ const reject = (code: PushRejectReason, detail: string, userOwned = true): Verdi
 // sync.proto: the REJECTED checks run in the listed order, all before STALE, REVIEW, HELD or
 // APPLIED routing, so a past-bound event is version_future whatever its key, device or stored version.
 export function validateEvent(event: Pick<SyncEvent, 'facetKey' | 'version' | 'op' | 'payload' | 'basis'>, ctx: EventContext): Verdict {
-  const payload = checkPayload(event, ctx);
+  const version = parseVersion(event.version);
+  return { ...check(event, version, ctx), micros: version?.micros };
+}
+
+function check(event: Pick<SyncEvent, 'facetKey' | 'op' | 'payload' | 'basis'>, version: ParsedVersion | undefined, ctx: EventContext): Outcome {
+  const payload = checkPayload(event, version, ctx);
   if (payload !== undefined) return payload;
   // A basis is a commit_cursor this server issued, or '' (the start of the feed, 0). One past
   // the head is still a basis: an outbox minted before a restore keeps its bases (rule 6).
@@ -64,11 +77,10 @@ export function validateEvent(event: Pick<SyncEvent, 'facetKey' | 'version' | 'o
 }
 
 /** Every check before basis_missing, in the listed order; undefined when the event passes them. */
-function checkPayload(event: Pick<SyncEvent, 'facetKey' | 'version' | 'op' | 'payload'>, ctx: EventContext): Verdict | undefined {
+function checkPayload(event: Pick<SyncEvent, 'facetKey' | 'op' | 'payload'>, version: ParsedVersion | undefined, ctx: EventContext): Outcome | undefined {
   const key = parseUserFacetKey(event.facetKey);
   const userOwned = key !== undefined;
 
-  const version = parseVersion(event.version);
   if (version === undefined || (userOwned && version.counter === null)) {
     return reject('version_malformed', 'not the grammar; a user-owned facet needs <instant>#<counter>#<device>', userOwned);
   }

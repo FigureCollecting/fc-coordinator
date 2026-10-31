@@ -45,16 +45,18 @@ const event = (over: Partial<{ facetKey: string; version: string; op: SyncOp; pa
   basis: '',
   ...over,
 });
+/** The instant of the default event's version, at(-1000), in epoch microseconds. */
+const MICROS = NOW_MICROS - 1_000_000n;
 /** Accepted, minted before the client had applied any transaction (basis ''). */
-const OK = { ok: true, basisSeq: 0n };
+const OK = { ok: true, basisSeq: 0n, micros: MICROS };
 
 describe('validateEvent', () => {
   it('reads the basis as the seq its cursor names', () => {
-    expect(validateEvent(event({ basis: encodeCursor(42n) }), ctx)).toEqual({ ok: true, basisSeq: 42n });
+    expect(validateEvent(event({ basis: encodeCursor(42n) }), ctx)).toEqual({ ok: true, basisSeq: 42n, micros: MICROS });
   });
 
   it('refuses an event with no basis, an UPSERT or a DELETE, as basis_missing', () => {
-    const missing = { ok: false, reason: 'basis_missing: the event carries no basis', userOwned: true };
+    const missing = { ok: false, reason: 'basis_missing: the event carries no basis', userOwned: true, micros: MICROS };
     expect(validateEvent(event({ basis: undefined }), ctx)).toEqual(missing);
     expect(validateEvent(event({ basis: undefined, op: SyncOp.DELETE, payload: '' }), ctx)).toEqual(missing);
   });
@@ -66,7 +68,7 @@ describe('validateEvent', () => {
   it.each(['x', 'djE6MDA', Buffer.from('v1:0').toString('base64url'), Buffer.from('v1:-1').toString('base64url'), `${encodeCursor(1n)}=`])(
     'refuses a basis that is not a cursor (%s) as basis_missing',
     (basis) => {
-      expect(validateEvent(event({ basis }), ctx)).toEqual({ ok: false, reason: 'basis_missing: the basis is not a cursor', userOwned: true });
+      expect(validateEvent(event({ basis }), ctx)).toEqual({ ok: false, reason: 'basis_missing: the basis is not a cursor', userOwned: true, micros: MICROS });
     },
   );
 
@@ -93,7 +95,7 @@ describe('validateEvent', () => {
 
   it('accepts a version exactly at the skew bound and refuses one microsecond past it', () => {
     const bound = canonicalVersion({ instant: new Date(NOW.getTime() + MAX_FUTURE_SKEW_MS), counter: 0, deviceId: DEVICE });
-    expect(validateEvent(event({ version: bound }), ctx)).toEqual(OK);
+    expect(validateEvent(event({ version: bound }), ctx)).toEqual({ ...OK, micros: NOW_MICROS + BigInt(MAX_FUTURE_SKEW_MS) * 1000n });
     expect(validateEvent(event({ version: bound }), { ...ctx, nowMicros: NOW_MICROS - 1n })).toMatchObject({
       ok: false,
       reason: expect.stringMatching(/^version_future: /),
@@ -231,7 +233,7 @@ describe('validateEvent', () => {
     const at = (payload: string) => validateEvent(event({ facetKey: noteKey, payload }), ctx);
     expect(MAX_PAYLOAD_BYTES).toBe(65_536);
     expect(at(padded('x', MAX_PAYLOAD_BYTES))).toEqual(OK);
-    const over = { ok: false, reason: 'payload_invalid: payload over 65536 bytes', userOwned: true };
+    const over = { ok: false, reason: 'payload_invalid: payload over 65536 bytes', userOwned: true, micros: MICROS };
     expect(at(padded('x', MAX_PAYLOAD_BYTES + 1))).toEqual(over);
     // 10,000 three-byte characters: fewer UTF-16 units than the cap, more UTF-8 bytes.
     const wide = padded('\u20ac'.repeat(10_000), MAX_PAYLOAD_BYTES + 1);
@@ -272,6 +274,31 @@ describe('validateEvent', () => {
     // A bare code matches the reason's code; a full reason must match exactly.
     expect(verdict.ok === false && (reason.includes(':') ? verdict.reason : verdict.reason.split(':')[0])).toBe(reason);
   });
+
+  // The event's sync delay is server_now minus this instant (src/sync/pushLog.ts), read from the one parse.
+  it.each([
+    ['an accepted event', {}],
+    ['a past-bound version (version_future)', { version: at(MAX_FUTURE_SKEW_MS + 60_000) }],
+    ['a past-bound version on a server-owned key', { facetKey: SERVER_OWNED, version: at(MAX_FUTURE_SKEW_MS + 60_000) }],
+    ['a bare instant on a user-owned key (version_malformed)', { version: at(-3_600_000).slice(0, 27) }],
+    ['a server-owned key', { facetKey: SERVER_OWNED, version: at(-3_600_000) }],
+    ['another device', { version: at(-3_600_000, '9c1e3a5b-7d9f-1b3d-5f7a-9c1e3b5d7f9a') }],
+    ['a payload outside its schema', { version: at(-3_600_000), payload: '{}' }],
+    ['a missing basis', { version: at(-3_600_000), basis: undefined }],
+  ])('gives the version instant with %s', (_why, over) => {
+    const version = (over as { version?: string }).version ?? at(-1000);
+    const expected = BigInt(Date.parse(version.slice(0, 23) + 'Z')) * 1000n + BigInt(version.slice(23, 26));
+    expect(validateEvent(event(over), ctx).micros).toBe(expected);
+  });
+
+  it.each(['x', '', '2026-09-26T11:00:00Z#0000000003#0f3a5c7e9b1d2f4a6c8e0b2d4f6a8c0e', `${at(-1000)}#extra`])(
+    'gives no instant when the version %j is not in the grammar',
+    (version) => {
+      const verdict = validateEvent(event({ version }), ctx);
+      expect(verdict).toMatchObject({ ok: false, reason: expect.stringMatching(/^version_malformed: /) });
+      expect(verdict).toHaveProperty('micros', undefined);
+    },
+  );
 
   it('names the failing location without echoing the payload', () => {
     const verdict = validateEvent(event({ payload: JSON.stringify({ status: 'secret-value', ...DISPLAY }) }), ctx);

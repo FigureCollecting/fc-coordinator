@@ -32,7 +32,7 @@ import {
 } from '@figurecollecting/fc-api-contract';
 import { kCallerDevice, kCallerSubject } from '../connect/identity.js';
 import { decodeCursor, encodeCursor } from './cursor.js';
-import { PUSH_LINE, pushErrorLine, pushLine, type SyncLog } from './pushLog.js';
+import { PUSH_LINE, pushErrorLine, pushLine, type Arrival, type SyncLog } from './pushLog.js';
 import { KeyedSerialiser, QueueFull } from './serialise.js';
 import {
   FeedTransaction,
@@ -115,10 +115,11 @@ export interface SyncRoutesDeps {
 
 const noLog: SyncLog = () => {};
 
-/** A Push the server answered, and whether the answer replayed a receipt. */
+/** A Push the server answered, whether the answer replayed a receipt, and what it read as it placed the events (none on a replay). */
 interface Placed {
   response: PushResponse;
   replay: boolean;
+  arrival?: Arrival;
 }
 
 interface Caller {
@@ -263,7 +264,8 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
       await deps.imports?.applied(tx, caller.userId, applied);
       const response = create(PushResponseSchema, { results });
       await writeReceipt(tx, caller.userId, req.clientId, requestSha256, Buffer.from(outcomesOf(response)));
-      return { response, replay: false };
+      const arrival = { nowMicros: now.micros, instants: verdicts.map((verdict) => verdict.micros), versions: facets.map((facet) => facet.version) };
+      return { response, replay: false, arrival };
     };
     try {
       // The signal aborts when the client goes away, which drops this Push if it is still queued.
@@ -290,7 +292,7 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
       log('warn', pushErrorLine(err, req.events.length), PUSH_LINE);
       throw err;
     }
-    log('info', pushLine(placed.response, placed.replay), PUSH_LINE);
+    log('info', pushLine(placed.response, placed.replay, placed.arrival), PUSH_LINE);
     return placed.response;
   };
 

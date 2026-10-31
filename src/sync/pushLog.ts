@@ -1,10 +1,27 @@
 // The sync log seam: what SyncService writes about a Push, one `sync.push` line per Push, never one
 // per event. A line is built from what the server answered (PushResponse) or the Connect code it
-// failed with, never from what the client sent, and every field goes through the allow-list below
-// before it reaches the logger. The logger adds the request's trace (src/platform/logger.ts).
+// failed with, and from what the server measured as it placed the Push (Arrival): ages and counts,
+// never a value the client sent. Every field goes through the allow-list below before it reaches
+// the logger. The logger adds the request's trace (src/platform/logger.ts).
 //
 // NEVER on a line: SyncEvent.version (it carries the DPoP device id), facet_key, payload, basis,
-// commit_cursor, client_id, the sub, the device id, or a reason's detail (only its code).
+// commit_cursor, client_id, the sub, the device id, a reason's detail (only its code), or a raw
+// delay or instant (only its age bucket: the exact value would date the user's edit).
+//
+// THE SYNC DELAY of an event is server_now minus its version instant: the phone's HLC, anchored to
+// the offset it measured against server_now (sync.proto rule 5). It is an ESTIMATE, wrong in either
+// direction, and the line says so with age_basis=version:
+// - too long: an edit minted on a phone clock running behind the server, or under a stale offset
+//   kept from an earlier session, keeps its low version (fc-mobile's rebase re-versions only the
+//   edits ahead of the present);
+// - too short: a rebase re-version or a version_future re-mint restarts the clock, and an edit
+//   minted on top of a base written later (by a fast-clock device, or the import) takes that base's
+//   instant (Hlc.tick(base));
+// - slightly negative for a fresh edit: the phone samples the offset at the midpoint of a probe
+//   whose round trip it clamps to 3 s (fc-mobile src/sync/engine.ts PROBE_TIMEOUT_MS), so the offset
+//   is off by up to about 1.5 s, and it pushes about 1 s after the write. A delay from 3 s ahead to
+//   10 s is therefore `<10s`, and only a version more than 3 s ahead is `ahead`.
+// Nothing is clamped: every delay lands in the one bucket its value names.
 import { Code, ConnectError } from '@connectrpc/connect';
 import { codeToString } from '@connectrpc/connect/protocol-connect';
 import { PUSH_REJECT_REASONS, PushOutcome, type PushResponse } from '@figurecollecting/fc-api-contract';
@@ -29,7 +46,18 @@ const OUTCOME_FIELDS: Record<PushOutcome, string> = {
 };
 
 /** Every field a sync line may carry; any other is dropped before the line is written. */
-export const SYNC_LOG_FIELDS: ReadonlySet<string> = new Set(['outcome', 'replay', 'events', ...Object.values(OUTCOME_FIELDS), 'reasons', 'code']);
+export const SYNC_LOG_FIELDS: ReadonlySet<string> = new Set([
+  'outcome',
+  'replay',
+  'events',
+  ...Object.values(OUTCOME_FIELDS),
+  'reasons',
+  'code',
+  'age_basis',
+  'ages',
+  'oldest_age',
+  'resend_stale',
+]);
 
 /** `fields` with only the keys `allowed` names. */
 export function allowListed(fields: Record<string, unknown>, allowed: ReadonlySet<string> = SYNC_LOG_FIELDS): Record<string, unknown> {
@@ -44,22 +72,106 @@ function reasonCode(reason: string): string {
   return REJECT_CODES.has(code) ? code : 'other';
 }
 
+const SECOND = 1_000_000n;
+const MINUTE = 60n * SECOND;
+const HOUR = 60n * MINUTE;
+const DAY = 24n * HOUR;
+
+/** A version further ahead of server_now than this is `ahead`; one less far is within the phone's offset error. */
+export const AHEAD_BEYOND_MICROS = 3n * SECOND;
+
+/** Each bucket below `ahead` and the delay it runs up to, exclusive; any longer is `>=7d`. */
+const AGE_LIMITS = [
+  ['<10s', 10n * SECOND],
+  ['<1m', MINUTE],
+  ['<10m', 10n * MINUTE],
+  ['<1h', HOUR],
+  ['<6h', 6n * HOUR],
+  ['<24h', DAY],
+  ['<7d', 7n * DAY],
+] as const;
+
+/** The age buckets, youngest first: `ages` counts events by these, and `oldest_age` is one of them. */
+export const AGE_BUCKETS = ['ahead', ...AGE_LIMITS.map(([bucket]) => bucket), '>=7d'] as const;
+export type AgeBucket = (typeof AGE_BUCKETS)[number];
+
+/** The bucket of a sync delay in microseconds (server_now minus the version instant). */
+export function ageBucket(delayMicros: bigint): AgeBucket {
+  if (delayMicros < -AHEAD_BEYOND_MICROS) return 'ahead';
+  for (const [bucket, below] of AGE_LIMITS) {
+    if (delayMicros < below) return bucket;
+  }
+  return '>=7d';
+}
+
+/**
+ * What the server read as it placed a Push, in push order, to measure it by. Nothing here is ever
+ * copied onto a line: only the buckets and counts measured from it are.
+ */
+export interface Arrival {
+  /** server_now when the Push was placed (store.ts serverNow), in epoch microseconds. */
+  nowMicros: bigint;
+  /** Each event's version instant (validate.ts Verdict.micros); undefined when its version did not parse. */
+  instants: readonly (bigint | undefined)[];
+  /** Each event's version as sent, to tell a STALE that was answered with the event's own version. */
+  versions: readonly string[];
+}
+
 /**
  * The line of a Push the server answered: how many events, how many of each outcome, the REJECTED
  * by code, and whether it replayed a receipt (the same client_id sent again). Every count is
  * present, zero or not, and the counts add up to `events`.
+ *
+ * With the Arrival of a placed Push it also carries:
+ * - `ages`: how many events had each sync delay (see THE SYNC DELAY above), by bucket. Every event
+ *   whose version parsed is aged, so a version_future reject counts as `ahead`; one whose version
+ *   did not parse is not.
+ * - `oldest_age`: the bucket of the largest delay, how long the oldest edit in the batch waited to
+ *   reach the server; an estimate either way like each age, not a bound. `none` when nothing was aged.
+ * - `resend_stale`: the events answered STALE with their own version, that is an edit the server
+ *   already held sent again under a new client_id, or twice in one batch. A CLIENT-BUG DETECTOR
+ *   that should read 0, not a duplicate ratio: receipts are never deleted (migrations/0003_sync.sql)
+ *   and the phone resends an unanswered batch under its own client_id, which is `replay`.
+ * A replay has no Arrival and measures nothing (`ages` {}, `oldest_age` none, `resend_stale` 0):
+ * its edits arrived with the Push it repeats, whose line measured them.
  */
-export function pushLine(response: PushResponse, replay: boolean): Record<string, unknown> {
+export function pushLine(response: PushResponse, replay: boolean, arrival?: Arrival): Record<string, unknown> {
   const counts = Object.fromEntries(Object.values(OUTCOME_FIELDS).map((field) => [field, 0])) as Record<string, number>;
   const reasons: Record<string, number> = {};
-  for (const result of response.results) {
+  let resendStale = 0;
+  for (const [index, result] of response.results.entries()) {
     counts[OUTCOME_FIELDS[result.outcome] ?? OUTCOME_FIELDS[PushOutcome.UNSPECIFIED]]! += 1;
     if (result.outcome === PushOutcome.REJECTED) {
       const code = reasonCode(result.reason);
       reasons[code] = (reasons[code] ?? 0) + 1;
     }
+    // PushResult.version is wire compatibility only (sync.proto): the answer is current.version.
+    if (result.outcome === PushOutcome.STALE && arrival !== undefined && result.current?.version === arrival.versions[index]) {
+      resendStale += 1;
+    }
   }
-  return allowListed({ outcome: 'ok', replay, events: response.results.length, ...counts, reasons });
+
+  const ages: Partial<Record<AgeBucket, number>> = {};
+  let oldest: bigint | undefined;
+  for (const instant of arrival?.instants ?? []) {
+    if (instant === undefined) continue;
+    const delay = arrival!.nowMicros - instant;
+    const bucket = ageBucket(delay);
+    ages[bucket] = (ages[bucket] ?? 0) + 1;
+    if (oldest === undefined || delay > oldest) oldest = delay;
+  }
+
+  return allowListed({
+    outcome: 'ok',
+    replay,
+    events: response.results.length,
+    ...counts,
+    reasons,
+    age_basis: 'version',
+    ages,
+    oldest_age: oldest === undefined ? 'none' : ageBucket(oldest),
+    resend_stale: resendStale,
+  });
 }
 
 /**
