@@ -53,6 +53,7 @@ import {
   type Tracer,
 } from '@opentelemetry/api';
 import { ConnectError, type Interceptor } from '@connectrpc/connect';
+import { extractClientTrace } from '../platform/client-trace.js';
 import { redactAttributes, type AttributeValue } from '../platform/shared.js';
 
 /** The instrumentation scope these spans are attributed to. */
@@ -120,10 +121,13 @@ function failSpan(span: Span, err: unknown): void {
  * is enough for a log tag — but the coordinator would never appear in the trace
  * as a participant, and its outbound hop would name the CALLER's span as its
  * parent. Opening a span here is what makes the service visible.
+ *
+ * The caller is a CLIENT, so only its traceparent is read: its tracestate and
+ * baggage never enter the context (platform/client-trace.ts, LGMOB C1).
  */
 export function traceparentServerInterceptor(options: { tracer?: Tracer } = {}): Interceptor {
   return (next) => async (req) => {
-    const parent = propagation.extract(context.active(), req.header, headersGetter);
+    const parent = extractClientTrace(context.active(), req.header, headersGetter);
     const span = tracerFor(options.tracer).startSpan(
       `${req.service.typeName}/${req.method.name}`,
       { kind: SpanKind.SERVER },

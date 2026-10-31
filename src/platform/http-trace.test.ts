@@ -1,4 +1,4 @@
-import { SpanStatusCode } from '@opentelemetry/api';
+import { SpanStatusCode, context, propagation, trace } from '@opentelemetry/api';
 import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
 import type { ReadableSpan as SdkReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -198,5 +198,82 @@ describe('registerHttpTracing — the slice-1a N3 gap', () => {
     await telemetry?.forceFlush();
 
     expect(capture.spans.map((s) => s.name)).toEqual(['GET /x']);
+  });
+});
+
+// LGMOB C1: the HTTP edge is the first extract site, and its context becomes
+// context.active() for everything later in the request, the Connect
+// interceptor included. A client may name its trace here and nothing else.
+describe('LGMOB C1: a client may set traceparent and nothing else (HTTP edge)', () => {
+  const TRACE_ID = '4bf92f3577b34da6a3ce929d0e0e4736';
+  const PARENT = '00f067aa0ba902b7';
+  const PHONE_RUN = 'c0ffee00c0ffee00c0ffee00c0ffee00';
+
+  /** What the handler's active context holds, as JSON. */
+  const probe = (): Record<string, unknown> => {
+    const active = context.active();
+    const span = trace.getSpan(active);
+    return {
+      baggage: propagation.getBaggage(active)?.getAllEntries() ?? null,
+      traceState: span?.spanContext().traceState?.serialize() ?? null,
+      traceId: span?.spanContext().traceId ?? null,
+      recording: span?.isRecording() ?? null,
+    };
+  };
+
+  it("keeps a client's baggage out of the request context, so no log line can carry its run id", async () => {
+    const lines: string[] = [];
+    app = Fastify({ loggerInstance: createStructuredLogger({ sink: (l) => lines.push(l), level: 'info' }) });
+    registerHttpTracing(app);
+    app.get('/x', async (request) => {
+      request.log.info('handling');
+      return probe();
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/x',
+      headers: { traceparent: `00-${TRACE_ID}-${PARENT}-01`, baggage: `fc.run_id=${PHONE_RUN},vendor=x` },
+    });
+
+    expect(res.json()).toMatchObject({ baggage: null, traceId: TRACE_ID });
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines.join('\n')).not.toContain(PHONE_RUN);
+  });
+
+  it("drops a client's tracestate but keeps its trace id and parent", async () => {
+    app = Fastify({ logger: false });
+    registerHttpTracing(app);
+    app.get('/x', async () => probe());
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/x',
+      headers: { traceparent: `00-${TRACE_ID}-${PARENT}-01`, tracestate: 'vendor=x' },
+    });
+    await telemetry?.forceFlush();
+
+    expect(res.json()).toMatchObject({ traceState: null, traceId: TRACE_ID });
+    expect(capture.spans[0]?.parentSpanContext?.spanId).toBe(PARENT);
+  });
+
+  it.each([
+    ['not a traceparent', 'not-a-traceparent'],
+    ['an all-zero trace id', `00-${'0'.repeat(32)}-${PARENT}-01`],
+    ['upper-case hex', `00-${TRACE_ID.toUpperCase()}-${PARENT}-01`],
+  ])('ignores a malformed traceparent (%s) and starts a fresh root', async (_label, bad) => {
+    app = Fastify({ logger: false });
+    registerHttpTracing(app);
+    app.get('/x', async () => probe());
+
+    const body = (await app.inject({ method: 'GET', url: '/x', headers: { traceparent: bad } })).json() as {
+      traceId: string;
+    };
+    await telemetry?.forceFlush();
+
+    expect(body.traceId).toMatch(/^[0-9a-f]{32}$/);
+    expect(body.traceId).not.toBe('0'.repeat(32));
+    expect(body.traceId).not.toBe(TRACE_ID);
+    expect(capture.spans[0]?.parentSpanContext).toBeUndefined();
   });
 });

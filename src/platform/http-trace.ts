@@ -29,7 +29,6 @@ import {
   SpanKind,
   SpanStatusCode,
   context,
-  propagation,
   trace,
   type Span,
   type Tracer,
@@ -41,6 +40,7 @@ import {
   ATTR_URL_PATH,
 } from '@opentelemetry/semantic-conventions';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { extractClientTrace } from './client-trace.js';
 
 export interface HttpTracingOptions {
   tracer?: Tracer;
@@ -70,7 +70,8 @@ export function registerHttpTracing(app: FastifyInstance, options: HttpTracingOp
     // Routing has already happened by onRequest, so the TEMPLATE is available;
     // a request that matched nothing (404) falls back to its path.
     const route = request.routeOptions.url ?? path;
-    const parent = propagation.extract(context.active(), request.headers);
+    // A client's traceparent only: never its tracestate or baggage (client-trace.ts).
+    const parent = extractClientTrace(context.active(), request.headers);
     const span = tracerFor().startSpan(
       `${request.method} ${route}`,
       {
