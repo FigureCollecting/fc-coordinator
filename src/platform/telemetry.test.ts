@@ -1,4 +1,4 @@
-import { context, trace, type ContextManager } from '@opentelemetry/api';
+import { ROOT_CONTEXT, TraceFlags, context, trace, type ContextManager } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
 import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
@@ -91,6 +91,46 @@ describe('telemetry — §A.5 rule 1: an async context manager is registered', (
 
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatch(/trace=[0-9a-f]{32} span=[0-9a-f]{16}/);
+  });
+});
+
+describe("telemetry — LGMOB C1: a client's sampled flag does not decide this service's spans", () => {
+  const TRACE_ID = '4bf92f3577b34da6a3ce929d0e0e4736';
+  const parent = (traceFlags: TraceFlags, isRemote: boolean) =>
+    trace.setSpanContext(ROOT_CONTEXT, { traceId: TRACE_ID, spanId: '00f067aa0ba902b7', traceFlags, isRemote });
+
+  it('records a span whose REMOTE parent said not-sampled, and marks it sampled', () => {
+    started = startTelemetry({ exporter: new CaptureExporter(), env: {} });
+    const span = trace.getTracer('test').startSpan('x', {}, parent(TraceFlags.NONE, true));
+
+    expect(span.isRecording()).toBe(true);
+    expect(span.spanContext().traceId).toBe(TRACE_ID);
+    expect(span.spanContext().traceFlags & TraceFlags.SAMPLED).toBe(TraceFlags.SAMPLED);
+    span.end();
+  });
+
+  it('still follows a LOCAL not-sampled parent: only the remote flag is overridden', () => {
+    started = startTelemetry({ exporter: new CaptureExporter(), env: {} });
+    const span = trace.getTracer('test').startSpan('x', {}, parent(TraceFlags.NONE, false));
+
+    expect(span.isRecording()).toBe(false);
+    span.end();
+  });
+
+  it('decides sampling in code, so OTEL_TRACES_SAMPLER in the environment is not read', () => {
+    // A consequence of an explicit sampler, pinned so it is a decision and not
+    // an accident. fc-infra sets no OTEL_TRACES_SAMPLER for the coordinator.
+    const saved = process.env['OTEL_TRACES_SAMPLER'];
+    process.env['OTEL_TRACES_SAMPLER'] = 'always_off';
+    try {
+      started = startTelemetry({ exporter: new CaptureExporter(), env: {} });
+      const span = trace.getTracer('test').startSpan('root');
+      expect(span.isRecording()).toBe(true);
+      span.end();
+    } finally {
+      if (saved === undefined) delete process.env['OTEL_TRACES_SAMPLER'];
+      else process.env['OTEL_TRACES_SAMPLER'] = saved;
+    }
   });
 });
 

@@ -474,4 +474,29 @@ describe('LGMOB C1: a client may set traceparent and nothing else (Connect edge)
     // global propagator with no baggage half (the plan's first cut) sends null.
     expect(r.outbound[0]?.get('baggage')).toBe(`fc.run_id=${SERVER_RUN}`);
   });
+
+  it("does not let a client's not-sampled flag switch the coordinator's spans off", async () => {
+    const r = relay();
+    await compareFrom(r, { traceparent: phoneTraceparent('00') });
+
+    const span = r.inHandler[0]?.span;
+    expect(r.inHandler[0]?.recording).toBe(true);
+    expect(span?.spanContext().traceId).toBe(PHONE_TRACE);
+    // So the spine is asked to sample too, rather than inheriting the phone's 00.
+    expect(r.outbound[0]?.get('traceparent')).toMatch(
+      new RegExp(`^00-${PHONE_TRACE}-[0-9a-f]{16}-01$`),
+    );
+  });
+
+  it('a not-sampled request was ALREADY joinable in logs: the sampler is export-time only', async () => {
+    // Red-team finding 11, pinned. fc-shared's getActiveTraceIds reads the span
+    // context of a NonRecordingSpan too, so a log line under a flags-00 request
+    // carried the phone's trace id before the sampler existed. This passes with
+    // or without the sampler; it is here so nobody credits it with log joins.
+    const r = relay();
+    await compareFrom(r, { traceparent: phoneTraceparent('00') });
+
+    expect(r.inHandler[0]?.ids?.traceId).toBe(PHONE_TRACE);
+    expect(r.outbound[0]?.get('traceparent')).toContain(PHONE_TRACE);
+  });
 });

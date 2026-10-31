@@ -276,4 +276,23 @@ describe('LGMOB C1: a client may set traceparent and nothing else (HTTP edge)', 
     expect(body.traceId).not.toBe(TRACE_ID);
     expect(capture.spans[0]?.parentSpanContext).toBeUndefined();
   });
+
+  it("records a not-sampled client's span; its log line carried the trace id all along", async () => {
+    const lines: string[] = [];
+    app = Fastify({ loggerInstance: createStructuredLogger({ sink: (l) => lines.push(l), level: 'info' }) });
+    registerHttpTracing(app);
+    app.get('/x', async (request) => {
+      request.log.info('handling');
+      return probe();
+    });
+
+    const res = await app.inject({ method: 'GET', url: '/x', headers: { traceparent: `00-${TRACE_ID}-${PARENT}-00` } });
+
+    // The sampler change: the span records (and would export) despite the 00.
+    expect(res.json()).toMatchObject({ recording: true, traceId: TRACE_ID });
+    // Red-team finding 11: this half held BEFORE the sampler change too. A
+    // NonRecordingSpan still has the trace id, so log joins never needed it.
+    const handled = lines.map((l) => JSON.parse(l) as Record<string, string>).find((l) => l['msg'] === 'handling');
+    expect(handled?.['trace']).toMatch(new RegExp(`^trace=${TRACE_ID} span=[0-9a-f]{16}$`));
+  });
 });

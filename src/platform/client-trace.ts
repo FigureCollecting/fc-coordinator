@@ -21,7 +21,8 @@
 // here. The edge is the one place that knows the caller is a client.
 //
 // The traceparent itself is still parsed by the W3C propagator, which ignores
-// a malformed one (the request then starts a fresh root).
+// a malformed one (the request then starts a fresh root). Its sampled flag is
+// not trusted either; see the sampler in telemetry.ts.
 // ============================================================================
 import { defaultTextMapGetter, propagation, type Context, type TextMapGetter } from '@opentelemetry/api';
 

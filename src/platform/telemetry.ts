@@ -30,6 +30,18 @@
 //         propagator is registered here (NodeTracerProvider.register installs
 //         the composite W3CTraceContext + Baggage propagator by default); the
 //         interceptors themselves arrive with the first Connect hop in slice 1b.
+//         It stays the global default ON PURPOSE: a CLIENT's tracestate and
+//         baggage are dropped at the client-facing edges (client-trace.ts),
+//         so the server's own baggage still reaches our services.
+//
+// SAMPLING (LGMOB C1). A client's sampled flag does not decide whether this
+// service records its spans: a remote parent that says "not sampled" is
+// sampled anyway, as a root span already is. Before this, a request with
+// `traceparent ...-00` turned the coordinator's spans off and passed the 00 on
+// to the spine. This is EXPORT-TIME hardening only. Log lines never depended
+// on it: fc-shared's getActiveTraceIds reads a NonRecordingSpan's ids too, so
+// a flags-00 request's lines already carried its trace id. The sampler is set
+// in code, so OTEL_TRACES_SAMPLER is not read on this path.
 //
 // SECRETS: the rule is never to SET a secret attribute; RedactingSpanExporter
 // is the second line of defence, running fc-shared's redactAttributes over
@@ -46,7 +58,9 @@ import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import {
+  AlwaysOnSampler,
   BatchSpanProcessor,
+  ParentBasedSampler,
   SimpleSpanProcessor,
   type ReadableSpan,
   type SpanExporter,
@@ -178,6 +192,12 @@ export function startTelemetry(options: StartTelemetryOptions = {}): Telemetry {
 
   const provider = new NodeTracerProvider({
     resource: resourceFromAttributes({ [ATTR_SERVICE_NAME]: serviceName }),
+    // SAMPLING (header): only the REMOTE not-sampled case changes; a local
+    // not-sampled parent still keeps its children unsampled.
+    sampler: new ParentBasedSampler({
+      root: new AlwaysOnSampler(),
+      remoteParentNotSampled: new AlwaysOnSampler(),
+    }),
     spanProcessors: [processor],
   });
 
