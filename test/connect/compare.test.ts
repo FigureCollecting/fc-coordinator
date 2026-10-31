@@ -369,6 +369,28 @@ describe('traceparent threads both Connect hops', () => {
     // Not the all-zero id: fc-shared reads that as "no span" and drops the tag.
     expect(outbound).not.toContain('00000000000000000000000000000000');
   });
+
+  // LGMOB C1, through the real app: Fastify's onRequest hook AND the Connect
+  // interceptor both extract, so either one alone leaking would fail this.
+  it("passes on neither a client's tracestate nor its baggage, only its trace", async () => {
+    harness = await start({ allow: true });
+
+    await harness.client.compare(
+      { seed: { case: 'gtin14', value: GTIN }, nowIso: NOW_ISO },
+      {
+        headers: {
+          traceparent: INBOUND,
+          tracestate: 'vendor=x',
+          baggage: 'fc.run_id=c0ffee00c0ffee00c0ffee00c0ffee00,vendor=x',
+        },
+      },
+    );
+
+    const headers = harness.spine.calls[0]?.headers;
+    expect(headers?.get('traceparent')).toContain(TRACE_ID);
+    expect(headers?.get('tracestate')).toBeNull();
+    expect(headers?.get('baggage')).toBeNull();
+  });
 });
 
 // ===========================================================================
