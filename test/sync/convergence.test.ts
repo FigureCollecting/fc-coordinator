@@ -41,6 +41,16 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { DISPLAY, ok, startSyncApp, SyncCaller, type SyncApp } from '../helpers/syncClient.js';
 import { startSyncDatabase, type SyncDatabase } from '../helpers/syncDatabase.js';
 
+/**
+ * Each run draws its own seed, and every failure names it: fast-check prints the seed and path when
+ * the property fails, and each witness after it carries the seed in its message. CONVERGENCE_SEED=<seed>
+ * replays a run's commands; which device wins a race or a tie (a pushBoth, the random device ids)
+ * can still differ from one replay to the next.
+ */
+const SEED = process.env.CONVERGENCE_SEED === undefined ? Math.floor(Math.random() * 2 ** 31) : Number(process.env.CONVERGENCE_SEED);
+if (!Number.isSafeInteger(SEED)) throw new Error(`CONVERGENCE_SEED must be an integer, not ${process.env.CONVERGENCE_SEED}`);
+const SEEDED = `CONVERGENCE_SEED=${SEED}`;
+
 let db: SyncDatabase;
 let h: SyncApp;
 let h2: SyncApp;
@@ -391,6 +401,7 @@ describe('(1) convergence', () => {
       }),
       {
         numRuns: 200,
+        seed: SEED,
         // Found by review: A's invalid edit is REJECTED with the response lost, A pulls B's older
         // write and keeps its pending edit, then the retry's REJECTED answer must carry B's write.
         examples: [
@@ -416,16 +427,30 @@ describe('(1) convergence', () => {
             ],
             2,
           ],
+          // An answer withdrawn. No import runs here, so the import answers every res/answer UPSERT
+          // STALE (src/import/answers.ts) and only a DELETE can land. About 1 random sample of 200 in
+          // 15 to 20 sees none APPLIED (seeds 2053961770, 114068056, 354546423): 3 % of seeds mint no
+          // such DELETE, and a dropped response turns a landed one into DUPLICATE on the resend.
+          // Device 1's answer is STALE and writes nothing; device 0's DELETE is APPLIED.
+          [
+            [
+              { kind: 'edit', d: 1, slot: 0, family: 'res/answer', remove: false, bad: false, noBasis: false, n: 0, tickMs: 1 },
+              { kind: 'push', d: 1, drop: false },
+              { kind: 'edit', d: 0, slot: 0, family: 'res/answer', remove: true, bad: false, noBasis: false, n: 0, tickMs: 1 },
+              { kind: 'push', d: 0, drop: false },
+            ],
+            1,
+          ],
         ],
       },
     );
-    expect(runs).toBeGreaterThanOrEqual(200);
-    expect(rejected).toBeGreaterThan(50);
-    expect([...appliedFamilies].sort()).toEqual([...USER_FACET_FAMILIES].sort());
-    expect(refusedForeign).toBeGreaterThan(10);
-    expect(basisMissing).toBeGreaterThan(10);
-    expect(stagedAcrossPages).toBeGreaterThan(50);
-    expect(restartsWhileStaged).toBeGreaterThan(0);
-    expect([...refusedFamilies].sort()).toEqual([...SERVER_FACET_FAMILIES, ...RETIRED].sort());
+    expect(runs, SEEDED).toBeGreaterThanOrEqual(200);
+    expect(rejected, SEEDED).toBeGreaterThan(50);
+    expect([...appliedFamilies].sort(), SEEDED).toEqual([...USER_FACET_FAMILIES].sort());
+    expect(refusedForeign, SEEDED).toBeGreaterThan(10);
+    expect(basisMissing, SEEDED).toBeGreaterThan(10);
+    expect(stagedAcrossPages, SEEDED).toBeGreaterThan(50);
+    expect(restartsWhileStaged, SEEDED).toBeGreaterThan(0);
+    expect([...refusedFamilies].sort(), SEEDED).toEqual([...SERVER_FACET_FAMILIES, ...RETIRED].sort());
   }, 600_000);
 });
