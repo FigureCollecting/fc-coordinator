@@ -8,7 +8,7 @@
 // (ImportHooks), and StatusResponse.pending_review is the import's count of what awaits review.
 // Each Push writes one sync.push line (./pushLog.ts) once its transaction has committed or failed.
 import { createHash } from 'node:crypto';
-import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
+import { clearField, clone, create, fromBinary, toBinary } from '@bufbuild/protobuf';
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
 import {
   DeltaResponseSchema,
@@ -32,7 +32,7 @@ import {
 } from '@figurecollecting/fc-api-contract';
 import { kCallerDevice, kCallerSubject } from '../connect/identity.js';
 import { decodeCursor, encodeCursor } from './cursor.js';
-import { PUSH_LINE, pushErrorLine, pushLine, type Arrival, type SyncLog } from './pushLog.js';
+import { PUSH_LINE, originTraceFields, pushErrorLine, pushLine, type Arrival, type SyncLog } from './pushLog.js';
 import { KeyedSerialiser, QueueFull } from './serialise.js';
 import {
   FeedTransaction,
@@ -71,7 +71,7 @@ export const MAX_QUEUED_PUSHES = 8;
 /**
  * The largest request body read, before any handler runs. 200 notes of 10,000 U+0001, which
  * JSON.stringify writes as \u0001 and the JSON envelope escapes again, each with the longest
- * basis (the cursor of the largest seq), are 14,073,154 bytes.
+ * basis (the cursor of the largest seq) and a well-formed origin_trace, are 14,082,954 bytes.
  */
 export const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 
@@ -135,6 +135,20 @@ function callerOf(ctx: HandlerContext): Caller {
     throw new ConnectError('sync needs an authenticated, device-bound caller', Code.Unauthenticated);
   }
   return { userId, deviceId };
+}
+
+/**
+ * What a batch is recorded and compared by under its client_id: the sha256 of the request with
+ * every event's origin_trace cleared (sync.proto SyncEvent.origin_trace, NOT PART OF REPLAY
+ * IDENTITY), so a retry that adds, changes or drops it is a replay. Cleared on a copy of the decoded
+ * message, so it holds over either wire format and the request keeps the value for the log. Cleared,
+ * not set to '': a request that carries none encodes to the bytes it did before 0.7.0, so a receipt
+ * recorded then still matches.
+ */
+export function replayDigest(req: PushRequest): Buffer {
+  const identity = clone(PushRequestSchema, req);
+  for (const event of identity.events) clearField(event, SyncEventSchema.field.originTrace);
+  return createHash('sha256').update(toBinary(PushRequestSchema, identity)).digest();
 }
 
 /** A facet on the wire, with commit_cursor when it is a Delta event that ends its transaction. */
@@ -211,7 +225,7 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
     if (req.events.length > MAX_BATCH) {
       throw new ConnectError(`a batch carries at most ${MAX_BATCH} events`, Code.InvalidArgument);
     }
-    const requestSha256 = createHash('sha256').update(toBinary(PushRequestSchema, req)).digest();
+    const requestSha256 = replayDigest(req);
     const deviceHex = normaliseDeviceId(caller.deviceId);
 
     const write = async (tx: TxClient): Promise<Placed> => {
@@ -289,10 +303,10 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
     try {
       placed = await place(req, ctx);
     } catch (err) {
-      log('warn', pushErrorLine(err, req.events.length), PUSH_LINE);
+      log('warn', { ...pushErrorLine(err, req.events.length), ...originTraceFields(req.events) }, PUSH_LINE);
       throw err;
     }
-    log('info', pushLine(placed.response, placed.replay, placed.arrival), PUSH_LINE);
+    log('info', { ...pushLine(placed.response, placed.replay, placed.arrival), ...originTraceFields(req.events) }, PUSH_LINE);
     return placed.response;
   };
 
