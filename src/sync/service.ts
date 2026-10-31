@@ -8,7 +8,7 @@
 // (ImportHooks), and StatusResponse.pending_review is the import's count of what awaits review.
 // Each Push writes one sync.push line (./pushLog.ts) once its transaction has committed or failed.
 import { createHash } from 'node:crypto';
-import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
+import { clearField, clone, create, fromBinary, toBinary } from '@bufbuild/protobuf';
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
 import {
   DeltaResponseSchema,
@@ -136,6 +136,20 @@ function callerOf(ctx: HandlerContext): Caller {
   return { userId, deviceId };
 }
 
+/**
+ * What a batch is recorded and compared by under its client_id: the sha256 of the request with
+ * every event's origin_trace cleared (sync.proto SyncEvent.origin_trace, NOT PART OF REPLAY
+ * IDENTITY), so a retry that adds, changes or drops it is a replay. Cleared on a copy of the decoded
+ * message, so it holds over either wire format and the request keeps the value for the log. Cleared,
+ * not set to '': a request that carries none encodes to the bytes it did before 0.7.0, so a receipt
+ * recorded then still matches.
+ */
+export function replayDigest(req: PushRequest): Buffer {
+  const identity = clone(PushRequestSchema, req);
+  for (const event of identity.events) clearField(event, SyncEventSchema.field.originTrace);
+  return createHash('sha256').update(toBinary(PushRequestSchema, identity)).digest();
+}
+
 /** A facet on the wire, with commit_cursor when it is a Delta event that ends its transaction. */
 const toWire = (facet: Facet | FeedEvent): SyncEvent =>
   create(SyncEventSchema, {
@@ -210,7 +224,7 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
     if (req.events.length > MAX_BATCH) {
       throw new ConnectError(`a batch carries at most ${MAX_BATCH} events`, Code.InvalidArgument);
     }
-    const requestSha256 = createHash('sha256').update(toBinary(PushRequestSchema, req)).digest();
+    const requestSha256 = replayDigest(req);
     const deviceHex = normaliseDeviceId(caller.deviceId);
 
     const write = async (tx: TxClient): Promise<Placed> => {
