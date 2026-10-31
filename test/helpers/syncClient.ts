@@ -33,6 +33,7 @@ import { resolveAuthConfig } from '../../src/auth/config.js';
 import { createAccessTokenVerifier } from '../../src/auth/oidc.js';
 import { createDeviceStore } from '../../src/auth/plugin.js';
 import { productionConnectOptions, type ConnectOptions } from '../../src/connect/register.js';
+import type { LogSink } from '../../src/platform/logger.js';
 import type { KeyedSerialiser } from '../../src/sync/serialise.js';
 import type { HoldPolicy } from '../../src/sync/service.js';
 import { makeDeviceKey, makeIssuer, makeProof, TEST_ORIGIN, type DeviceKey, type TestIssuer } from './auth.js';
@@ -49,8 +50,9 @@ export interface SyncApp {
 /**
  * Production wiring, as src/server.ts assembles it, minus the spine. Pass the issuer of a running
  * app to start a second replica on the same database that accepts the same tokens, a Push queue
- * to watch it, a hold policy to stand in for the import's (import.proto HELD), and any Connect
- * option to lay over production's (the import's spine and key).
+ * to watch it, a hold policy to stand in for the import's (import.proto HELD), any Connect
+ * option to lay over production's (the import's spine and key), and a sink to read the app's info
+ * log (silent without one).
  */
 export async function startSyncApp(
   db: pg.Pool,
@@ -58,6 +60,7 @@ export async function startSyncApp(
   writers?: KeyedSerialiser,
   holds?: HoldPolicy,
   connect: Partial<ConnectOptions> = {},
+  logSink?: LogSink,
 ): Promise<SyncApp> {
   const issuer = sharedIssuer ?? (await makeIssuer());
   const config = resolveAuthConfig({
@@ -68,7 +71,7 @@ export async function startSyncApp(
   });
   const app = buildApp({
     db,
-    logLevel: 'silent',
+    ...(logSink !== undefined ? { logLevel: 'info' as const, logSink } : { logLevel: 'silent' as const }),
     auth: {
       config,
       devices: createDeviceStore(db),
@@ -99,6 +102,8 @@ export type Rpc<T> =
 /** One enrolled device of one user. */
 export class SyncCaller {
   nonce: string | undefined;
+  /** Sent on every call beside the DPoP headers: a traceparent, say. */
+  headers: Record<string, string> = {};
 
   private constructor(
     private readonly app: FastifyInstance,
@@ -161,6 +166,7 @@ export class SyncCaller {
         method: 'POST',
         url,
         headers: {
+          ...this.headers,
           'content-type': binary ? 'application/proto' : 'application/json',
           'connect-protocol-version': '1',
           authorization: `DPoP ${this.token}`,

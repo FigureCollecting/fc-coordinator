@@ -1,12 +1,15 @@
 // SyncService's defensive branches, without a database: a context with no caller, and a Push
 // whose transaction fails part-way.
 import { randomUUID } from 'node:crypto';
-import { SyncOp, canonicalVersion, occFacetKey } from '@figurecollecting/fc-api-contract';
+import { create } from '@bufbuild/protobuf';
+import { Code, createContextValues, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
+import { PushRequestSchema, SyncOp, canonicalVersion, occFacetKey, type PushRequest } from '@figurecollecting/fc-api-contract';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../../src/app.js';
 import { productionConnectOptions } from '../../src/connect/register.js';
 import { SpineReadClient } from '../../src/spine/spineReadClient.js';
+import { createSyncRoutes } from '../../src/sync/service.js';
 import type { SyncPool, TxClient } from '../../src/sync/store.js';
 import { SYNC_SERVICE_PATH } from '../helpers/syncClient.js';
 
@@ -123,6 +126,15 @@ describe('a Push whose transaction fails', () => {
     expect(res.statusCode).toBe(500);
     expect(release).toHaveBeenCalledTimes(1);
     expect(release.mock.calls[0]![0]).toBeInstanceOf(Error);
+  });
+});
+
+describe('SyncService given no log', () => {
+  it('still answers a Push with its own error: the sync.push line goes nowhere', async () => {
+    let push: ((req: PushRequest, ctx: HandlerContext) => Promise<unknown>) | undefined;
+    createSyncRoutes({ db: neverPool })({ service: (_service: unknown, impl: { push: typeof push }) => (push = impl.push) } as unknown as ConnectRouter);
+    const ctx = { values: createContextValues(), signal: new AbortController().signal } as unknown as HandlerContext;
+    await expect(push!(create(PushRequestSchema, { clientId: 'c' }), ctx)).rejects.toMatchObject({ code: Code.Unauthenticated });
   });
 });
 
