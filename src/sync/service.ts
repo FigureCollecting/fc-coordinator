@@ -6,6 +6,7 @@
 // (ImportHooks.late), or none, and then nothing is held.
 // An answer to an import item (res/{site}/{head}) is the import's to accept or answer STALE
 // (ImportHooks), and StatusResponse.pending_review is the import's count of what awaits review.
+// Each Push writes one sync.push line (./pushLog.ts) once its transaction has committed or failed.
 import { createHash } from 'node:crypto';
 import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
@@ -31,6 +32,7 @@ import {
 } from '@figurecollecting/fc-api-contract';
 import { kCallerDevice, kCallerSubject } from '../connect/identity.js';
 import { decodeCursor, encodeCursor } from './cursor.js';
+import { PUSH_LINE, pushErrorLine, pushLine, type SyncLog } from './pushLog.js';
 import { KeyedSerialiser, QueueFull } from './serialise.js';
 import {
   FeedTransaction,
@@ -107,6 +109,16 @@ export interface SyncRoutesDeps {
   holds?: HoldPolicy;
   /** The import's answers and review count; without them an answer is placed by LWW and nothing awaits review. */
   imports?: ImportHooks;
+  /** Where each Push's sync.push line goes; without it, nowhere. */
+  log?: SyncLog;
+}
+
+const noLog: SyncLog = () => {};
+
+/** A Push the server answered, and whether the answer replayed a receipt. */
+interface Placed {
+  response: PushResponse;
+  replay: boolean;
 }
 
 interface Caller {
@@ -169,6 +181,7 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
   const { db } = deps;
   const writers = deps.writers ?? new KeyedSerialiser(MAX_QUEUED_PUSHES);
   const holds = deps.holds ?? deps.imports?.late ?? holdNothing;
+  const log = deps.log ?? noLog;
 
   const delta = async (req: DeltaRequest, ctx: HandlerContext): Promise<DeltaResponse> => {
     const caller = callerOf(ctx);
@@ -188,7 +201,8 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
     });
   };
 
-  const push = async (req: PushRequest, ctx: HandlerContext): Promise<PushResponse> => {
+  /** One Push, in its transaction: settles once that transaction has committed or rolled back. */
+  const place = async (req: PushRequest, ctx: HandlerContext): Promise<Placed> => {
     const caller = callerOf(ctx);
     if (!CLIENT_ID.test(req.clientId)) {
       throw new ConnectError('client_id must be 1 to 128 printable ASCII characters, no spaces', Code.InvalidArgument);
@@ -199,7 +213,7 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
     const requestSha256 = createHash('sha256').update(toBinary(PushRequestSchema, req)).digest();
     const deviceHex = normaliseDeviceId(caller.deviceId);
 
-    const write = async (tx: TxClient): Promise<PushResponse> => {
+    const write = async (tx: TxClient): Promise<Placed> => {
       await boundLockWaits(tx, PUSH_LOCK_TIMEOUT_MS);
       await lockUser(tx, caller.userId);
       const receipt = await readReceipt(tx, caller.userId, req.clientId);
@@ -207,7 +221,7 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
         if (!receipt.requestSha256.equals(requestSha256)) {
           throw new ConnectError('client_id was already used for a different batch', Code.InvalidArgument);
         }
-        return replay(tx, caller.userId, fromBinary(PushResponseSchema, receipt.outcomes));
+        return { response: await replay(tx, caller.userId, fromBinary(PushResponseSchema, receipt.outcomes)), replay: true };
       }
 
       const now = await serverNow(tx);
@@ -249,7 +263,7 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
       await deps.imports?.applied(tx, caller.userId, applied);
       const response = create(PushResponseSchema, { results });
       await writeReceipt(tx, caller.userId, req.clientId, requestSha256, Buffer.from(outcomesOf(response)));
-      return response;
+      return { response, replay: false };
     };
     try {
       // The signal aborts when the client goes away, which drops this Push if it is still queued.
@@ -264,6 +278,20 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
       }
       throw err;
     }
+  };
+
+  // The line is written after place() settles, so after COMMIT: a Push that rolled back never logs
+  // an edit as applied, and its retry under the same client_id is placed, not replayed.
+  const push = async (req: PushRequest, ctx: HandlerContext): Promise<PushResponse> => {
+    let placed: Placed;
+    try {
+      placed = await place(req, ctx);
+    } catch (err) {
+      log('warn', pushErrorLine(err, req.events.length), PUSH_LINE);
+      throw err;
+    }
+    log('info', pushLine(placed.response, placed.replay), PUSH_LINE);
+    return placed.response;
   };
 
   const status = async (_req: unknown, ctx: HandlerContext): Promise<StatusResponse> => {

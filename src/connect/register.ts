@@ -139,7 +139,15 @@ export function registerConnect(app: FastifyInstance, options: ConnectOptions): 
   const compareRoutes = createCompareRoutes(options);
   // The import's answers ride Push with the import's own key: one key mints and finds every copy.
   const imports = options.import === undefined ? undefined : createImportHooks(options.import.occIdKey);
-  const syncRoutes = options.sync === undefined ? undefined : createSyncRoutes({ ...(imports !== undefined ? { imports } : {}), ...options.sync });
+  // Each Push's sync.push line goes to the app's logger, with the trace of the request it answered.
+  const syncRoutes =
+    options.sync === undefined
+      ? undefined
+      : createSyncRoutes({
+          ...(imports !== undefined ? { imports } : {}),
+          log: (level, fields, message) => app.log[level](fields, message),
+          ...options.sync,
+        });
   // A display denial is logged on the app's logger, with the trace of the request it belonged to:
   // info with its rules when something was withheld, debug when nothing was (catalog.proto).
   const catalogRoutes =
