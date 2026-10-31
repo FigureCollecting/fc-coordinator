@@ -1,13 +1,15 @@
 // The sync log seam: what SyncService writes about a Push, one `sync.push` line per Push, never one
 // per event. A line is built from what the server answered (PushResponse) or the Connect code it
-// failed with, never from what the client sent, and every field goes through the allow-list below
-// before it reaches the logger. The logger adds the request's trace (src/platform/logger.ts).
+// failed with, and of what the client sent it takes only a well-formed origin_trace
+// (originTraceFields). Every field goes through the allow-list below before it reaches the logger.
+// The logger adds the request's trace (src/platform/logger.ts).
 //
 // NEVER on a line: SyncEvent.version (it carries the DPoP device id), facet_key, payload, basis,
-// commit_cursor, client_id, the sub, the device id, or a reason's detail (only its code).
+// commit_cursor, client_id, the sub, the device id, a reason's detail (only its code), or a
+// malformed origin_trace (only how many events carried one).
 import { Code, ConnectError } from '@connectrpc/connect';
 import { codeToString } from '@connectrpc/connect/protocol-connect';
-import { PUSH_REJECT_REASONS, PushOutcome, type PushResponse } from '@figurecollecting/fc-api-contract';
+import { PUSH_REJECT_REASONS, PushOutcome, isTraceId, type PushResponse, type SyncEvent } from '@figurecollecting/fc-api-contract';
 
 /** The msg of the line each Push writes: `jq 'select(.msg == "sync.push")'`. */
 export const PUSH_LINE = 'sync.push';
@@ -29,7 +31,18 @@ const OUTCOME_FIELDS: Record<PushOutcome, string> = {
 };
 
 /** Every field a sync line may carry; any other is dropped before the line is written. */
-export const SYNC_LOG_FIELDS: ReadonlySet<string> = new Set(['outcome', 'replay', 'events', ...Object.values(OUTCOME_FIELDS), 'reasons', 'code']);
+export const SYNC_LOG_FIELDS: ReadonlySet<string> = new Set([
+  'outcome',
+  'replay',
+  'events',
+  ...Object.values(OUTCOME_FIELDS),
+  'reasons',
+  'code',
+  'origin_trace',
+  'origin_trace_more',
+  'origin_trace_malformed',
+  'origin_trace_absent',
+]);
 
 /** `fields` with only the keys `allowed` names. */
 export function allowListed(fields: Record<string, unknown>, allowed: ReadonlySet<string> = SYNC_LOG_FIELDS): Record<string, unknown> {
@@ -70,4 +83,38 @@ export function pushLine(response: PushResponse, replay: boolean): Record<string
 export function pushErrorLine(err: unknown, events: number): Record<string, unknown> {
   const code = err instanceof ConnectError ? err.code : Code.Internal;
   return allowListed({ outcome: 'error', code: codeToString(code), events });
+}
+
+/** The most distinct origin_trace values one line lists; origin_trace_more counts the rest. */
+export const ORIGIN_TRACE_CAP = 20;
+
+/**
+ * The origin_trace fields of a Push's line (sync.proto SyncEvent.origin_trace, 0.7.0): which user
+ * actions minted the edits it carries, so an action can be found by the id the device kept. Read
+ * from the request on every line, the replay's and the refused Push's included:
+ * - `origin_trace`: each distinct value isTraceId calls well-formed, in push order (oldest edit
+ *   first), at most ORIGIN_TRACE_CAP; find a Push by one with
+ *   `jq 'select(.msg == "sync.push" and any(.origin_trace[]?; . == "<id>"))'`;
+ * - `origin_trace_more`: how many distinct well-formed values past those;
+ * - `origin_trace_malformed`: how many events carried any other value, whatever its length; the
+ *   value itself is never written;
+ * - `origin_trace_absent`: how many carried none, as every event from an app built before 0.7.0.
+ * The value is client-chosen and unchecked, so a join on it is a lead, never proof.
+ */
+export function originTraceFields(events: readonly Pick<SyncEvent, 'originTrace'>[]): Record<string, unknown> {
+  const wellFormed = new Set<string>();
+  let malformed = 0;
+  let absent = 0;
+  for (const { originTrace } of events) {
+    if (originTrace === undefined) absent += 1;
+    else if (isTraceId(originTrace)) wellFormed.add(originTrace);
+    else malformed += 1;
+  }
+  const listed = [...wellFormed];
+  return allowListed({
+    origin_trace: listed.slice(0, ORIGIN_TRACE_CAP),
+    origin_trace_more: Math.max(0, listed.length - ORIGIN_TRACE_CAP),
+    origin_trace_malformed: malformed,
+    origin_trace_absent: absent,
+  });
 }

@@ -32,7 +32,7 @@ import {
 } from '@figurecollecting/fc-api-contract';
 import { kCallerDevice, kCallerSubject } from '../connect/identity.js';
 import { decodeCursor, encodeCursor } from './cursor.js';
-import { PUSH_LINE, pushErrorLine, pushLine, type SyncLog } from './pushLog.js';
+import { PUSH_LINE, originTraceFields, pushErrorLine, pushLine, type SyncLog } from './pushLog.js';
 import { KeyedSerialiser, QueueFull } from './serialise.js';
 import {
   FeedTransaction,
@@ -301,10 +301,10 @@ export function createSyncRoutes(deps: SyncRoutesDeps): (router: ConnectRouter) 
     try {
       placed = await place(req, ctx);
     } catch (err) {
-      log('warn', pushErrorLine(err, req.events.length), PUSH_LINE);
+      log('warn', { ...pushErrorLine(err, req.events.length), ...originTraceFields(req.events) }, PUSH_LINE);
       throw err;
     }
-    log('info', pushLine(placed.response, placed.replay), PUSH_LINE);
+    log('info', { ...pushLine(placed.response, placed.replay), ...originTraceFields(req.events) }, PUSH_LINE);
     return placed.response;
   };
 

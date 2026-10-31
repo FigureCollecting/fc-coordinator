@@ -12,7 +12,7 @@ import {
   ufFacetKey,
 } from '@figurecollecting/fc-api-contract';
 import { describe, expect, it } from 'vitest';
-import { PUSH_LINE, SYNC_LOG_FIELDS, allowListed, pushErrorLine, pushLine } from './pushLog.js';
+import { ORIGIN_TRACE_CAP, PUSH_LINE, SYNC_LOG_FIELDS, allowListed, originTraceFields, pushErrorLine, pushLine } from './pushLog.js';
 
 const DEVICE = '0f3a5c7e-9b1d-2f4a-6c8e-0b2d4f6a8c0e';
 const KEY = ufFacetKey('5d0c9a1e-3b7f-4e2a-9c6d-1f8b0e4a7c35', 'note');
@@ -115,7 +115,24 @@ describe('the sync.push line of a Push that failed', () => {
 describe('the sync field allow-list', () => {
   it('names exactly the fields a sync line may carry', () => {
     expect([...SYNC_LOG_FIELDS].sort()).toEqual(
-      ['applied', 'code', 'duplicate', 'events', 'held', 'outcome', 'reasons', 'rejected', 'replay', 'review', 'stale', 'unspecified'].sort(),
+      [
+        'applied',
+        'code',
+        'duplicate',
+        'events',
+        'held',
+        'origin_trace',
+        'origin_trace_absent',
+        'origin_trace_malformed',
+        'origin_trace_more',
+        'outcome',
+        'reasons',
+        'rejected',
+        'replay',
+        'review',
+        'stale',
+        'unspecified',
+      ].sort(),
     );
   });
 
@@ -126,5 +143,57 @@ describe('the sync field allow-list', () => {
 
   it('takes another list, for a line with fields of its own', () => {
     expect(allowListed({ events: 1, origin_trace: 'none' }, new Set(['origin_trace']))).toEqual({ origin_trace: 'none' });
+  });
+});
+
+describe('the origin_trace fields of a sync.push line', () => {
+  /** A distinct well-formed origin_trace (32 lowercase hex, not all zero) per n. */
+  const id = (n: number) => n.toString(16).padStart(32, 'a');
+  const traced = (...traces: (string | undefined)[]) => traces.map((originTrace) => (originTrace === undefined ? {} : { originTrace }));
+  const NONE = { origin_trace: [], origin_trace_more: 0, origin_trace_malformed: 0, origin_trace_absent: 0 };
+
+  it('lists each distinct well-formed id once, in push order, so the oldest action comes first', () => {
+    expect(originTraceFields(traced(id(2), id(1), id(2), id(3), id(1)))).toEqual({ ...NONE, origin_trace: [id(2), id(1), id(3)] });
+  });
+
+  it(`lists at most ${ORIGIN_TRACE_CAP} and counts the distinct ids past them`, () => {
+    expect(ORIGIN_TRACE_CAP).toBe(20);
+    const ids = Array.from({ length: 25 }, (_, n) => id(n + 1));
+    const fields = originTraceFields(traced(...ids, ...ids, id(1)));
+    expect(fields).toEqual({ ...NONE, origin_trace: ids.slice(0, 20), origin_trace_more: 5 });
+    expect(originTraceFields(traced(...ids.slice(0, 20)))).toEqual({ ...NONE, origin_trace: ids.slice(0, 20) });
+  });
+
+  it('counts an event with none as absent: an app built before 0.7.0 sends none', () => {
+    expect(originTraceFields(traced(undefined, id(1), undefined))).toEqual({ ...NONE, origin_trace: [id(1)], origin_trace_absent: 2 });
+  });
+
+  it('counts each malformed value, whatever its length, and never carries one', () => {
+    const malformed = [
+      '',
+      `zz-${'canary'}`,
+      id(7).toUpperCase(),
+      '0'.repeat(32),
+      'b'.repeat(31),
+      'b'.repeat(33),
+      `${'b'.repeat(31)}g`,
+      ` ${'b'.repeat(32)}`,
+      `${'c'.repeat(32)}\n`,
+      'é'.repeat(32),
+      `canary-${'d'.repeat(10_000)}`,
+    ];
+    const fields = originTraceFields(traced(...malformed, id(1)));
+    expect(fields).toEqual({ ...NONE, origin_trace: [id(1)], origin_trace_malformed: malformed.length });
+    const text = JSON.stringify(fields);
+    for (const value of malformed.filter((v) => v !== '')) expect(text).not.toContain(value);
+    expect(text).not.toMatch(/canary|BBB|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|ccc|ddd|é|0{32}/i);
+  });
+
+  it('carries every field for an empty Push, so a query never meets a missing one', () => {
+    expect(originTraceFields([])).toEqual(NONE);
+  });
+
+  it('writes only allow-listed fields', () => {
+    for (const field of Object.keys(originTraceFields(traced(id(1), 'zz', undefined)))) expect(SYNC_LOG_FIELDS.has(field)).toBe(true);
   });
 });

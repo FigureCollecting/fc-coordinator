@@ -165,6 +165,95 @@ describe('the sync.push line', () => {
   });
 });
 
+describe('the origin_trace on the sync.push line (fc-api-contract 0.7.0)', () => {
+  const traceIdNew = () => randomBytes(16).toString('hex');
+
+  it('lists each action\'s origin_trace beside the request\'s trace, so the 09:00 action joins the 15:00 Push', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const [actionA, actionB] = [traceIdNew(), traceIdNew()];
+    const canary = `zz-${randomUUID()}`;
+    const { traceId, traceparent } = trace();
+    caller.headers = { traceparent };
+    const mark = log.mark();
+    ok(
+      await caller.push({
+        clientId: randomUUID(),
+        events: [
+          { ...upsert(occFacetKey(randomUUID(), 'status'), mint(caller, -60_000, 1), status('owned')), originTrace: actionA },
+          { ...upsert(occFacetKey(randomUUID(), 'status'), mint(caller, -60_000, 2), status('owned')), originTrace: actionA },
+          { ...upsert(occFacetKey(randomUUID(), 'status'), mint(caller, -60_000, 3), status('wished')), originTrace: actionB },
+          upsert(occFacetKey(randomUUID(), 'status'), mint(caller, -60_000, 4), status('owned')),
+          { ...upsert(occFacetKey(randomUUID(), 'status'), mint(caller, -60_000, 5), status('owned')), originTrace: canary },
+        ],
+      }),
+    );
+
+    const lines = log.sync(mark);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      msg: 'sync.push',
+      outcome: 'ok',
+      events: 5,
+      applied: 5,
+      origin_trace: [actionA, actionB],
+      origin_trace_more: 0,
+      origin_trace_malformed: 1,
+      origin_trace_absent: 1,
+    });
+    expect(traceIdOf(lines[0]!)).toBe(traceId);
+    expect(log.raw.slice(mark).join('\n')).not.toContain(canary);
+  });
+
+  it('never writes a malformed value, whatever its length, and never one per event', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const malformed = [`canary-${randomUUID()}`, traceIdNew().toUpperCase(), `${traceIdNew()}0`, `x${randomUUID()}`.repeat(300)];
+    const mark = log.mark();
+    ok(
+      await caller.push({
+        clientId: randomUUID(),
+        events: malformed.map((originTrace, i) => ({ ...upsert(occFacetKey(randomUUID(), 'status'), mint(caller, -60_000, i), status('owned')), originTrace })),
+      }),
+    );
+    const lines = log.sync(mark);
+    expect(lines).toEqual([expect.objectContaining({ msg: 'sync.push', events: 4, origin_trace: [], origin_trace_malformed: 4, origin_trace_absent: 0 })]);
+    const text = log.raw.slice(mark).join('\n');
+    for (const value of malformed) expect(text).not.toContain(value.slice(0, 33));
+  });
+
+  it(`lists at most 20 actions and counts the rest`, async () => {
+    const caller = await SyncCaller.enrol(h);
+    const actions = Array.from({ length: 23 }, traceIdNew);
+    const mark = log.mark();
+    ok(
+      await caller.push({
+        clientId: randomUUID(),
+        events: actions.map((originTrace, i) => ({ ...upsert(occFacetKey(randomUUID(), 'status'), mint(caller, -60_000, i), status('owned')), originTrace })),
+      }),
+    );
+    expect(log.sync(mark)).toEqual([expect.objectContaining({ events: 23, origin_trace: actions.slice(0, 20), origin_trace_more: 3 })]);
+  });
+
+  it('lists the origin_trace a replay carries, and what a refused Push carried', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const key = occFacetKey(randomUUID(), 'status');
+    const batch = { clientId: randomUUID(), events: [upsert(key, mint(caller), status('owned'))] };
+    const [first, retry, refused] = [traceIdNew(), traceIdNew(), traceIdNew()];
+    ok(await caller.push({ ...batch, events: [{ ...batch.events[0]!, originTrace: first }] }));
+
+    const mark = log.mark();
+    ok(await caller.push({ ...batch, events: [{ ...batch.events[0]!, originTrace: retry }] }));
+    ok(await caller.push(batch));
+    const reused = await caller.push({ clientId: batch.clientId, events: [{ ...upsert(key, mint(caller, -30_000), status('wished')), originTrace: refused }] });
+    expect(reused).toMatchObject({ ok: false, code: 'invalid_argument' });
+
+    expect(log.sync(mark)).toEqual([
+      expect.objectContaining({ outcome: 'ok', replay: true, duplicate: 1, origin_trace: [retry], origin_trace_absent: 0 }),
+      expect.objectContaining({ outcome: 'ok', replay: true, duplicate: 1, origin_trace: [], origin_trace_absent: 1 }),
+      expect.objectContaining({ level: 'warn', outcome: 'error', code: 'invalid_argument', events: 1, origin_trace: [refused], origin_trace_malformed: 0 }),
+    ]);
+  });
+});
+
 describe('a Push whose transaction rolls back', () => {
   // CRITIQUE 3: a line written inside the transaction calls a rolled-back edit applied, and the
   // retry, which finds no receipt, applied a second time instead of replay=true.
@@ -222,8 +311,9 @@ describe('what a sync line never carries', () => {
     const caller = await SyncCaller.enrol(h);
     caller.headers = { traceparent: trace().traceparent };
     const mark = log.mark();
-    ok(await caller.push({ clientId: randomUUID(), events: [upsert(occFacetKey(randomUUID(), 'status'), mint(caller), status('owned'))] }));
-    await caller.push({ clientId: '', events: [] });
+    const events = [{ ...upsert(occFacetKey(randomUUID(), 'status'), mint(caller), status('owned')), originTrace: randomBytes(16).toString('hex') }];
+    ok(await caller.push({ clientId: randomUUID(), events }));
+    await caller.push({ clientId: '', events });
     const lines: LogLine[] = log.sync(mark);
     expect(lines).toHaveLength(2);
     for (const line of lines) {
