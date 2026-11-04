@@ -33,7 +33,7 @@ describe('migrations — numbered-SQL doctrine', () => {
     // refuses a back-dated prefix (exit 6), so this file can never be added
     // later to a database that has already applied 0001 — it is 0000 or it is a
     // hand-run psql nobody can prove.
-    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql', '0004_sync_transactions.sql', '0005_import.sql', '0006_import_reimport.sql', '0007_display_restriction.sql', '0008_mask_store_revocation.sql']);
+    expect(files).toEqual(['0000_grants.sql', '0001_identity.sql', '0002_collection.sql', '0003_sync.sql', '0004_sync_transactions.sql', '0005_import.sql', '0006_import_reimport.sql', '0007_display_restriction.sql', '0008_mask_store_revocation.sql', '0009_late_edit_indexes.sql']);
   });
 
   it('contains no transaction control — the runner owns the boundaries (psql -1)', () => {
@@ -44,12 +44,30 @@ describe('migrations — numbered-SQL doctrine', () => {
     }
   });
 
-  it('contains no CREATE INDEX CONCURRENTLY, which cannot run inside psql -1', () => {
+  // The no-transaction header: migrate.sh applies such a file statement by statement (no -1), the
+  // only way CREATE INDEX CONCURRENTLY can run. It must be the file's FIRST line.
+  const NO_TX = /^-- migrate: no-transaction\n/;
+
+  it('contains CREATE INDEX CONCURRENTLY only in a file headed no-transaction, which psql -1 could not run', () => {
     for (const file of files) {
       // Comments are stripped first: the ban is on executable SQL, and the
       // files legitimately DOCUMENT the rule in their headers.
+      const raw = readFileSync(path.join(MIGRATIONS, file), 'utf8');
+      if (NO_TX.test(raw)) continue;
+      expect(raw.replace(/--[^\n]*/g, ''), file).not.toMatch(/CONCURRENTLY/i);
+    }
+  });
+
+  it('keeps a no-transaction file re-runnable: every CREATE INDEX and ADD COLUMN is IF NOT EXISTS', () => {
+    // Without the -1 wrapper a failure leaves the statements before it committed, so the re-run
+    // must step over them (migrate.sh writes the ledger row only after the whole file).
+    const noTx = files.filter((f) => NO_TX.test(readFileSync(path.join(MIGRATIONS, f), 'utf8')));
+    expect(noTx).toEqual(['0009_late_edit_indexes.sql']);
+    for (const file of noTx) {
       const sql = readFileSync(path.join(MIGRATIONS, file), 'utf8').replace(/--[^\n]*/g, '');
-      expect(sql).not.toMatch(/CONCURRENTLY/i);
+      for (const m of sql.matchAll(/CREATE\s+(UNIQUE\s+)?INDEX\b[^;]*/gi)) expect(m[0], file).toMatch(/CONCURRENTLY IF NOT EXISTS/);
+      for (const m of sql.matchAll(/ADD\s+COLUMN\b[^,;]*/gi)) expect(m[0], file).toMatch(/ADD COLUMN IF NOT EXISTS/);
+      expect(sql, file).not.toMatch(/CREATE\s+TABLE(?!\s+IF NOT EXISTS)/i);
     }
   });
 });
@@ -101,10 +119,10 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     await pg?.stop();
   });
 
-  it('applies all nine migrations in one run and records them in the ledger', async () => {
+  it('applies all ten migrations in one run and records them in the ledger', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=9 skipped=0');
+    expect(run.output).toContain('applied=10 skipped=0');
 
     const ledger = await asMigratorDb('SELECT filename FROM schema_migrations ORDER BY filename');
     expect(ledger.stdout.trim().split('\n')).toEqual([
@@ -117,13 +135,77 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
       '0006_import_reimport.sql',
       '0007_display_restriction.sql',
       '0008_mask_store_revocation.sql',
+      '0009_late_edit_indexes.sql',
     ]);
   });
 
   it('is a no-op on re-run', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=9');
+    expect(run.output).toContain('applied=0 skipped=10');
+  });
+
+  describe('0009_late_edit_indexes', () => {
+    const checked = (run: ExecResult): void => expect(run.exitCode, run.output).toBe(0);
+    const denied = (run: ExecResult, why: RegExp): void => {
+      expect(run.exitCode).not.toBe(0);
+      expect(run.output).toMatch(why);
+    };
+    const asApp = (sql: string): Promise<ExecResult> => pg.exec(['psql', '-U', APP, '-d', DB, '-At', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
+
+    it('builds every late-edit index, valid, CONCURRENTLY, outside the runner\'s transaction', async () => {
+      const idx = await asMigratorDb(
+        `SELECT c.relname || ' ' || i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+          WHERE c.relname IN ('feed_event_user_facet_seq_idx', 'feed_event_user_txn_open_idx', 'import_row_base_user_head_idx',
+                              'import_kept_copy_user_head_idx', 'facet_state_occ_head_idx', 'facet_state_occ_origin_idx',
+                              'import_copy_base_user_head_idx') ORDER BY 1`,
+      );
+      expect(idx.stdout.trim().split('\n')).toEqual([
+        'facet_state_occ_head_idx true',
+        'facet_state_occ_origin_idx true',
+        'feed_event_user_facet_seq_idx true',
+        'feed_event_user_txn_open_idx true',
+        'import_copy_base_user_head_idx true',
+        'import_kept_copy_user_head_idx true',
+        'import_row_base_user_head_idx true',
+      ]);
+      // The partial indexes keep the predicates the queries prove, and read no wide column (HOT stays).
+      const defs = await asMigratorDb(`SELECT indexdef FROM pg_indexes WHERE indexname LIKE 'facet_state_occ_%' OR indexname = 'feed_event_user_txn_open_idx' ORDER BY indexname`);
+      expect(defs.stdout).toContain('(user_id, occ_head) WHERE (occ_head IS NOT NULL)');
+      expect(defs.stdout).toContain('(user_id, occ_origin) WHERE (occ_origin IS NOT NULL)');
+      expect(defs.stdout).toContain('(user_id, seq) WHERE opens_txn');
+      expect(defs.stdout).not.toMatch(/payload/);
+    });
+
+    it('derives occ_head and occ_origin from an upsert of a copy\'s head or origin only, and lets the app neither write them nor be refused its own writes', async () => {
+      const U = '00000000-0000-4000-8000-0000000000a9';
+      const O = '00000000-0000-4000-8000-0000000000b9';
+      const H = '00000000-0000-4000-8000-0000000000c9';
+      const v = '2026-11-03T12:00:00.000000Z';
+      checked(await asApp(`INSERT INTO app_user (id) VALUES ('${U}')`));
+      const put = (key: string, op: string, payload: string) =>
+        asApp(`WITH f AS (INSERT INTO feed_event (user_id, facet_key, version, op, payload) VALUES ('${U}', '${key}', '${v}', '${op}', '${payload}') RETURNING seq)
+               INSERT INTO facet_state (user_id, facet_key, version, op, payload, seq) SELECT '${U}', '${key}', '${v}', '${op}', '${payload}', seq FROM f
+               ON CONFLICT (user_id, facet_key) DO UPDATE SET op = EXCLUDED.op, payload = EXCLUDED.payload, seq = EXCLUDED.seq`);
+      checked(await put(`occ/${O}/head`, 'upsert', `{"head_id":"${H}"}`));
+      checked(await put(`occ/${O}/origin`, 'upsert', '{"site":"mfc","native_id":"119","ordinal":1}'));
+      checked(await put(`occ/${O}/status`, 'upsert', '{"status":"owned"}'));
+      const cols = async () => (await asApp(`SELECT facet_key || ' ' || coalesce(occ_head, '-') || ' ' || coalesce(occ_origin, '-') FROM facet_state WHERE user_id = '${U}' ORDER BY 1`)).stdout.trim().split('\n');
+      expect(await cols()).toEqual([`occ/${O}/head ${H} -`, `occ/${O}/origin - 119`, `occ/${O}/status - -`]);
+      // A tombstoned head names no figure: its payload is '' and is never cast.
+      checked(await put(`occ/${O}/head`, 'delete', ''));
+      expect((await cols())[0]).toBe(`occ/${O}/head - -`);
+      denied(await asApp(`UPDATE facet_state SET occ_head = 'x' WHERE user_id = '${U}'`), /generated column|cannot be updated|can only be updated to DEFAULT/i);
+    });
+
+    it('bounds sessions on the database: idle in a transaction 120 s, a statement 30 s', async () => {
+      const set = await asMigratorDb(
+        `SELECT unnest(setconfig) FROM pg_db_role_setting WHERE setrole = 0 AND setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database()) ORDER BY 1`,
+      );
+      expect(set.stdout.trim().split('\n')).toEqual(['idle_in_transaction_session_timeout=120s', 'statement_timeout=30s']);
+      expect((await asApp('SHOW idle_in_transaction_session_timeout')).stdout.trim()).toBe('2min');
+      expect((await asApp('SHOW statement_timeout')).stdout.trim()).toBe('30s');
+    });
   });
 
   // ── The two-role split, proven rather than described ──────────────────────
@@ -639,7 +721,7 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
   it('still exits 0 on a correctly named directory', async () => {
     const run = await migrate();
     expect(run.exitCode).toBe(0);
-    expect(run.output).toContain('applied=0 skipped=9');
+    expect(run.output).toContain('applied=0 skipped=10');
   });
 
   it('refuses the whole run when an applied migration has been edited on disk', async () => {
@@ -651,5 +733,64 @@ describe('migrations — applied by scripts/migrate.sh against a real Postgres',
     const run = await migrate({}, '/tmp/tampered');
     expect(run.exitCode).toBe(4);
     expect(run.output).toMatch(/provenance/i);
+  });
+  // ── no-transaction files: CREATE INDEX CONCURRENTLY, statement by statement ──────────────────
+  describe('a file headed "-- migrate: no-transaction"', () => {
+    const NOTX_DB = 'fccoord_notx';
+    const inNotx = (sql: string): Promise<ExecResult> => pg.exec(['psql', '-U', MIGRATOR, '-d', NOTX_DB, '-At', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
+    const write = (dir: string, files: Record<string, string>): Promise<ExecResult> =>
+      pg.exec(['sh', '-c', [`rm -rf ${dir} && mkdir -p ${dir}`, ...Object.entries(files).map(([f, body]) => `printf '%s' '${body}' > ${dir}/${f}`)].join(' && ')]);
+    const T = 'CREATE TABLE t (k int);\n';
+    const UNIQ = '-- migrate: no-transaction\nCREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS t_k_uniq ON t (k);\n';
+
+    beforeAll(async () => {
+      await asSuper(`CREATE DATABASE ${NOTX_DB} OWNER ${MIGRATOR}`);
+    });
+
+    it('is applied outside a transaction, and its ledger row is written only once the whole file stood', async () => {
+      await write('/tmp/notx', { '0000_t.sql': T });
+      expect((await migrate({ PGDATABASE: NOTX_DB }, '/tmp/notx')).exitCode).toBe(0);
+      expect((await inNotx('INSERT INTO t VALUES (1), (1)')).exitCode).toBe(0);
+      await write('/tmp/notx', { '0000_t.sql': T, '0001_uniq.sql': UNIQ });
+
+      // The build fails on the duplicate and leaves an INVALID index behind, as CIC does.
+      const failed = await migrate({ PGDATABASE: NOTX_DB }, '/tmp/notx');
+      expect(failed.exitCode).not.toBe(0);
+      expect(failed.output).toMatch(/could not create unique index/);
+      expect((await inNotx("SELECT indisvalid FROM pg_index WHERE indexrelid = 't_k_uniq'::regclass")).stdout.trim()).toBe('f');
+      expect((await inNotx("SELECT count(*) FROM schema_migrations WHERE filename = '0001_uniq.sql'")).stdout.trim()).toBe('0');
+
+      // Re-run: IF NOT EXISTS steps over the invalid index, and the runner refuses to record it.
+      const refused = await migrate({ PGDATABASE: NOTX_DB }, '/tmp/notx');
+      expect(refused.exitCode).toBe(7);
+      expect(refused.output).toMatch(/invalid index.*t_k_uniq.*DROP INDEX CONCURRENTLY/is);
+      expect((await inNotx("SELECT count(*) FROM schema_migrations WHERE filename = '0001_uniq.sql'")).stdout.trim()).toBe('0');
+
+      // The operator's undo: drop it, fix the data, re-run.
+      expect((await inNotx('DROP INDEX CONCURRENTLY t_k_uniq')).exitCode).toBe(0);
+      expect((await inNotx('DELETE FROM t')).exitCode).toBe(0);
+      const done = await migrate({ PGDATABASE: NOTX_DB }, '/tmp/notx');
+      expect(done.exitCode, done.output).toBe(0);
+      expect(done.output).toContain('applied=1 skipped=1');
+      expect((await inNotx("SELECT indisvalid FROM pg_index WHERE indexrelid = 't_k_uniq'::regclass")).stdout.trim()).toBe('t');
+    });
+
+    it('could not be applied without the header: CONCURRENTLY inside the runner\'s transaction fails whole', async () => {
+      await write('/tmp/notx2', { '0000_t.sql': T, '0001_uniq.sql': '', '0002_bare.sql': 'CREATE INDEX CONCURRENTLY IF NOT EXISTS t_k_bare ON t (k);\n' });
+      await pg.exec(['sh', '-c', 'cp /tmp/notx/0001_uniq.sql /tmp/notx2/0001_uniq.sql']);
+      const run = await migrate({ PGDATABASE: NOTX_DB }, '/tmp/notx2');
+      expect(run.exitCode).not.toBe(0);
+      expect(run.output).toMatch(/cannot run inside a transaction block/);
+    });
+
+    it('runs its own sessions free of the database\'s statement_timeout, which 0009 sets to 30 s', async () => {
+      expect((await inNotx(`ALTER DATABASE ${NOTX_DB} SET statement_timeout = '1s'`)).exitCode).toBe(0);
+      expect((await inNotx('SELECT pg_sleep(1.5)')).output).toMatch(/statement timeout/);
+      await write('/tmp/notx3', { '0000_t.sql': T, '0001_uniq.sql': '', '0003_slow.sql': 'SELECT pg_sleep(1.5);\n' });
+      await pg.exec(['sh', '-c', 'cp /tmp/notx/0001_uniq.sql /tmp/notx3/0001_uniq.sql']);
+      const run = await migrate({ PGDATABASE: NOTX_DB }, '/tmp/notx3');
+      expect(run.exitCode, run.output).toBe(0);
+      expect(run.output).toContain('applied=1 skipped=2');
+    });
   });
 });
