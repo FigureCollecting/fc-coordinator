@@ -16,6 +16,7 @@
     "dev": "tsx watch src/server.ts",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
+    "test:plan-guard": "vitest run test/plan-guard.test.ts",
     "migrate": "sh scripts/migrate.sh",
     "proto:generate": "buf generate",
     "phase2": "tsx scripts/phase2-client/cli.ts",

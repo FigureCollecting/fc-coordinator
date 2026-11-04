@@ -219,7 +219,8 @@ export async function recordCursor(
   await db.query(
     `INSERT INTO feed_cursor (user_id, device_id, acked_seq, delivered_seq) VALUES ($1, $2, $3, $4)
      ON CONFLICT (user_id, device_id) DO UPDATE
-       SET acked_seq = EXCLUDED.acked_seq, delivered_seq = EXCLUDED.delivered_seq, updated_at = now()`,
+       SET acked_seq = EXCLUDED.acked_seq, delivered_seq = EXCLUDED.delivered_seq, updated_at = now()
+     WHERE feed_cursor.delivered_seq IS DISTINCT FROM EXCLUDED.delivered_seq OR feed_cursor.acked_seq IS DISTINCT FROM EXCLUDED.acked_seq`,
     [userId, deviceId, ackedSeq.toString(), deliveredSeq.toString()],
   );
 }

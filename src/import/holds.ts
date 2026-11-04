@@ -133,13 +133,20 @@ async function placeOnFigures(tx: SqlClient, userId: string, edits: readonly Pus
  * The frames of `heads` whose import marker is after `after` (the push's oldest basis). A frame whose
  * marker is the basis itself was seen; reading it too would change nothing, since an edit is late
  * only before a marker above its basis and replayFigure counts only those.
+ *
+ * Each import's start is computed once per import, not once per frame row: MATERIALIZED keeps the
+ * planner from inlining the CTE back into a per-row SubPlan (C-4; feed_event_user_txn_open_idx makes
+ * each one a single probe). Recording the start on import_run is the clean follow-on.
  */
-async function readFrames(tx: SqlClient, userId: string, heads: readonly string[], after: bigint): Promise<FrameRow[]> {
+export async function readFrames(tx: SqlClient, userId: string, heads: readonly string[], after: bigint): Promise<FrameRow[]> {
   const { rows } = await tx.query<{ head_id: string; import_number: number; export_date: string; marker: string; start: string; settled: boolean; before: FrameBefore | null }>(
-    `SELECT f.head_id, f.import_number, to_char(r.export_date, 'YYYY-MM-DD') AS export_date, r.marker_seq AS marker, f.settled, f.before,
-            (SELECT max(e.seq) FROM feed_event e WHERE e.user_id = r.user_id AND e.opens_txn AND e.seq <= r.marker_seq) AS start
-       FROM import_frame f JOIN import_run r ON r.user_id = f.user_id AND r.import_number = f.import_number
-      WHERE f.user_id = $1 AND f.head_id = ANY($2::uuid[]) AND r.marker_seq > $3
+    `WITH runs AS MATERIALIZED (
+       SELECT r.import_number, r.export_date, r.marker_seq,
+              (SELECT max(e.seq) FROM feed_event e WHERE e.user_id = r.user_id AND e.opens_txn AND e.seq <= r.marker_seq) AS start
+         FROM import_run r WHERE r.user_id = $1 AND r.marker_seq > $3)
+     SELECT f.head_id, f.import_number, to_char(r.export_date, 'YYYY-MM-DD') AS export_date, r.marker_seq AS marker, f.settled, f.before, r.start
+       FROM import_frame f JOIN runs r ON r.import_number = f.import_number
+      WHERE f.user_id = $1 AND f.head_id = ANY($2::uuid[])
       ORDER BY r.marker_seq`,
     [userId, heads, after.toString()],
   );
@@ -336,6 +343,30 @@ async function placeLate(tx: SqlClient, userId: string, e: PushedEdit, feed: Fee
   return (await applyEvent(tx, userId, e, feed)).applied;
 }
 
+/**
+ * Every edit after `marker` to one of `keys` or to any key under one of `occs` (occ/{occ}/...: the
+ * copy fields and the open-ended families, occ/{occ}/tag/{tag} included). One literal range per occ,
+ * ['occ/<occ>/', 'occ/<occ>0'), is exactly the keys that start 'occ/<occ>/' in bytewise order ('0'
+ * follows '/'), which facet_key's COLLATE "C" is; an occ id is a uuid, never holding '/'. Literal
+ * bounds let feed_event_user_facet_seq_idx serve each range (a BitmapOr); occs bound through unnest
+ * would hide them from the planner.
+ */
+export async function editsSince(
+  tx: SqlClient,
+  userId: string,
+  marker: bigint,
+  keys: readonly string[],
+  occs: readonly string[],
+): Promise<{ facet_key: string; version: string }[]> {
+  const ranges = occs.map((_, i) => `(facet_key >= $${4 + 2 * i} AND facet_key < $${5 + 2 * i})`);
+  const { rows } = await tx.query<{ facet_key: string; version: string }>(
+    `SELECT facet_key, version FROM feed_event
+      WHERE user_id = $1 AND seq > $2 AND (${['facet_key = ANY($3::text[])', ...ranges].join(' OR ')})`,
+    [userId, marker.toString(), keys, ...occs.flatMap((occ) => [`occ/${occ}/`, `occ/${occ}0`])],
+  );
+  return rows;
+}
+
 /** The replay of S's late edits in one Push: held, the decision as it was, or a revision. */
 async function replayFigure(
   tx: SqlClient,
@@ -424,11 +455,7 @@ async function reviseOrHold(
   const ids = unique([...b.rows, ...b.rowBases].map((r) => r.id));
   const occs = unique([...b.occs, ...occsOf(late), ...occsOf(recorded.map((r) => r.facet)), ...(await figureOccs(tx, userId, S, ids))]).sort(bytewise);
   const keys = figureKeys(S, occs);
-  const { rows: since } = await tx.query<{ facet_key: string; version: string }>(
-    `SELECT facet_key, version FROM feed_event
-      WHERE user_id = $1 AND seq > $2 AND (facet_key = ANY($3::text[]) OR (facet_key LIKE 'occ/%' AND split_part(facet_key, '/', 2) = ANY($4::text[])))`,
-    [userId, f.marker.toString(), [...keys, `res/mfc/${S}`], occs],
-  );
+  const since = await editsSince(tx, userId, f.marker, [...keys, `res/mfc/${S}`], occs);
   const replayedHere = new Set(recorded.map((r) => `${r.facet.facetKey}\n${r.facet.version}`));
   if (since.some((e) => !isServerVersion(e.version) && !replayedHere.has(`${e.facet_key}\n${e.version}`))) return HOLD;
 

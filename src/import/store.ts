@@ -54,16 +54,19 @@ export async function readImportState(tx: SqlClient, userId: string): Promise<Im
   );
 }
 
-/** Every copy whose head or base is S or whose origin is one of `ids` (the rows of S). */
+/**
+ * Every copy whose head or base is S or whose origin is one of `ids` (the rows of S). occ_head and
+ * occ_origin are migration 0009's generated columns: a copy's head_id (native_id) while its head
+ * (origin) is an upsert, NULL otherwise, each with a partial index. S is a lowercase uuid (an answer
+ * key's or a frame's), so the base is compared as a uuid and its index serves it.
+ */
 export async function figureOccs(tx: SqlClient, userId: string, S: string, ids: readonly string[]): Promise<string[]> {
   const { rows } = await tx.query<{ occ: string }>(
-    `SELECT split_part(facet_key, '/', 2) AS occ FROM facet_state
-      WHERE user_id = $1 AND facet_key LIKE 'occ/%/head' AND (CASE WHEN op = 'upsert' THEN payload::jsonb ->> 'head_id' END) = $2
+    `SELECT split_part(facet_key, '/', 2) AS occ FROM facet_state WHERE user_id = $1 AND occ_head = $2
      UNION
-     SELECT split_part(facet_key, '/', 2) FROM facet_state
-      WHERE user_id = $1 AND facet_key LIKE 'occ/%/origin' AND (CASE WHEN op = 'upsert' THEN payload::jsonb ->> 'native_id' END) = ANY($3::text[])
+     SELECT split_part(facet_key, '/', 2) FROM facet_state WHERE user_id = $1 AND occ_origin = ANY($3::text[])
      UNION
-     SELECT occ_id::text FROM import_copy_base WHERE user_id = $1 AND head_id::text = $2`,
+     SELECT occ_id::text FROM import_copy_base WHERE user_id = $1 AND head_id = $2::uuid`,
     [userId, S, ids],
   );
   return rows.map((r) => r.occ);
