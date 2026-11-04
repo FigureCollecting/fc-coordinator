@@ -17,7 +17,20 @@
 #     are deliberately NON-idempotent (bare CREATE TABLE/INDEX), so that state
 #     would wedge every retry on the first duplicate object. -1 is valid here
 #     because every file is transactional DDL: no CREATE INDEX CONCURRENTLY,
-#     no BEGIN/COMMIT of its own (enforced mechanically - next bullet).
+#     no BEGIN/COMMIT of its own (enforced mechanically - next bullet) - with
+#     ONE exception, the next bullet but one.
+#   * No-transaction files: a file whose FIRST line is exactly
+#       -- migrate: no-transaction
+#     is applied WITHOUT -1, statement by statement in autocommit, which is the
+#     only way CREATE INDEX CONCURRENTLY can run. Its ledger row is written in
+#     a separate step, only after the whole file succeeded AND no index in the
+#     schema is left invalid (a failed or cancelled CONCURRENTLY build leaves an
+#     INVALID index that IF NOT EXISTS would then step over: exit 7, naming it;
+#     DROP INDEX CONCURRENTLY it and re-run). A failure part-way leaves the
+#     statements before it committed, so such a file must be RE-RUNNABLE: every
+#     CREATE INDEX CONCURRENTLY IF NOT EXISTS, every ADD COLUMN IF NOT EXISTS
+#     (test/migrations.test.ts enforces both). The transaction-control scan
+#     below applies to it as to every file.
 #   * Pre-apply transaction-control scan (exit 5): every PENDING file is
 #     tokenized BEFORE anything is applied; a top-level BEGIN / START / COMMIT
 #     / END / ABORT / ROLLBACK / SAVEPOINT / RELEASE refuses the WHOLE run.
@@ -55,9 +68,16 @@
 #
 # Exit codes: 0 = success (applied and/or skipped) - 2 = config/preflight
 #   refusal - 4 = provenance refusal - 5 = transaction control inside a
-#   pending file - 6 = out-of-order (back-dated) pending file - other = psql
-#   failure (that file's transaction rolled back whole: no DDL kept, no
-#   ledger row).
+#   pending file - 6 = out-of-order (back-dated) pending file - 7 = an invalid
+#   index after a no-transaction file (no ledger row) - other = psql failure
+#   (that file's transaction rolled back whole: no DDL kept, no ledger row;
+#   for a no-transaction file, the statements before the failing one stay and
+#   the re-run steps over them).
+#
+# Session limits: the runner's own sessions run with statement_timeout=0
+#   (PGOPTIONS, ahead of any the caller passes), so a database-level
+#   statement_timeout (0009 sets 30 s) never cancels a migration or the
+#   advisory-lock wait below, which is indefinite by design.
 #
 # Concurrency: serialized on session-level advisory lock key
 #   7377849944825291881 (0x6663636f6f726469, ASCII "fccoordi"), held by a
@@ -90,6 +110,7 @@ else die 2 "need sha256sum or shasum on PATH"; fi
 sha256_of() { $SHATOOL -- "$1" | awk '{print $1}'; }
 
 export PGAPPNAME=${PGAPPNAME:-fccoord-migrate}
+export PGOPTIONS="-c statement_timeout=0 ${PGOPTIONS:-}"
 PSQL="psql -X -q -v ON_ERROR_STOP=1"
 
 # --- preflight: prove who/where, refuse superuser ---------------------------
@@ -261,8 +282,23 @@ for f in "$@"; do
     n_skipped=$((n_skipped+1))
     continue
   fi
+  record="INSERT INTO schema_migrations (filename, sha256, applied_at) VALUES ('$b', '$disk_sha', now())"
+  if [ "$(head -n 1 -- "$f")" = "-- migrate: no-transaction" ]; then
+    printf 'migrate: apply %s (sha256 %s, no transaction)\n' "$b" "$disk_sha"
+    if $PSQL -f "$f"; then :; else
+      rc=$?   # psql's own exit status, as for a transactional file
+      printf 'migrate: FAILED %s — no-transaction file: the statements before the failure are committed, no ledger row; fix and re-run (every statement is re-runnable)\n' "$b" >&2
+      exit "$rc"
+    fi
+    invalid=$($PSQL -At -c "SELECT string_agg(c.relname, ' ' ORDER BY c.relname) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE NOT i.indisvalid AND n.nspname = current_schema()")
+    [ -z "$invalid" ] ||
+      die 7 "invalid index(es) after $b: $invalid — a CONCURRENTLY build failed or was cancelled; DROP INDEX CONCURRENTLY each and re-run (no ledger row written)"
+    $PSQL -c "$record" >/dev/null
+    n_applied=$((n_applied+1))
+    continue
+  fi
   printf 'migrate: apply %s (sha256 %s)\n' "$b" "$disk_sha"
-  if $PSQL -1 -f "$f" -c "INSERT INTO schema_migrations (filename, sha256, applied_at) VALUES ('$b', '$disk_sha', now())"; then
+  if $PSQL -1 -f "$f" -c "$record"; then
     n_applied=$((n_applied+1))
   else
     rc=$?   # actual psql exit status (the failing condition's own code)

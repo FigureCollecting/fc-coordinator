@@ -455,6 +455,14 @@ Numbered raw SQL plus `psql`, mirroring fc-aggregation's proven doctrine:
 
 - each file commits **atomically with its ledger row** (`psql -1`), so a crash
   can never leave an applied-but-unrecorded migration;
+- the one exception is a file whose first line is `-- migrate: no-transaction`
+  (0009: `CREATE INDEX CONCURRENTLY` cannot run in a transaction). It runs
+  statement by statement and every statement must be re-runnable (`IF NOT
+  EXISTS`): a failure part-way keeps what ran before it and writes no ledger
+  row, and the re-run steps over it. The ledger row is written only once no
+  index in the schema is left INVALID (exit `7` otherwise, naming each);
+- the runner sets its own sessions' `statement_timeout` to 0, so the
+  database-wide 30 s limit 0009 sets never cuts a migration short;
 - applied files are **immutable** — an edited file refuses the whole run;
 - a back-dated numeric prefix refuses the whole run (fix forward, gaps are fine);
 - transaction control inside a migration refuses the whole run: the runner owns
@@ -463,7 +471,10 @@ Numbered raw SQL plus `psql`, mirroring fc-aggregation's proven doctrine:
 - re-running is a no-op.
 
 Exit codes: `0` success, `2` preflight refusal, `4` provenance refusal, `5`
-transaction control in a pending file, `6` out-of-order file.
+transaction control in a pending file, `6` out-of-order file, `7` an INVALID
+index after a no-transaction file (no ledger row: `DROP INDEX CONCURRENTLY` it,
+once `pg_stat_progress_create_index` shows no build of it in progress, and
+re-run).
 
 | Migration | Contents |
 |---|---|
@@ -475,6 +486,7 @@ transaction control in a pending file, `6` out-of-order file.
 | `0006_import_reimport.sql` | `import_copy_base.import_removed` (a copy an import removed), `import_kept_copy` (knowing keeps), `import_export_row` (the latest export's rows, for the discrepancy report), `import_frame.before` (each figure as the import found it) and, append-only, `import_late_edit` (the late edits a Push replayed and APPLIED) and `import_revision` (the revisions that changed a figure) |
 | `0007_display_restriction.sql` | `display_restriction` (rule id, level image/product/source, subject, scope no_display/owner_views_only/no_share/no_mask): data the coordinator reads at the image-list chokepoint; the CHECKs are the writer's rules; the app role may only read it |
 | `0008_mask_store_revocation.sql` | MASK-G: a store's cut-out revocation is one `display_restriction` row, held to one shape by a CHECK: rule `mask-store:<site key>`, level `source`, the site key in the spine's grammar `^[a-z0-9]+(-[a-z0-9]+)*$`, scope `no_mask` (written by `scripts/mask-store.sh`) |
+| `0009_late_edit_indexes.sql` | No transaction (built `CONCURRENTLY`). The late-edit path's indexes: `feed_event (user_id, facet_key, seq)`, `feed_event (user_id, seq) WHERE opens_txn`, and `(user_id, head_id)` on `import_row_base`, `import_kept_copy` and `import_copy_base`. Two STORED generated columns on `facet_state`, `occ_head` and `occ_origin` (what `figureOccs` compares), each with a partial index, so a score or status edit stays HOT. The database's session limits: `idle_in_transaction_session_timeout` 120 s, `statement_timeout` 30 s |
 
 ### A store asks for its cut-outs to be removed (MASK-G)
 

@@ -371,6 +371,26 @@ describe('HELD only for a reaction', () => {
     expect((await db.admin.query('SELECT 1 FROM import_late_edit WHERE user_id = $1', [a.userId])).rows).toHaveLength(0);
   });
 
+  it('(i) holds a late sale when another device TAGGED the copy since the re-import: occ/{occ}/tag/{tag} is an edit to the copy', async () => {
+    // The revision's "anything since the marker" reads every key under S's copies. A rewrite that
+    // enumerated the copy fields (head, status, collection, disposal) would lose the open-ended tag
+    // family and revise here, over the other device's edit.
+    const { a, b } = await twoDevices();
+    const [x, y] = [nextId(), nextId()];
+    const cx = importOccId(KEY, a.userId, x, 1);
+    await imported(a, [row(x, 'Owned'), row(y, 'Owned')]);
+    const { cursor: bSaw } = await drain(b);
+    const sale = edit(b, `occ/${cx}/status`, { status: 'former' }, bSaw, 60_000);
+    await imported(a, [row(y, 'Owned')], DATE_B);
+    const { cursor: aSaw } = await drain(a);
+    expect(outcomes(await pushed(a, [edit(a, `occ/${cx}/tag/${randomUUID()}`, {}, aSaw)]))).toEqual(['APPLIED']);
+
+    const res = await pushed(b, [sale]);
+    expect(outcomes(res)).toEqual(['HELD']);
+    expect(await heldCount(a.userId)).toBe(1);
+    expect((await db.admin.query('SELECT 1 FROM import_revision WHERE user_id = $1', [a.userId])).rows).toHaveLength(0);
+  });
+
   it('(iii) holds a late sale whose replay changes a result the user has since answered', async () => {
     const { a, b } = await twoDevices();
     const x = nextId();

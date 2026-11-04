@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripVTControlCharacters } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import config from '../vitest.config.js';
 
@@ -96,7 +97,17 @@ describe('the coverage gate is per file, not a repo-wide average', () => {
     // such suffix. So: at least one failure, and EVERY failure names the probe.
     // The absence of an unsuffixed line is the proof that the global numbers
     // were fine and only the per-file rule objected.
-    const failures = output.split('\n').filter((line) => line.includes('does not meet'));
+    //
+    // A failure is vitest's own threshold line, not any line holding the phrase:
+    // CI's default reporter also prints each passing test slower than
+    // slowTestThreshold (300 ms), and a test NAMED "... does not meet ..." was
+    // read as a failure. CI colours the output, so strip it before anchoring.
+    const THRESHOLD_FAILURE =
+      /^ERROR: Coverage for (?:lines|functions|statements|branches) \([\d.]+%\) does not meet (?:global|"[^"]+") threshold \([\d.]+%\)/;
+    const failures = output
+      .split('\n')
+      .map((line) => stripVTControlCharacters(line).trim())
+      .filter((line) => THRESHOLD_FAILURE.test(line));
     expect(failures.length).toBeGreaterThan(0);
     for (const line of failures) {
       expect({ line: line.trim(), namesProbe: line.trimEnd().endsWith(PROBE) }).toEqual({
