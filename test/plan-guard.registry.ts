@@ -71,8 +71,10 @@ export const REGISTRY: GuardEntry[] = [
   read('holds.lastMarker', /^SELECT max\(marker_seq\) AS seq FROM import_run WHERE user_id = \$1$/),
   read('holds.placeOnFigures', /^SELECT facet_key, payload FROM facet_state WHERE user_id = \$1 AND facet_key = ANY\(\$2::text\[\]\) AND op = 'upsert'$/),
   read('holds.readRevisions', /^SELECT v\.head_id, r\.marker_seq AS marker, v\.seq, v\.before, v\.after FROM import_revision v/),
-  // readFrames (C-4): the frames after the basis, each with its import's start (seq <= r.marker).
-  read('holds.readFrames', /^(SELECT f\.head_id, f\.import_number|WITH runs AS MATERIALIZED)/),
+  // readFrames (C-4): the frames after the basis, each with its import's start (seq <= r.marker). The
+  // start is one probe per import run, not per frame: a frame costs its own row and no more, so a
+  // per-frame probe (the old correlated SubPlan, ~3 buffers a frame) breaks the bound.
+  read('holds.readFrames', /^(SELECT f\.head_id, f\.import_number|WITH runs AS MATERIALIZED)/, { base: 60, perRow: 2 }),
   // facetsBefore (C-1): S's keys as the feed had them just below an import's start (seq < f.start).
   read('holds.facetsBefore', /^SELECT DISTINCT ON \(facet_key\) facet_key, version, op, payload FROM feed_event WHERE user_id = \$1 AND facet_key = ANY\(\$2::text\[\]\) AND seq < \$3/),
   read('holds.hadHeadBy', /^SELECT 1 FROM feed_event WHERE user_id = \$1 AND facet_key = \$2 AND op = 'upsert' AND seq <= \$3 LIMIT 1$/),

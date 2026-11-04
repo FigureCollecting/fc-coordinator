@@ -1,6 +1,7 @@
 -- Plan guard fill, part B, run after the whale's first import (made through the real app): more device
 -- pushes from the 240 background users, interleaved with the whale's own device edits to the copies its
--- import made (tag memberships, added and removed), until the whale holds 32x the median user's feed.
+-- import made (tag memberships, added and removed), until the whale holds 32x the median user's feed,
+-- and the whale's knowing keeps at 32x the median user's.
 -- Needs part A's temp tables (same session) and set_config('pg.whale', <uuid>). Tags only, so the
 -- whale's second import (also through the app) finds nothing of its own decisions moved.
 SET statement_timeout = 0;
@@ -39,6 +40,14 @@ SELECT current_setting('pg.whale')::uuid, floor(random() * 100000), (random() * 
        md5('dev:whale')
   FROM generate_series(1, (SELECT n FROM w_need)) j
   JOIN w_occ o ON o.i = 1 + (j * 7919) % (SELECT count(*) FROM w_occ);
+
+-- The whale's knowing keeps: 32x the median background user's, on figures MFC no longer lists (two
+-- copies each), so the per-figure reads of import_kept_copy have a whale to walk past. None is on a
+-- figure of the whale's export, so its second import ends none of them.
+INSERT INTO import_kept_copy (user_id, occ_id, head_id, kind)
+SELECT current_setting('pg.whale')::uuid, md5('wkept:' || j)::uuid, md5('wkhead:' || (j / 2))::uuid, 'owned'
+  FROM generate_series(1, 32 * (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY n)
+                                  FROM (SELECT count(*) AS n FROM import_kept_copy WHERE user_id IN (SELECT uid FROM g_user) GROUP BY user_id) k)) j;
 
 CREATE TEMP TABLE b_mark AS SELECT coalesce(max(seq), 0) AS seq FROM feed_event;
 INSERT INTO feed_event (user_id, facet_key, version, op, payload, opens_txn)

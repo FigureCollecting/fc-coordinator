@@ -5,8 +5,9 @@
 // Shape (PLAN.md U12 shared rules): postgres:17, migrated to head, the U5 planner costs
 // (random_page_cost 1.1, effective_io_concurrency 200), 240 background users with a median of 125 MFC
 // rows, and one WHALE at 32x the median user, made through the real app: two imports of 4,000 rows
-// and device edits in between. A 1x user runs the same scenario. feed_event and facet_state hold over
-// 320k rows; a 1x user is under 1 % of either.
+// and device edits in between, plus 32x the median user's knowing keeps (filled directly: no scenario
+// statement writes one, but two read them by figure). A 1x user runs the same scenario. feed_event and
+// facet_state hold over 320k rows; a 1x user is under 1 % of either.
 //
 // The scenario reaches every late-edit statement with the code's own bounds: the frames (seq <=
 // r.marker), facets before an import's start (seq < f.start), the revision path's edits since the
@@ -30,7 +31,7 @@ import { importOccId } from '../src/import/occ.js';
 import { figureOccs } from '../src/import/store.js';
 import { SpineReadClient } from '../src/spine/spineReadClient.js';
 import { startFakeSpineRead, type FakeSpineRead } from './helpers/fakeSpineRead.js';
-import { BIG_TABLES, judge, normalise, spyPool, type Captured, type GuardEntry, type Judged } from './helpers/planGuard.js';
+import { BIG_TABLES, judge, normalise, spyPool, type Captured, type GuardEntry, type Judged, type Queryable } from './helpers/planGuard.js';
 import { DISPLAY, ok, startSyncApp, SyncCaller, type SyncApp } from './helpers/syncClient.js';
 import { startSyncDatabase, SYNC_DB, type SyncDatabase } from './helpers/syncDatabase.js';
 import { headFor, mfcCsv, type FixtureRow } from './import/fixture.js';
@@ -184,16 +185,18 @@ afterAll(async () => {
 const count = async (sql: string, values: unknown[] = []) => Number((await db.admin.query<{ n: string }>(sql, values)).rows[0]!.n);
 
 describe('plan guard: the shape it runs on', () => {
-  it('is at growth shape: over 320k feed events and facets, a whale at about 32x the median user, a 1x user under 1 %', async () => {
+  it('is at growth shape: over 320k feed events and facets, a whale at about 32x the median user (its knowing keeps too), a 1x user under 1 %', async () => {
     const total = await count('SELECT count(*) AS n FROM feed_event');
     expect(total).toBeGreaterThan(320_000);
-    expect(await count('SELECT count(*) AS n FROM facet_state')).toBeGreaterThan(250_000);
+    expect(await count('SELECT count(*) AS n FROM facet_state')).toBeGreaterThan(320_000);
     const median = await count('SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY n) AS n FROM (SELECT count(*) AS n FROM feed_event GROUP BY user_id) x');
     const w = await count('SELECT count(*) AS n FROM feed_event WHERE user_id = $1', [whale.userId]);
     const one = await count('SELECT count(*) AS n FROM feed_event WHERE user_id = $1', [oneX.userId]);
     expect(w / median).toBeGreaterThan(24);
     expect(w / median).toBeLessThan(40);
     expect(one / total).toBeLessThan(0.01);
+    const keptMedian = await count('SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY n) AS n FROM (SELECT count(*) AS n FROM import_kept_copy GROUP BY user_id) x');
+    expect((await count('SELECT count(*) AS n FROM import_kept_copy WHERE user_id = $1', [whale.userId])) / keptMedian).toBeGreaterThan(24);
     for (const t of BIG_TABLES) expect(await count(`SELECT count(*) AS n FROM ${t}`), t).toBeGreaterThanOrEqual(5_000);
   });
 
@@ -204,6 +207,34 @@ describe('plan guard: the shape it runs on', () => {
 });
 
 const entryFor = (text: string): GuardEntry[] => REGISTRY.filter((e) => e.match.test(normalise(text)));
+
+/**
+ * Per statement text and scope: the first and the last values it was sent with, and the widest (the
+ * most array elements bound: a late push over twenty figures, say), each judged against its entry.
+ */
+async function judgeAll(on: Queryable): Promise<Judged[]> {
+  const width = (c: Captured) => c.values.reduce<number>((n, v) => n + (Array.isArray(v) ? v.length : 0), 0);
+  const picked = new Map<string, Captured[]>();
+  for (const c of captured) {
+    if (c.scope === 'setup') continue;
+    const k = `${c.scope}\n${normalise(c.text)}`;
+    const seen = picked.get(k) ?? [];
+    if (seen.length === 0) seen.push(c, c, c);
+    seen[1] = c;
+    if (width(c) > width(seen[2]!)) seen[2] = c;
+    picked.set(k, seen);
+  }
+  const judged: Judged[] = [];
+  for (const list of picked.values()) {
+    for (const c of new Set(list)) {
+      const entries = entryFor(c.text);
+      if (entries.length !== 1 || entries[0]!.kind === 'control') continue;
+      judged.push(await judge(on, entries[0]!, c));
+    }
+  }
+  return judged;
+}
+const failingOf = (judged: Judged[]): Judged[] => judged.filter((j) => j.violations.length > 0 && REGISTRY.find((e) => e.id === j.entry)!.allow === undefined);
 
 describe('plan guard: every statement the scenario sent', () => {
   it('is in the registry exactly once, and no allowance in it has expired', () => {
@@ -221,35 +252,41 @@ describe('plan guard: every statement the scenario sent', () => {
   });
 
   it('reads no big table whole, walks no index unbounded, repeats no SubPlan over one, and stays inside its buffer bound', async () => {
-    // Per statement text and scope: the first and the last values it was sent with, and the widest
-    // (the most array elements bound: a late push over twenty figures, say).
-    const width = (c: Captured) => c.values.reduce<number>((n, v) => n + (Array.isArray(v) ? v.length : 0), 0);
-    const picked = new Map<string, Captured[]>();
-    for (const c of captured) {
-      if (c.scope === 'setup') continue;
-      const k = `${c.scope}\n${normalise(c.text)}`;
-      const seen = picked.get(k) ?? [];
-      if (seen.length === 0) seen.push(c, c, c);
-      seen[1] = c;
-      if (width(c) > width(seen[2]!)) seen[2] = c;
-      picked.set(k, seen);
-    }
-    const judged: Judged[] = [];
-    for (const list of picked.values()) {
-      for (const c of new Set(list)) {
-        const entries = entryFor(c.text);
-        if (entries.length !== 1 || entries[0]!.kind === 'control') continue;
-        judged.push(await judge(db.admin, entries[0]!, c));
-      }
-    }
+    const judged = await judgeAll(db.admin);
     const report = process.env['PLAN_GUARD_REPORT'];
     if (report !== undefined) writeFileSync(report, JSON.stringify(judged, null, 1));
-    const failing = judged.filter((j) => j.violations.length > 0 && REGISTRY.find((e) => e.id === j.entry)!.allow === undefined);
+    const failing = failingOf(judged);
     expect(
       failing.map((j) => `${j.entry} [${j.scope}] ${j.violations.join('; ')}\n${j.plan}`),
       'statements over their bound',
     ).toEqual([]);
     expect(judged.length).toBeGreaterThan(20);
+  });
+
+  it('bites: without any one of the indexes 0009 builds, some statement breaks its bound', async () => {
+    // Every index 0009 builds, read from the migration itself: a new one needs a statement here that needs it.
+    const sql = readFileSync(path.join(HERE, '..', 'migrations', '0009_late_edit_indexes.sql'), 'utf8');
+    const built = [...sql.matchAll(/^CREATE INDEX CONCURRENTLY IF NOT EXISTS (\w+) ON/gm)].map((m) => m[1]!);
+    expect(built).toHaveLength(7);
+    // Only what breaks WITHOUT the index counts: a statement already over its bound bites nothing.
+    const key = (j: Judged) => `${j.entry} [${j.scope}] ${j.text}`;
+    const before = new Set(failingOf(await judgeAll(db.admin)).map(key));
+    const client = await db.admin.connect();
+    const failingWithout: Record<string, number> = {};
+    try {
+      for (const idx of built) {
+        await client.query('BEGIN');
+        try {
+          await client.query(`DROP INDEX ${idx}`);
+          failingWithout[idx] = failingOf(await judgeAll(client)).filter((j) => !before.has(key(j))).length;
+        } finally {
+          await client.query('ROLLBACK');
+        }
+      }
+    } finally {
+      client.release();
+    }
+    expect(Object.entries(failingWithout).filter(([, n]) => n === 0).map(([idx]) => idx), `indexes no statement needs (new failures without each: ${JSON.stringify(failingWithout)})`).toEqual([]);
   });
 });
 
@@ -270,13 +307,19 @@ const OLD_READ_FRAMES = `SELECT f.head_id, f.import_number, to_char(r.export_dat
       ORDER BY r.marker_seq`;
 
 const sorted = <T>(xs: T[]): string[] => xs.map((x) => JSON.stringify(x)).sort();
+/** editsSince's comparisons on the fixed sample (see figures()). */
+const PARITY_COMPARISONS = 1_005;
 
-/** (user, S, the MFC ids of S's rows, its copies' occs) for background users and both scenario users. */
+/**
+ * (user, S, the MFC ids of S's rows, its copies' occs) for background users and both scenario users.
+ * A fixed sample: head ids are fixed (the fill's md5 and headFor of fixed MFC ids), and the random
+ * uuids of the scenario's users only break ties between users sharing a head.
+ */
 async function figures(limit: number): Promise<{ userId: string; S: string; ids: string[]; occs: string[] }[]> {
   const { rows } = await db.admin.query<{ user_id: string; s: string; ids: string[]; occs: string[] }>(
     `SELECT r.user_id, r.head_id AS s, array_agg(DISTINCT r.mfc_id) AS ids, array_agg(DISTINCT c.occ_id::text) AS occs
        FROM import_row_base r JOIN import_copy_base c ON c.user_id = r.user_id AND c.head_id = r.head_id
-      GROUP BY 1, 2 ORDER BY md5(r.user_id::text || r.head_id::text) LIMIT $1`,
+      GROUP BY 1, 2 ORDER BY md5(r.head_id::text), r.user_id LIMIT $1`,
     [limit],
   );
   return rows.map((r) => ({ userId: r.user_id, S: r.s, ids: r.ids, occs: r.occs }));
@@ -309,7 +352,9 @@ describe('identical rows: the rewritten late-edit statements return what the sta
         }
       }
     }
-    expect(compared).toBeGreaterThan(900);
+    // 150 sampled figures and 4 scenario cases, three occ sets at each of their markers and at 0: a
+    // background user has one import, a scenario user two. The sample is fixed, so the count is exact.
+    expect(compared).toBe(PARITY_COMPARISONS);
     expect(nonEmpty).toBeGreaterThan(500);
   });
 

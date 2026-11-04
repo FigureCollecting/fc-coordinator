@@ -165,8 +165,11 @@ function removedRows(root: PlanNode): number {
   return removed;
 }
 
+/** Where a statement is explained: the admin pool, or one client inside a transaction that changed the schema. */
+export type Queryable = Pick<pg.PoolClient, 'query'>;
+
 /** Explain one captured statement and judge it against its entry. */
-export async function judge(admin: pg.Pool, entry: GuardEntry, c: Captured): Promise<Judged> {
+export async function judge(admin: Queryable, entry: GuardEntry, c: Captured): Promise<Judged> {
   const analysed = entry.kind === 'read';
   const explain = analysed ? 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ' : 'EXPLAIN (FORMAT JSON) ';
   const run = async () => (await admin.query<{ 'QUERY PLAN': [{ Plan: PlanNode; 'Execution Time'?: number }] }>(explain + c.text, [...c.values])).rows[0]!['QUERY PLAN'][0];
