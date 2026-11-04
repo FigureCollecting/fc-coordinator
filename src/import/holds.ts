@@ -345,11 +345,12 @@ async function placeLate(tx: SqlClient, userId: string, e: PushedEdit, feed: Fee
 
 /**
  * Every edit after `marker` to one of `keys` or to any key under one of `occs` (occ/{occ}/...: the
- * copy fields and the open-ended families, occ/{occ}/tag/{tag} included). One literal range per occ,
- * ['occ/<occ>/', 'occ/<occ>0'), is exactly the keys that start 'occ/<occ>/' in bytewise order ('0'
- * follows '/'), which facet_key's COLLATE "C" is; an occ id is a uuid, never holding '/'. Literal
- * bounds let feed_event_user_facet_seq_idx serve each range (a BitmapOr); occs bound through unnest
- * would hide them from the planner.
+ * copy fields and the open-ended families, occ/{occ}/tag/{tag} included). One range per occ, its two
+ * bounds bound as parameters, ['occ/<occ>/', 'occ/<occ>0'), is exactly the keys that start
+ * 'occ/<occ>/' in bytewise order ('0' follows '/'), which facet_key's COLLATE "C" is; an occ id is a
+ * uuid, never holding '/'. node-postgres sends an unnamed statement, planned with these values (a
+ * custom plan), so feed_event_user_facet_seq_idx serves each range (a BitmapOr); occs bound through
+ * unnest would hide them from the planner.
  */
 export async function editsSince(
   tx: SqlClient,
