@@ -6,9 +6,10 @@
 // captured.
 //
 // env: COORDINATOR_PORT (default 5052), COORDINATOR_HOST (default 0.0.0.0),
-//      LOG_LEVEL (default info), SERVICE_VERSION (the commit the image was
-//      built from, stamped by the image build: `version` on every log line and
-//      service.version on every span),
+//      LOG_LEVEL (default info, and info for a value that names no level),
+//      SERVICE_VERSION (the commit the image was built from, stamped by the
+//      image build: `version` on every log line and service.version on every
+//      span),
 //      DATABASE_URL or PG* (see db/pool), PG_POOL_MAX (default 10),
 //      PGSSLMODE disable|require|verify-full (+ PGSSLROOTCERT) — unset is
 //      plaintext dev; production sets verify-full with the mounted CNPG CA,
@@ -41,7 +42,6 @@ import { createAccessTokenVerifier, createJwksFor } from './auth/oidc.js';
 import { createDeviceStore } from './auth/plugin.js';
 import { productionConnectOptions } from './connect/register.js';
 import { createCoordinatorPool, describeTarget } from './db/pool.js';
-import type { LogLevel } from './platform/logger.js';
 import { startTelemetry } from './platform/telemetry.js';
 
 const port = Number(process.env['COORDINATOR_PORT'] ?? '5052');
@@ -60,7 +60,9 @@ const routePrefix = resolveRoutePrefix();
 const app = buildApp({
   db: pool,
   telemetry: telemetry.state,
-  logLevel: (process.env['LOG_LEVEL'] as LogLevel | undefined) ?? 'info',
+  // As typed: the logger trims and lowercases it, and logs at info, saying so
+  // once, for a value that names no level (platform/logger.ts).
+  logLevel: process.env['LOG_LEVEL'],
   routePrefix,
   auth: {
     config: authConfig,

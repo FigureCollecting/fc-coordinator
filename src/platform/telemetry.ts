@@ -23,6 +23,7 @@
 // bounded, and never throwing into the app. The HTTP/protobuf exporter this
 // service carried before is gone; an endpoint that names an HTTP collector
 // (:4318) is not understood. No endpoint is set today (fc-infra LG-X1c sets it).
+// shutdown() waits SHUTDOWN_TIMEOUT_MS for the last flush, then returns.
 //
 // SAMPLING (LGMOB C1). A client's sampled flag does not decide whether this
 // service records its spans. fc-shared's provider uses the SDK default sampler
@@ -42,6 +43,27 @@ import { COORDINATOR_REDACT_OPTIONS, startTracing, type ExporterKind } from './s
 export { DEFAULT_SERVICE_NAME };
 export type { ExporterKind };
 
+/**
+ * How long shutdown() waits for the last flush. An export has 10 s (fc-shared's
+ * default), and so had the shutdown behind a collector that never answers.
+ * server.ts stops the process hard, with exit 1, 10 s after SIGTERM, and
+ * telemetry shuts down last in that drain: a dead collector alone turned every
+ * clean stop into a failed one. The spans still queued then are lost.
+ */
+export const SHUTDOWN_TIMEOUT_MS = 3_000;
+
+/** Settles when `work` does, or once `ms` have passed: `work` then goes on unawaited. Never rejects. */
+function within(work: Promise<void>, ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    const done = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    work.then(done, done);
+  });
+}
+
 /** What /healthz and the boot line read about tracing. Carries no endpoint and no credential. */
 export interface TelemetryState {
   registered: boolean;
@@ -55,6 +77,7 @@ export interface TelemetryState {
 export interface Telemetry {
   readonly state: TelemetryState;
   forceFlush(): Promise<void>;
+  /** Flush and stop. Returns after SHUTDOWN_TIMEOUT_MS at the latest, with the flush still going. */
   shutdown(): Promise<void>;
 }
 
@@ -65,6 +88,8 @@ export interface StartTelemetryOptions {
   exporter?: SpanExporter;
   /** Hosts added to the propagation allowlist; a test's loopback fake is not on the default list. */
   propagateHosts?: readonly string[];
+  /** How long shutdown() waits. Default SHUTDOWN_TIMEOUT_MS. */
+  shutdownTimeoutMs?: number;
 }
 
 /**
@@ -87,6 +112,6 @@ export function startTelemetry(options: StartTelemetryOptions = {}): Telemetry {
       version: tracing.state.version,
     },
     forceFlush: () => tracing.forceFlush(),
-    shutdown: () => tracing.shutdown(),
+    shutdown: () => within(tracing.shutdown(), options.shutdownTimeoutMs ?? SHUTDOWN_TIMEOUT_MS),
   };
 }

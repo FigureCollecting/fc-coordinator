@@ -39,7 +39,7 @@ npm start        # node dist/server.js
 | `COORDINATOR_PORT` | `5052` | listen port |
 | `COORDINATOR_HOST` | `0.0.0.0` | listen address |
 | `COORDINATOR_ROUTE_PREFIX` | `/api` | every route except `/healthz` is served under this. Set it to the empty string to serve at the root. **The edge must not rewrite it** — see below |
-| `LOG_LEVEL` | `info` | trace / debug / info / warn / error / fatal / silent |
+| `LOG_LEVEL` | `info` | trace / debug / info / warn / error / fatal / silent, in any case. Any other value logs at `info` and says so once at boot (a `log.level_fallback` warn line) |
 | `SERVICE_VERSION` | `unknown` | the commit the image was built from, stamped by the image build (CI passes `github.sha`); reported as `version` on every log line and `service.version` on every span |
 | `DATABASE_URL` | unset | full DSN; when unset the discrete `PG*` variables are used |
 | `PGHOST` `PGPORT` `PGUSER` `PGPASSWORD` `PGDATABASE` | libpq defaults | discrete connection settings |
@@ -398,10 +398,16 @@ a caller logs is one JSON string on the line (`jq '.ages | fromjson'`).
 Redaction is fc-shared's policy plus this service's DPoP key pattern;
 `src/platform/redaction-keys.test.ts` lists the keys and proves each is masked.
 
+An `error` or `fatal` line that carries an Error (a 500 is one) has `err`
+(`type`, `message`) and `error_stack`: the stack's frames on one line, redacted
+as any field is and cut at 1000 characters. The frames only: the stack's header
+repeats the message, which is `err.message`.
+
 Every response to a traced request carries a W3C `traceresponse` header,
-`00-<trace_id>-<span_id>-<flags>`, naming the same span its log lines carry, so
-a client can quote the id of a request that went wrong. `/healthz` opens no span
-and carries none.
+`00-<trace_id>-<span_id>-<flags>`, naming the same trace its log lines carry
+(the span id is the HTTP request span's; a Connect handler's lines carry the
+Connect span's id), so a client can quote the trace id of a request that went
+wrong. `/healthz` opens no span and carries none.
 
 ### Trace propagation (§A.5 rule 3) — complete
 

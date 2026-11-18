@@ -53,8 +53,8 @@ export type {
 // exporter and `instrumentation`, all in package.json) and nothing of the
 // browser surface. test/import-graph.test.ts still measures that.
 // ---------------------------------------------------------------------------
-export { createLogger } from '@figurecollecting/fc-shared/server/log';
-export type { LevelSetting } from '@figurecollecting/fc-shared/server/log';
+export { LOG_LEVELS, createLogger } from '@figurecollecting/fc-shared/server/log';
+export type { LevelSetting, Logger as SharedLogger } from '@figurecollecting/fc-shared/server/log';
 
 export { startTracing, withPropagationTarget } from '@figurecollecting/fc-shared/server/tracing';
 export type { ExporterKind, StartTracingOptions } from '@figurecollecting/fc-shared/server/tracing';

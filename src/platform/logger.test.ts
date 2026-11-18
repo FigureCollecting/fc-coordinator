@@ -1,3 +1,4 @@
+import Fastify from 'fastify';
 import { describe, expect, it } from 'vitest';
 import { createStructuredLogger, DEFAULT_SERVICE_NAME } from './logger.js';
 
@@ -270,5 +271,286 @@ describe('platform/logger: DPoP secrets', () => {
     expect(first(lines)['dpop_nonce']).toBe('[REDACTED]');
     // the OUTCOME is deliberately still legible: an operator needs it
     expect(first(lines)['auth_outcome']).toBe('nonce_missing');
+  });
+});
+
+// What server.ts hands over is process.env.LOG_LEVEL as it was typed: nothing checked it before.
+describe('platform/logger: the level it is given', () => {
+  const FALLBACK = 'log.level_fallback';
+  const levelsOf = (lines: string[]): string[] => lines.map((l) => (JSON.parse(l) as { level: string }).level);
+
+  function emitAll(level: unknown): Line[] {
+    const { lines, sink } = capture();
+    const log = createStructuredLogger({ level: level as string, sink });
+    log.trace('t');
+    log.debug('d');
+    log.info('i');
+    log.warn('w');
+    log.error('e');
+    log.fatal('f');
+    return lines.map((l) => JSON.parse(l) as Line);
+  }
+
+  it.each([
+    ['INFO', ['info', 'warn', 'error', 'fatal']],
+    ['Info', ['info', 'warn', 'error', 'fatal']],
+    [' info', ['info', 'warn', 'error', 'fatal']],
+    ['\tWARN \n', ['warn', 'error', 'fatal']],
+    ['Debug', ['debug', 'info', 'warn', 'error', 'fatal']],
+    ['TRACE', ['trace', 'debug', 'info', 'warn', 'error', 'fatal']],
+    ['FATAL', ['fatal']],
+    ['Silent', []],
+  ])('reads %j as the level it names, in any case and with spaces around it, and says nothing about it', (given, expected) => {
+    const entries = emitAll(given);
+    expect(entries.map((e) => e['level'])).toEqual(expected);
+    expect(entries.filter((e) => e['event'] === FALLBACK)).toEqual([]);
+  });
+
+  it.each([['warning'], ['verbose'], [''], ['   '], ['constructor'], ['toString'], ['30'], [30], [null]])(
+    'logs at info for %j, which is no level, rather than going silent',
+    (given) => {
+      const entries = emitAll(given);
+      const own = entries.filter((e) => e['event'] !== FALLBACK);
+      expect(own.map((e) => e['level'])).toEqual(['info', 'warn', 'error', 'fatal']);
+    },
+  );
+
+  it('says so once, first, at warn, naming what it was given', () => {
+    const { lines, sink } = capture();
+    const log = createStructuredLogger({ level: 'verbose', sink });
+
+    expect(lines).toHaveLength(1);
+    expect(first(lines)).toMatchObject({ level: 'warn', event: FALLBACK, log_level_given: 'verbose', log_level: 'info' });
+    expect(first(lines)['msg']).toContain('LOG_LEVEL');
+
+    log.info('one');
+    log.child({ reqId: 'r-1' }).info('two');
+    log.child({ reqId: 'r-2' }, { level: 'nonsense' as never }).info('three');
+    expect(lines.filter((l) => l.includes(FALLBACK))).toHaveLength(1);
+    expect(lines).toHaveLength(4);
+  });
+
+  it('reports info as its level after a fallback: Fastify reads it', () => {
+    expect(createStructuredLogger({ level: 'verbose', sink: () => {} }).level).toBe('info');
+    expect(createStructuredLogger({ level: ' WARN', sink: () => {} }).level).toBe('warn');
+  });
+
+  it('says nothing when no level is given', () => {
+    const { lines, sink } = capture();
+    createStructuredLogger({ sink });
+    expect(lines).toEqual([]);
+  });
+
+  it('prints the value it was given as any other field: a secret-shaped one is masked, a long one cut', () => {
+    const jws = 'eyJhbGciOiJFUzI1NiIsInR5cCI6ImRwb3Arand0In0.eyJzdWIiOiJyb3NzIn0.c2ln';
+    const { lines, sink } = capture();
+    createStructuredLogger({ level: `${jws}\n${'x'.repeat(5000)}`, sink });
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain(jws);
+    expect((lines[0] as string).length).toBeLessThan(1500);
+    expect(levelsOf(lines)).toEqual(['warn']);
+  });
+});
+
+// S2 (chal1): a 500 logged no stack at all once the line went through fc-shared, whose `err` is
+// {type, message}. The frames are back, as error_stack, on error and fatal lines only.
+describe('platform/logger: an error line carries the stack', () => {
+  const HERE = 'logger.test.ts';
+
+  it('writes the frames as error_stack when an Error is the first argument, and keeps err and msg', () => {
+    const { lines, sink } = capture();
+    createStructuredLogger({ sink }).error(new Error('db down'));
+
+    const entry = first(lines);
+    expect(entry['err']).toEqual({ type: 'Error', message: 'db down' });
+    expect(entry['msg']).toBe('db down');
+    expect(entry['error_stack']).toMatch(/^\s*at /);
+    expect(entry['error_stack']).toContain(HERE);
+    expect(lines[0]).not.toContain('\\n');
+  });
+
+  it('keeps the message a caller gives after the Error', () => {
+    const { lines, sink } = capture();
+    createStructuredLogger({ sink }).error(new Error('db down'), 'sync push', 'failed');
+
+    expect(first(lines)).toMatchObject({ msg: 'sync push failed', err: { type: 'Error', message: 'db down' } });
+    expect(first(lines)['error_stack']).toContain(HERE);
+  });
+
+  it('writes it for the shape Fastify logs a 500 in: ({ err, ... }, msg)', () => {
+    const { lines, sink } = capture();
+    createStructuredLogger({ sink }).error({ err: new TypeError('x is not a function'), reqId: 'r-1' }, 'handler failed');
+
+    const entry = first(lines);
+    expect(entry).toMatchObject({ msg: 'handler failed', req_id: 'r-1', err: { type: 'TypeError', message: 'x is not a function' } });
+    expect(entry['error_stack']).toContain(HERE);
+  });
+
+  it('writes it at fatal, and on a child logger', () => {
+    const { lines, sink } = capture();
+    const log = createStructuredLogger({ sink });
+    log.fatal(new Error('out of memory'));
+    log.child({ reqId: 'r-1' }).child({ route: '/x' }).error({ err: new Error('nested') }, 'child');
+
+    const entries = lines.map((l) => JSON.parse(l) as Line);
+    expect(entries[0]?.['level']).toBe('fatal');
+    expect(entries[0]?.['error_stack']).toContain(HERE);
+    expect(entries[1]).toMatchObject({ req_id: 'r-1', route: '/x' });
+    expect(entries[1]?.['error_stack']).toContain(HERE);
+  });
+
+  it('writes none below error: a 4xx Fastify logs at info, and a warn, stay one short line', () => {
+    const { lines, sink } = capture();
+    const log = createStructuredLogger({ level: 'trace', sink });
+    log.trace(new Error('t'));
+    log.debug({ err: new Error('d') }, 'd');
+    log.info({ err: new Error('i') }, 'i');
+    log.warn(new Error('w'));
+
+    expect(lines).toHaveLength(4);
+    for (const line of lines) expect(JSON.parse(line) as Line).not.toHaveProperty('error_stack');
+  });
+
+  it('writes nothing at all when the level is above error, and nothing extra at silent', () => {
+    const { lines, sink } = capture();
+    createStructuredLogger({ level: 'fatal', sink }).error(new Error('dropped'));
+    createStructuredLogger({ level: 'silent', sink }).fatal(new Error('dropped'));
+    expect(lines).toEqual([]);
+  });
+
+  it('leaves a line with no Error on it alone', () => {
+    const { lines, sink } = capture();
+    const log = createStructuredLogger({ sink });
+    log.error('boom');
+    log.error({ err: 'not an Error', count: 2 }, 'odd');
+    log.error({ reqId: 'r-1' }, 'no err');
+    log.error(null, 'null first');
+    log.error(['a', 'b']);
+    (log.error as () => void)();
+
+    expect(lines).toHaveLength(6);
+    for (const line of lines) expect(JSON.parse(line) as Line).not.toHaveProperty('error_stack');
+    expect(JSON.parse(lines[1] as string)).toMatchObject({ msg: 'odd', err: { type: 'string', message: 'not an Error' }, count: 2 });
+  });
+
+  it('writes no error_stack for an Error with no frames, and still writes the line', () => {
+    const { lines, sink } = capture();
+    const log = createStructuredLogger({ sink });
+    const bare = new Error('no stack');
+    delete bare.stack;
+    const custom = new Error('custom stack');
+    custom.stack = 'custom stack: a line that is no frame';
+    const numeric = new Error('numeric stack');
+    (numeric as { stack: unknown }).stack = 42;
+    log.error(bare);
+    log.error({ err: custom }, 'custom');
+    log.error(numeric);
+
+    expect(lines).toHaveLength(3);
+    for (const line of lines) expect(JSON.parse(line) as Line).not.toHaveProperty('error_stack');
+    expect(lines.join('\n')).not.toContain('a line that is no frame');
+  });
+
+  it('never throws for an Error it cannot read: the line is written without the stack', () => {
+    const { lines, sink } = capture();
+    const hostile = new Error('hostile');
+    Object.defineProperty(hostile, 'stack', {
+      get() {
+        throw new Error('stack getter');
+      },
+    });
+
+    expect(() => createStructuredLogger({ sink }).error({ err: hostile }, 'handler failed')).not.toThrow();
+    expect(first(lines)).toMatchObject({ msg: 'handler failed', err: { type: 'Error', message: 'hostile' } });
+    expect(first(lines)).not.toHaveProperty('error_stack');
+  });
+
+  it('only reads err on a plain object: a class instance is passed on as it came', () => {
+    class Wrapper {
+      err = new Error('inside a class');
+    }
+    const { lines, sink } = capture();
+    createStructuredLogger({ sink }).error(new Wrapper(), 'wrapped');
+    createStructuredLogger({ sink }).error(Object.assign(Object.create(null) as object, { err: new Error('null proto') }), 'bare');
+
+    expect(JSON.parse(lines[0] as string) as Line).not.toHaveProperty('error_stack');
+    expect((JSON.parse(lines[1] as string) as Line)['error_stack']).toContain(HERE);
+  });
+
+  it('does not change the object it was handed', () => {
+    const fields = { err: new Error('db down'), reqId: 'r-1' };
+    createStructuredLogger({ sink: () => {} }).error(fields, 'handler failed');
+    expect(Object.keys(fields)).toEqual(['err', 'reqId']);
+  });
+
+  it('cuts a long stack at the value cap, top frames first', () => {
+    const deep = new Error('deep');
+    deep.stack = `Error: deep\n${Array.from({ length: 200 }, (_, i) => `    at fn${i} (/app/dist/file${i}.js:${i}:1)`).join('\n')}`;
+    const { lines, sink } = capture();
+    createStructuredLogger({ sink }).error(deep);
+
+    const stack = first(lines)['error_stack'] as string;
+    expect(stack).toContain('at fn0 (/app/dist/file0.js:0:1)');
+    expect(stack).not.toContain('fn199');
+    expect(stack.length).toBeLessThan(1100);
+  });
+});
+
+// The ruling on S2: no secret may ride a stack. V8 copies the message into the stack's header, and
+// fc-shared masks a message as a whole (a JSON document's keys, a header line, a form body): rules
+// that do not see it once frames follow it. So the header is not printed again; the frames are.
+describe('platform/logger: no secret rides the stack', () => {
+  const JWS = 'eyJhbGciOiJFUzI1NiIsInR5cCI6ImRwb3Arand0In0.eyJzdWIiOiJyb3NzIn0.c2ln';
+
+  it.each([
+    ['a bearer token', 'upstream said no: Bearer SxMARKERbearer0123456789abcdef', 'SxMARKERbearer'],
+    ['a compact JWS', `assertion rejected ${JWS}`, JWS],
+    ['a URL with userinfo and a query', 'GET https://fc:SxMARKERuserinfo@pg.example/db?token=SxMARKERquery failed', 'SxMARKER'],
+    ['a JSON document with a secret key', '{"password":"SxMARKERjson","user":"ross"}', 'SxMARKERjson'],
+    ['a header line', 'Authorization: Basic SxMARKERheader', 'SxMARKERheader'],
+    ['a cookie header line', 'Cookie: sid=SxMARKERcookie', 'SxMARKERcookie'],
+    ['a form body', 'client_secret=SxMARKERform&grant_type=refresh_token', 'SxMARKERform'],
+    ['a message of several lines', `first line\nBearer SxMARKERmultiline0123456789abcdef\nlast line`, 'SxMARKERmultiline'],
+    ['a frame-shaped line in the message', `failed\n    at Bearer SxMARKERframe0123456789abcdef`, 'SxMARKERframe'],
+  ])('masks %s in the message and does not print it in the stack', (_label, message, marker) => {
+    const { lines, sink } = capture();
+    const log = createStructuredLogger({ sink });
+    log.error(new Error(message));
+    log.error({ err: new Error(message) }, 'handler failed');
+
+    expect(lines).toHaveLength(2);
+    for (const line of lines) {
+      expect(line).not.toContain(marker);
+      expect((JSON.parse(line) as Line)['error_stack']).toContain('logger.test.ts');
+    }
+  });
+
+  it('masks a secret a custom stack carries in a frame', () => {
+    const custom = new Error('custom');
+    custom.stack = `Error: custom\n    at handler (https://fc:SxMARKERpw@h.example/app.js?sig=SxMARKERsig:1:2)\n    at Bearer SxMARKERbearer0123456789abcdef`;
+    const { lines, sink } = capture();
+    createStructuredLogger({ sink }).error(custom);
+
+    expect(lines[0]).not.toContain('SxMARKER');
+    expect(first(lines)['error_stack']).toContain('at handler');
+  });
+
+  it('a real Fastify 500 logs the stack, with the secret in its message masked', async () => {
+    const { lines, sink } = capture();
+    const app = Fastify({ loggerInstance: createStructuredLogger({ sink }) });
+    app.get('/boom', async function boomHandler() {
+      throw new Error('{"password":"SxMARKERfastify","detail":"pg: relation does not exist"}');
+    });
+    const response = await app.inject({ method: 'GET', url: '/boom' });
+    await app.close();
+
+    expect(response.statusCode).toBe(500);
+    const failed = lines.map((l) => JSON.parse(l) as Line).filter((e) => e['level'] === 'error');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.['error_stack']).toContain('boomHandler');
+    expect(failed[0]?.['error_stack']).toContain('logger.test.ts');
+    expect(failed[0]?.['err']).toMatchObject({ type: 'Error' });
+    expect(lines.join('\n')).not.toContain('SxMARKERfastify');
   });
 });

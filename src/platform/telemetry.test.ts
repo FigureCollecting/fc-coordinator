@@ -4,7 +4,7 @@
 import { ROOT_CONTEXT, TraceFlags, context, propagation, trace } from '@opentelemetry/api';
 import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
 import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getActiveTraceIds, withPropagationTarget } from './shared.js';
 import { DEFAULT_SERVICE_NAME, startTelemetry, type Telemetry } from './telemetry.js';
 
@@ -295,5 +295,49 @@ describe('telemetry: lifecycle', () => {
 
     await expect(telemetry.forceFlush()).resolves.toBeUndefined();
     await expect(telemetry.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('shutdown stops waiting after its budget, and the flush it left goes on to finish', async () => {
+    const exported: string[] = [];
+    let release: (() => void) | undefined;
+    const stuck: SpanExporter = {
+      export: (spans, done) => {
+        release = () => {
+          exported.push(...spans.map((span) => span.name));
+          done({ code: ExportResultCode.SUCCESS });
+        };
+      },
+      shutdown: () => Promise.resolve(),
+    };
+    const telemetry = startTelemetry({ exporter: stuck, env: {}, serviceName: 'stuck', shutdownTimeoutMs: 50 });
+    trace.getTracer('test').startActiveSpan('queued', (span) => span.end());
+
+    const startedAt = performance.now();
+    await expect(telemetry.shutdown()).resolves.toBeUndefined();
+    const waited = performance.now() - startedAt;
+    expect(waited).toBeGreaterThanOrEqual(45);
+    expect(waited).toBeLessThan(5_000);
+
+    // Not finished: the export is still in flight and the registration is still the running one.
+    expect(exported).toEqual([]);
+    expect(startTelemetry({ env: {}, serviceName: 'next' }).state.serviceName).toBe('stuck');
+
+    release?.();
+    await vi.waitFor(() => {
+      started = startTelemetry({ env: {}, serviceName: 'next' });
+      expect(started.state.serviceName).toBe('next');
+    });
+    expect(exported).toEqual(['queued']);
+  });
+
+  it('shutdown returns as soon as the flush is done, and leaves no timer behind', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const telemetry = startTelemetry({ env: {}, shutdownTimeoutMs: 60_000 });
+      await expect(telemetry.shutdown()).resolves.toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

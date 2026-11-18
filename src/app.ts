@@ -29,7 +29,7 @@ import { validateRoutePrefix } from './auth/config.js';
 import { registerAuth, type AuthPluginOptions } from './auth/plugin.js';
 import { probeDatabase, type QueryableDb } from './db/pool.js';
 import { registerHttpTracing } from './platform/http-trace.js';
-import { createStructuredLogger, type LogLevel, type LogSink } from './platform/logger.js';
+import { createStructuredLogger, type LogSink } from './platform/logger.js';
 import type { TelemetryState } from './platform/telemetry.js';
 import { registerConnect, type ConnectOptions } from './connect/register.js';
 
@@ -38,7 +38,8 @@ export const SERVICE_NAME = 'fc-coordinator';
 export interface BuildAppOptions {
   db: QueryableDb;
   telemetry?: TelemetryState;
-  logLevel?: LogLevel;
+  /** A log level as an operator may have typed it; one that names no level means info (platform/logger.ts). */
+  logLevel?: string;
   logSink?: LogSink;
   /** Omit to build a health-only app: the edge is not registered at all. */
   auth?: AuthPluginOptions;
