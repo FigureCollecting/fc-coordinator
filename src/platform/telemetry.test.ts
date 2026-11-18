@@ -6,7 +6,7 @@ import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
 import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getActiveTraceIds, withPropagationTarget } from './shared.js';
-import { DEFAULT_SERVICE_NAME, startTelemetry, type Telemetry } from './telemetry.js';
+import { DEFAULT_SERVICE_NAME, SHUTDOWN_TIMEOUT_MS, startTelemetry, type Telemetry } from './telemetry.js';
 
 class CaptureExporter implements SpanExporter {
   readonly spans: ReadableSpan[] = [];
@@ -316,7 +316,8 @@ describe('telemetry: lifecycle', () => {
     await expect(telemetry.shutdown()).resolves.toBeUndefined();
     const waited = performance.now() - startedAt;
     expect(waited).toBeGreaterThanOrEqual(45);
-    expect(waited).toBeLessThan(5_000);
+    // The budget it was given, not the default one.
+    expect(waited).toBeLessThan(SHUTDOWN_TIMEOUT_MS - 1_000);
 
     // Not finished: the export is still in flight and the registration is still the running one.
     expect(exported).toEqual([]);
