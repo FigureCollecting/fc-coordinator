@@ -2,14 +2,19 @@
 // Process entrypoint.
 //
 // Order matters: telemetry is registered BEFORE the app is built, so the very
-// first log line already carries a trace tag and the pool's spans are captured.
+// first log line already carries the image's revision and the pool's spans are
+// captured.
 //
 // env: COORDINATOR_PORT (default 5052), COORDINATOR_HOST (default 0.0.0.0),
-//      LOG_LEVEL (default info), SERVICE_VERSION (stamped by the image build),
+//      LOG_LEVEL (default info), SERVICE_VERSION (the commit the image was
+//      built from, stamped by the image build: `version` on every log line and
+//      service.version on every span),
 //      DATABASE_URL or PG* (see db/pool), PG_POOL_MAX (default 10),
 //      PGSSLMODE disable|require|verify-full (+ PGSSLROOTCERT) — unset is
 //      plaintext dev; production sets verify-full with the mounted CNPG CA,
-//      OTEL_EXPORTER_OTLP_(TRACES_)ENDPOINT to ship spans,
+//      OTEL_EXPORTER_OTLP_(TRACES_)ENDPOINT to ship spans over gRPC (:4317;
+//      unset, nothing is exported) and OTEL_PROPAGATION_ALLOWLIST for the hosts
+//      an outbound traceparent may go to (default: in-cluster names),
 //      OIDC_ISSUER / OIDC_AUDIENCE / OIDC_JWKS_URI / COORDINATOR_PUBLIC_ORIGIN
 //      (all REQUIRED, no defaults — see auth/config.ts for why) plus the
 //      optional DPOP_* and DEVICE_CACHE_TTL_SECONDS tuning knobs,

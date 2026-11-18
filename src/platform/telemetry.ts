@@ -1,100 +1,59 @@
 // ============================================================================
-// OpenTelemetry bootstrap — plan §A.5, all three propagation rules.
+// OpenTelemetry bootstrap: fc-shared's startTracing (LG-C1), which carries the
+// three propagation rules of plan §A.5 for every service on the estate.
 //
-// RULE 1  Register an SDK with an ASYNC CONTEXT MANAGER. fc-shared's trace.ts
-//         reads the *active* span; without AsyncLocalStorageContextManager the
-//         active span is lost at the first `await` and every log line after it
-//         loses its trace tag. NodeTracerProvider.register() defaults to that
-//         manager today, but it is passed EXPLICITLY here so the requirement
-//         survives an upgrade that changes the default.
+// RULE 1  An ASYNC CONTEXT MANAGER. fc-shared registers an
+//         AsyncLocalStorageContextManager explicitly, so the active span
+//         survives an `await` and every later log line keeps its trace_id.
 //
-// RULE 2  NEVER `OTEL_TRACES_EXPORTER=none`. It makes NodeSDK register a no-op
-//         provider whose trace id is all zeroes, and fc-shared treats an
-//         all-zero id as "no span" — so logs silently lose their trace tag
-//         rather than failing loudly. This bug already shipped once in
-//         fc-backend. Two separate defences, and it is worth being precise
-//         about which one is load-bearing HERE:
-//           (a) STRUCTURAL, and the one that actually holds today: this module
-//               builds a NodeTracerProvider with a real SimpleSpanProcessor
-//               wrapping a NoopSpanExporter, and NEVER uses NodeSDK.
-//               NodeTracerProvider does not read OTEL_TRACES_EXPORTER at all,
-//               so the variable cannot produce a no-op provider on this path.
-//               The test asserts spans RECORD, which is that property directly.
-//           (b) DEFENCE IN DEPTH: scrubDisabledExporterEnv() deletes the
-//               variable anyway, so the day someone swaps in NodeSDK — which
-//               DOES read it — the bug cannot come back with it. Removing the
-//               scrub would not fail the behavioural tests today; that is
-//               expected, not a gap in them.
+// RULE 2  NEVER a no-op PROVIDER. fc-shared builds a TracerProvider (never
+//         NodeSDK, so OTEL_TRACES_EXPORTER is not read): with no endpoint only
+//         the span PROCESSOR is a no-op. Spans record with real ids and
+//         nothing leaves the pod.
 //
-// RULE 3  W3C `traceparent` on every Connect hop, via interceptors. The W3C
-//         propagator is registered here (NodeTracerProvider.register installs
-//         the composite W3CTraceContext + Baggage propagator by default); the
-//         interceptors themselves arrive with the first Connect hop in slice 1b.
-//         It stays the global default ON PURPOSE: a CLIENT's tracestate and
-//         baggage are dropped at the client-facing edges (client-trace.ts),
-//         so the server's own baggage still reaches our services.
+// RULE 3  W3C `traceparent` on every Connect hop. fc-shared's propagator is the
+//         W3C pair behind a HOST ALLOWLIST (OTEL_PROPAGATION_ALLOWLIST, default
+//         `*.svc.cluster.local,*.svc,localhost`): an injection happens only for
+//         a target on the list, so the client interceptor names its target
+//         (connect/interceptors.ts). A CLIENT's tracestate and baggage are
+//         still dropped at the client-facing edges (client-trace.ts).
+//
+// EXPORT. OTLP over gRPC when OTEL_EXPORTER_OTLP_TRACES_ENDPOINT or
+// OTEL_EXPORTER_OTLP_ENDPOINT is set (the traces-specific one wins), batched,
+// bounded, and never throwing into the app. The HTTP/protobuf exporter this
+// service carried before is gone; an endpoint that names an HTTP collector
+// (:4318) is not understood. No endpoint is set today (fc-infra LG-X1c sets it).
 //
 // SAMPLING (LGMOB C1). A client's sampled flag does not decide whether this
-// service records its spans: a remote parent that says "not sampled" is
-// sampled anyway, as a root span already is. Before this, a request with
-// `traceparent ...-00` turned the coordinator's spans off and passed the 00 on
-// to the spine. This is EXPORT-TIME hardening only. Log lines never depended
-// on it: fc-shared's getActiveTraceIds reads a NonRecordingSpan's ids too, so
-// a flags-00 request's lines already carried its trace id. The sampler is set
-// in code, so OTEL_TRACES_SAMPLER is not read on this path.
+// service records its spans. fc-shared's provider uses the SDK default sampler
+// (parent-based, always on), so that is decided where the client's traceparent
+// is read: client-trace.ts marks the extracted parent sampled.
 //
-// SECRETS: the rule is never to SET a secret attribute; RedactingSpanExporter
-// is the second line of defence, running fc-shared's redactAttributes over
-// every span's attributes just before export. The shared VALUE patterns cover
-// the compact-JWS shapes — the entitlement assertion and the DPoP proof are
-// both /eyJ[A-Za-z0-9._-]{10,}/ — but NOT the DPoP nonce, which is opaque
-// base64url and indistinguishable from an ordinary id. That one is caught by
-// KEY name, which is why the redaction here passes COORDINATOR_REDACT_OPTIONS
-// (platform/shared.ts) rather than relying on fc-shared's defaults.
+// SECRETS: the rule is never to SET a secret attribute; fc-shared's redacting
+// exporter is the second line of defence, over every span's attributes, events
+// and links just before export. It runs with COORDINATOR_REDACT_OPTIONS
+// (platform/shared.ts), because the DPoP nonce is opaque base64url that no
+// value pattern can tell from an id: only its KEY catches it.
 // ============================================================================
-import { context, propagation, trace, type ContextManager } from '@opentelemetry/api';
-import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
-import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
-import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
-import { resourceFromAttributes } from '@opentelemetry/resources';
-import {
-  AlwaysOnSampler,
-  BatchSpanProcessor,
-  ParentBasedSampler,
-  SimpleSpanProcessor,
-  type ReadableSpan,
-  type SpanExporter,
-  type SpanProcessor,
-} from '@opentelemetry/sdk-trace-base';
-import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
-import { ATTR_SERVICE_NAME } from '@opentelemetry/semantic-conventions';
-import { COORDINATOR_REDACT_OPTIONS, redactAttributes, type AttributeValue } from './shared.js';
+import type { SpanExporter } from '@opentelemetry/sdk-trace';
+import { DEFAULT_SERVICE_NAME } from './logger.js';
+import { COORDINATOR_REDACT_OPTIONS, startTracing, type ExporterKind } from './shared.js';
 
-export const DEFAULT_SERVICE_NAME = 'fc-coordinator';
+export { DEFAULT_SERVICE_NAME };
+export type { ExporterKind };
 
-export type ExporterKind = 'otlp' | 'noop';
-
-export interface ExporterChoice {
-  kind: ExporterKind;
-  endpoint?: string;
-}
-
-/** What /healthz reports about tracing. Carries no endpoint and no credential. */
+/** What /healthz and the boot line read about tracing. Carries no endpoint and no credential. */
 export interface TelemetryState {
   registered: boolean;
+  /** 'otlp' (gRPC) with an endpoint, 'noop' without, 'custom' under the test seam. */
   exporter: ExporterKind;
   serviceName: string;
+  /** The image's revision (SERVICE_VERSION, stamped by the image build); 'unknown' outside one. */
+  version: string;
 }
 
 export interface Telemetry {
   readonly state: TelemetryState;
-  /**
-   * The context manager actually registered. Exposed so §A.5 rule 1 is
-   * ASSERTABLE: NodeTracerProvider.register() would default to the same class,
-   * so "it survives an await" alone cannot tell an explicit choice from a lucky
-   * default, and a future change to that default would go unnoticed.
-   */
-  readonly contextManager: ContextManager;
   forceFlush(): Promise<void>;
   shutdown(): Promise<void>;
 }
@@ -102,119 +61,32 @@ export interface Telemetry {
 export interface StartTelemetryOptions {
   env?: Record<string, string | undefined>;
   serviceName?: string;
-  /** Test seam. Production builds the exporter from the environment. */
+  /** Test seam: export here instead of OTLP, still redacted and batched. */
   exporter?: SpanExporter;
+  /** Hosts added to the propagation allowlist; a test's loopback fake is not on the default list. */
+  propagateHosts?: readonly string[];
 }
 
 /**
- * Remove `OTEL_TRACES_EXPORTER=none` from an environment. Returns true when it
- * was present, so the caller can warn: someone meant to disable export and
- * would instead have disabled TRACE IDS.
+ * Register tracing for this process. One per process: a second call while the
+ * first is running returns the running registration unchanged.
  */
-export function scrubDisabledExporterEnv(env: Record<string, string | undefined>): boolean {
-  if (env['OTEL_TRACES_EXPORTER']?.trim().toLowerCase() !== 'none') return false;
-  delete env['OTEL_TRACES_EXPORTER'];
-  return true;
-}
-
-/** Traces-specific endpoint wins over the generic one, per the OTel spec. */
-export function resolveExporterChoice(env: Record<string, string | undefined>): ExporterChoice {
-  const endpoint = (
-    env['OTEL_EXPORTER_OTLP_TRACES_ENDPOINT'] ??
-    env['OTEL_EXPORTER_OTLP_ENDPOINT'] ??
-    ''
-  ).trim();
-  return endpoint === '' ? { kind: 'noop' } : { kind: 'otlp', endpoint };
-}
-
-/** Swallows spans and always succeeds. Real exporter, no-op destination. */
-export class NoopSpanExporter implements SpanExporter {
-  export(_spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    resultCallback({ code: ExportResultCode.SUCCESS });
-  }
-  shutdown(): Promise<void> {
-    return Promise.resolve();
-  }
-  forceFlush(): Promise<void> {
-    return Promise.resolve();
-  }
-}
-
-/**
- * A view of a span with its attributes redacted. Object.create keeps the real
- * span as the prototype, so the SDK's getter-backed fields (duration, ended,
- * events, status, resource) survive — a spread would silently drop them.
- */
-export function redactSpan(span: ReadableSpan): ReadableSpan {
-  const redacted = redactAttributes(
-    span.attributes as unknown as Record<string, AttributeValue>,
-    COORDINATOR_REDACT_OPTIONS,
-  );
-  return Object.create(span as object, {
-    attributes: { value: redacted, enumerable: true, configurable: true },
-  }) as ReadableSpan;
-}
-
-/** Runs fc-shared's redaction policy over span attributes just before export. */
-export class RedactingSpanExporter implements SpanExporter {
-  constructor(private readonly delegate: SpanExporter) {}
-
-  export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    this.delegate.export(spans.map(redactSpan), resultCallback);
-  }
-
-  shutdown(): Promise<void> {
-    return this.delegate.shutdown();
-  }
-
-  forceFlush(): Promise<void> {
-    return this.delegate.forceFlush?.() ?? Promise.resolve();
-  }
-}
-
-export function buildExporter(choice: ExporterChoice): SpanExporter {
-  if (choice.kind === 'otlp') return new OTLPTraceExporter({ url: choice.endpoint });
-  return new NoopSpanExporter();
-}
-
 export function startTelemetry(options: StartTelemetryOptions = {}): Telemetry {
-  const env = options.env ?? process.env;
-  const serviceName = options.serviceName ?? DEFAULT_SERVICE_NAME;
-
-  scrubDisabledExporterEnv(env);
-  const choice = resolveExporterChoice(env);
-
-  const exporter = options.exporter ?? new RedactingSpanExporter(buildExporter(choice));
-  // A REAL processor in both cases (rule 2). Batching only helps when spans
-  // actually travel; the no-collector path stays simple and synchronous.
-  const processor: SpanProcessor =
-    choice.kind === 'otlp' ? new BatchSpanProcessor(exporter) : new SimpleSpanProcessor(exporter);
-
-  const provider = new NodeTracerProvider({
-    resource: resourceFromAttributes({ [ATTR_SERVICE_NAME]: serviceName }),
-    // SAMPLING (header): only the REMOTE not-sampled case changes; a local
-    // not-sampled parent still keeps its children unsampled.
-    sampler: new ParentBasedSampler({
-      root: new AlwaysOnSampler(),
-      remoteParentNotSampled: new AlwaysOnSampler(),
-    }),
-    spanProcessors: [processor],
+  const tracing = startTracing(options.serviceName ?? DEFAULT_SERVICE_NAME, {
+    env: options.env ?? process.env,
+    redact: COORDINATOR_REDACT_OPTIONS,
+    ...(options.exporter !== undefined ? { exporter: options.exporter } : {}),
+    ...(options.propagateHosts !== undefined ? { propagateHosts: options.propagateHosts } : {}),
   });
 
-  // Rule 1, explicit.
-  const contextManager = new AsyncLocalStorageContextManager();
-  provider.register({ contextManager });
-
   return {
-    state: { registered: true, exporter: choice.kind, serviceName },
-    contextManager,
-    forceFlush: () => provider.forceFlush(),
-    shutdown: async () => {
-      await provider.shutdown();
-      contextManager.disable();
-      trace.disable();
-      context.disable();
-      propagation.disable();
+    state: {
+      registered: true,
+      exporter: tracing.state.exporter,
+      serviceName: tracing.state.service,
+      version: tracing.state.version,
     },
+    forceFlush: () => tracing.forceFlush(),
+    shutdown: () => tracing.shutdown(),
   };
 }

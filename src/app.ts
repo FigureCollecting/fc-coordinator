@@ -11,7 +11,8 @@
 // CLOSED IN SLICE 1b (was N3): inbound HTTP IS instrumented now.
 // registerHttpTracing adds the onRequest hook that opens a server span from the
 // incoming `traceparent` and keeps it active for the rest of the lifecycle, so
-// every log line from a running request carries `trace=<id> span=<id>`.
+// every log line from a running request carries trace_id and span_id, and its
+// response names the same span in a `traceresponse` header (LG-C1).
 // /healthz is excluded: a liveness probe every second is noise, not a trace.
 // ALSO CLOSED IN SLICE 1b: the traceparent Connect INTERCEPTORS (§A.5 rule 3).
 // src/connect/interceptors.ts carries both halves — the server one continues the
@@ -102,7 +103,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
 
   const app = Fastify({
     loggerInstance: createStructuredLogger({
-      name: SERVICE_NAME,
+      service: SERVICE_NAME,
+      // The image's revision on every line. From the telemetry state, which read
+      // SERVICE_VERSION once: this factory still reads no environment.
+      ...(options.telemetry !== undefined ? { version: options.telemetry.version } : {}),
       ...(options.logLevel !== undefined ? { level: options.logLevel } : {}),
       ...(options.logSink !== undefined ? { sink: options.logSink } : {}),
     }),

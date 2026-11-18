@@ -33,6 +33,7 @@ import { startTelemetry, type Telemetry } from '../../src/platform/telemetry.js'
 import { generateTestSigningKey } from '../helpers/entitlementVerifier.js';
 import { startFakeSpineRead, type FakeSpineRead, type FakeSpineReadOptions } from '../helpers/fakeSpineRead.js';
 import { startFakeOpenFga, type FakeOpenFga } from '../helpers/fakeOpenFga.js';
+import { parseLine } from '../helpers/syncLog.js';
 
 const KID = 'ent-test';
 const SUB = 'user-1';
@@ -105,7 +106,8 @@ async function start(
   const app = buildApp({
     db: stubDb,
     logLevel: 'debug',
-    logSink: (line) => lines.push(JSON.parse(line) as Record<string, unknown>),
+    // parseLine: `denials` is one JSON string on the line (fc-shared's flat log shape).
+    logSink: (line) => lines.push(parseLine(line)),
     compare: {
       spineRead,
       resolveIdentity: () => ({ sub: SUB }),

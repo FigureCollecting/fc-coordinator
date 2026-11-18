@@ -1,9 +1,12 @@
-import { ROOT_CONTEXT, propagation, trace, type TextMapGetter } from '@opentelemetry/api';
+import { ROOT_CONTEXT, TraceFlags, context, propagation, trace, type TextMapGetter } from '@opentelemetry/api';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CLIENT_TRACE_HEADER, clientTraceGetter, extractClientTrace } from './client-trace.js';
+import { createStructuredLogger } from './logger.js';
 import { startTelemetry, type Telemetry } from './telemetry.js';
 
 const TRACEPARENT = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+/** Shaped like a trace id, so fc-shared would accept it as a run id. */
+const PHONE_RUN = 'c0ffee00c0ffee00c0ffee00c0ffee00';
 
 const headersGetter: TextMapGetter<Headers> = {
   get: (carrier, key) => carrier.get(key) ?? undefined,
@@ -80,5 +83,76 @@ describe('extractClientTrace', () => {
 
     expect(propagation.getBaggage(ctx)?.getEntry('mine')?.value).toBe('1');
     expect(propagation.getBaggage(ctx)?.getEntry('k')).toBeUndefined();
+  });
+
+  it("never takes a client's fc.run_id as the server's run, with or without a traceparent", () => {
+    // fc-shared's propagator turns an inbound fc.run_id baggage entry into the run id on every log
+    // line. The edge shows it no baggage header, so a phone cannot name a run.
+    const lines: string[] = [];
+    const log = createStructuredLogger({ level: 'info', sink: (line) => lines.push(line) });
+    for (const headers of [
+      { traceparent: TRACEPARENT, baggage: `fc.run_id=${PHONE_RUN}` },
+      { baggage: `fc.run_id=${PHONE_RUN}` },
+    ]) {
+      context.with(extractClientTrace(ROOT_CONTEXT, headers), () => log.info('handling'));
+    }
+
+    expect(lines).toHaveLength(2);
+    expect(lines.join('\n')).not.toContain(PHONE_RUN);
+    for (const line of lines) expect(JSON.parse(line)).not.toHaveProperty('run_id');
+  });
+});
+
+// LGMOB C1, decided here since LG-C1: the provider's sampler follows the parent, so the parent a
+// client names is marked sampled before a span is started under it.
+describe("extractClientTrace: a client's sampled flag is not trusted", () => {
+  const NOT_SAMPLED = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00';
+
+  it('marks a not-sampled client parent sampled, keeping its trace id and span id', () => {
+    const parent = trace.getSpanContext(extractClientTrace(ROOT_CONTEXT, { traceparent: NOT_SAMPLED }));
+
+    expect(parent).toMatchObject({
+      traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+      spanId: '00f067aa0ba902b7',
+      isRemote: true,
+      traceFlags: TraceFlags.SAMPLED,
+    });
+  });
+
+  it('so a span started under it records, and is itself sampled', () => {
+    const span = trace
+      .getTracer('test')
+      .startSpan('x', {}, extractClientTrace(ROOT_CONTEXT, { traceparent: NOT_SAMPLED }));
+
+    expect(span.isRecording()).toBe(true);
+    expect(span.spanContext().traceFlags & TraceFlags.SAMPLED).toBe(TraceFlags.SAMPLED);
+    span.end();
+  });
+
+  it('keeps the other flag bits a client set, adding only the sampled bit', () => {
+    // 0x02 is the level-2 random-trace-id flag.
+    const parent = trace.getSpanContext(
+      extractClientTrace(ROOT_CONTEXT, { traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-02' }),
+    );
+    expect(parent?.traceFlags).toBe(0x03);
+  });
+
+  it('leaves an already-sampled client parent exactly as extracted', () => {
+    const parent = trace.getSpanContext(extractClientTrace(ROOT_CONTEXT, { traceparent: TRACEPARENT }));
+    expect(parent?.traceFlags).toBe(TraceFlags.SAMPLED);
+  });
+
+  it('adds no parent when the client sent none, or a malformed one', () => {
+    expect(trace.getSpanContext(extractClientTrace(ROOT_CONTEXT, {}))).toBeUndefined();
+    expect(trace.getSpanContext(extractClientTrace(ROOT_CONTEXT, { traceparent: 'not-a-traceparent' }))).toBeUndefined();
+  });
+
+  it("does not touch the server's own not-sampled span when the client names no trace", () => {
+    // Only the REMOTE parent this extract read is overridden. A local span already in the
+    // context keeps the flag this service gave it.
+    const local = { traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), traceFlags: TraceFlags.NONE };
+    const ctx = extractClientTrace(trace.setSpanContext(ROOT_CONTEXT, local), {});
+
+    expect(trace.getSpanContext(ctx)).toEqual(local);
   });
 });

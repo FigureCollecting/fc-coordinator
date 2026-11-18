@@ -3,7 +3,9 @@
 // failed with, and from what the server measured as it placed the Push (Arrival): ages and counts.
 // Of what the client sent, a line takes only a well-formed origin_trace (originTraceFields). Every
 // field goes through the allow-list below before it reaches the logger. The logger adds the
-// request's trace (src/platform/logger.ts).
+// request's trace (trace_id, span_id) and writes every field as a scalar: `reasons`, `ages` and
+// `origin_trace` are one JSON string each on the line, read back with jq's fromjson
+// (src/platform/logger.ts).
 //
 // NEVER on a line: SyncEvent.version (it carries the DPoP device id), facet_key, payload, basis,
 // commit_cursor, client_id, the sub, the device id, a reason's detail (only its code), a raw
@@ -199,7 +201,7 @@ export const ORIGIN_TRACE_CAP = 20;
  * from the request on every line, the replay's and the refused Push's included:
  * - `origin_trace`: each distinct value isTraceId calls well-formed, in push order (oldest edit
  *   first), at most ORIGIN_TRACE_CAP; find a Push by one with
- *   `jq 'select(.msg == "sync.push" and any(.origin_trace[]?; . == "<id>"))'`;
+ *   `jq 'select(.msg == "sync.push" and any((.origin_trace // "[]") | fromjson[]; . == "<id>"))'`;
  * - `origin_trace_more`: how many distinct well-formed values past those;
  * - `origin_trace_malformed`: how many events carried any other value, whatever its length; the
  *   value itself is never written;

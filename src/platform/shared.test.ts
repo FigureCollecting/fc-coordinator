@@ -26,6 +26,10 @@ describe('platform/shared — the single fc-shared seam', () => {
       'redactAttributes',
       'configureLogger',
       'sanitizeLogValue',
+      // the node-only server subpaths (LG-C1): the log shape and the tracing bootstrap
+      'createLogger',
+      'startTracing',
+      'withPropagationTarget',
     ];
     for (const name of fns) {
       expect(typeof (shared as unknown as Record<string, unknown>)[name]).toBe('function');

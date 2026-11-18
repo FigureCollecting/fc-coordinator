@@ -43,6 +43,23 @@ export type {
 } from '@figurecollecting/fc-shared/utils/sanitize';
 
 // ---------------------------------------------------------------------------
+// THE NODE-ONLY SERVER SUBPATHS (fc-shared 1.10.0, LG-C1): the estate's one log
+// shape and its tracing bootstrap. platform/logger.ts and platform/telemetry.ts
+// are the only callers; each passes COORDINATOR_REDACT_OPTIONS below, so the
+// DPoP keys stay masked on a log line and on an exported span.
+//
+// These bundles keep every package external, so they load this service's own
+// @opentelemetry/* copies (optional peers of fc-shared: the SDK, the gRPC OTLP
+// exporter and `instrumentation`, all in package.json) and nothing of the
+// browser surface. test/import-graph.test.ts still measures that.
+// ---------------------------------------------------------------------------
+export { createLogger } from '@figurecollecting/fc-shared/server/log';
+export type { LevelSetting } from '@figurecollecting/fc-shared/server/log';
+
+export { startTracing, withPropagationTarget } from '@figurecollecting/fc-shared/server/tracing';
+export type { ExporterKind, StartTracingOptions } from '@figurecollecting/fc-shared/server/tracing';
+
+// ---------------------------------------------------------------------------
 // LOCAL EXTENSION — DPoP (plan §A.4), carried forward from the slice-1a review.
 //
 // fc-shared's DEFAULT_SENSITIVE_KEY_PATTERN matches neither `dpop` nor

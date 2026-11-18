@@ -112,10 +112,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Read service version from package.json
-        id: service-version
-        run: echo "version=$(node -pe "require('./package.json').version")" >> "$GITHUB_OUTPUT"
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -130,8 +126,11 @@ jobs:
           push: false
           load: true
           tags: fc-coordinator:ci
+          # Commit as version (LG-C1): the service reports the commit it was
+          # built from. On a pull_request that is the merge commit, and this
+          # image is never pushed.
           build-args: |
-            SERVICE_VERSION=${{ steps.service-version.outputs.version }}
+            SERVICE_VERSION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           secrets: |
@@ -169,10 +168,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Read service version from package.json
-        id: service-version
-        run: echo "version=$(node -pe "require('./package.json').version")" >> "$GITHUB_OUTPUT"
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -207,8 +202,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Commit as version (LG-C1): the pushed commit, the same value the
+          # metadata step writes as the org.opencontainers.image.revision label
+          # and fc-infra records beside the digest it pins.
           build-args: |
-            SERVICE_VERSION=${{ steps.service-version.outputs.version }}
+            SERVICE_VERSION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           secrets: |

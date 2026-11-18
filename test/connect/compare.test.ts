@@ -80,7 +80,9 @@ let telemetry: Telemetry;
 // spans whose context is all zeroes and which the W3C propagator declines to
 // inject. It is also what the service itself does at boot.
 beforeAll(() => {
-  telemetry = startTelemetry({ env: {}, serviceName: 'fc-coordinator-test' });
+  // The fake spine listens on loopback, which the propagation allowlist does not
+  // name by default (in-cluster names only): without it no traceparent is sent.
+  telemetry = startTelemetry({ env: {}, serviceName: 'fc-coordinator-test', propagateHosts: ['127.0.0.1'] });
 });
 
 afterAll(async () => {

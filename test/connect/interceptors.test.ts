@@ -14,6 +14,7 @@ import {
   SpanKind,
   SpanStatusCode,
   context,
+  createContextKey,
   propagation,
   trace,
   type Baggage,
@@ -21,8 +22,8 @@ import {
   type Tracer,
 } from '@opentelemetry/api';
 import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
-import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
-import { Code, ConnectError, createClient, type Client } from '@connectrpc/connect';
+import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace';
+import { Code, ConnectError, createClient, type Client, type Interceptor } from '@connectrpc/connect';
 import { createRouterTransport } from '@connectrpc/connect';
 import { create } from '@bufbuild/protobuf';
 import {
@@ -64,12 +65,31 @@ let exporter: CollectingExporter;
 
 beforeEach(() => {
   exporter = new CollectingExporter();
-  telemetry = startTelemetry({ env: {}, serviceName: 'fc-coordinator-test', exporter });
+  // `in-memory` is the host of connect's router transport: the propagator injects only for a
+  // host on its allowlist, and the default list is in-cluster names.
+  telemetry = startTelemetry({
+    env: {},
+    serviceName: 'fc-coordinator-test',
+    exporter,
+    propagateHosts: ['in-memory'],
+  });
 });
 
 afterEach(async () => {
   await telemetry.shutdown();
 });
+
+/**
+ * Outermost on a test's client: by the time a call returns (or throws), every span it ended has
+ * reached the exporter. Spans are batched on the way out, so a test would otherwise read none.
+ */
+const flushAfter: Interceptor = (next) => async (req) => {
+  try {
+    return await next(req);
+  } finally {
+    await telemetry.forceFlush();
+  }
+};
 
 /**
  * A SpineRead client and server wired through connect's in-memory transport,
@@ -86,7 +106,7 @@ function wire(
     },
     {
       router: { interceptors: [traceparentServerInterceptor(options)] },
-      transport: { interceptors: [traceparentClientInterceptor(options)] },
+      transport: { interceptors: [flushAfter, traceparentClientInterceptor(options)] },
     },
   );
   return createClient(SpineRead, transport);
@@ -319,8 +339,8 @@ describe('the carrier accessors match the WHATWG Headers API', () => {
 // tracestate and baggage must not reach the server's context, because the SDK
 // copies a parent's tracestate onto every child span and the W3C propagators
 // re-inject both on the SpineRead hop. A phone-supplied `fc.run_id` entry would
-// also become the server's run id once fc-shared's RunIdBaggagePropagator is
-// installed (lg-logging U8). The strip is at the edge, not in the global
+// also become the server's run id now that fc-shared's RunIdBaggagePropagator
+// is installed (LG-C1). The strip is at the edge, not in the global
 // propagator, so the server's OWN baggage still goes to our services; the last
 // tests in this block pin both halves.
 // ===========================================================================
@@ -351,8 +371,8 @@ interface Relay {
  * fc-mobile -> coordinator -> SpineRead, in memory. The coordinator half runs
  * its handler behind the SERVER interceptor and calls the spine through the
  * CLIENT interceptor, as compare does. With `serverRun`, the handler adds a run
- * id of its own to baggage the way fc-shared's run-id rules do (fc.run_id
- * first, then the context's other entries), so a test can tell the server's
+ * id of its own the way fc-shared's server/job does (the context key, which
+ * goes out as the first baggage entry), so a test can tell the server's
  * baggage apart from anything a client sent.
  */
 function relay(options: { serverRun?: string } = {}): Relay {
@@ -383,15 +403,22 @@ function relay(options: { serverRun?: string } = {}): Relay {
             const span = trace.getSpan(active);
             inHandler.push({ baggage, span, recording: span?.isRecording(), ids: getActiveTraceIds() });
             if (options.serverRun === undefined) return spine.compare(req);
-            let own = propagation.createBaggage({ 'fc.run_id': { value: options.serverRun } });
-            for (const [key, entry] of baggage?.getAllEntries() ?? []) {
-              if (key !== 'fc.run_id') own = own.setEntry(key, entry);
-            }
-            return context.with(propagation.setBaggage(active, own), () => spine.compare(req));
+            // The server's own run and one baggage entry of its own, set as fc-shared's
+            // server/job sets them: the run under the context key `fc.run_id`
+            // (createContextKey is Symbol.for, so this is fc-shared's key), which its
+            // propagator writes as the first baggage entry.
+            const own = propagation.setBaggage(
+              active.setValue(createContextKey('fc.run_id'), options.serverRun),
+              propagation.createBaggage({ tier: { value: 'server' } }),
+            );
+            return context.with(own, () => spine.compare(req));
           },
         });
       },
-      { router: { interceptors: [traceparentServerInterceptor()] } },
+      {
+        router: { interceptors: [traceparentServerInterceptor()] },
+        transport: { interceptors: [flushAfter] },
+      },
     ),
   );
   return { phone, outbound, inHandler };
@@ -469,10 +496,58 @@ describe('LGMOB C1: a client may set traceparent and nothing else (Connect edge)
       baggage: `fc.run_id=${PHONE_RUN},vendor=x`,
     });
 
-    // Exactly the server's entry. The phone's run id and its other entry are
-    // gone, and the global W3C baggage propagator still writes the header: a
-    // global propagator with no baggage half (the plan's first cut) sends null.
-    expect(r.outbound[0]?.get('baggage')).toBe(`fc.run_id=${SERVER_RUN}`);
+    // Exactly the server's entries, its run first. The phone's run id and its
+    // other entry are gone, and the global W3C baggage propagator still writes
+    // the header: a global propagator with no baggage half (the plan's first
+    // cut) sends null.
+    expect(r.outbound[0]?.get('baggage')).toBe(`fc.run_id=${SERVER_RUN},tier=server`);
+  });
+
+  it("never forwards a fc.run_id baggage entry that is not the server's run", async () => {
+    // fc-shared's propagator (LG-C1): only the run under its context key is
+    // written. An entry that merely sits in baggage under that name, as a
+    // forged or stale one would, is removed on the way out.
+    const spine: Headers[] = [];
+    const client = createClient(
+      SpineRead,
+      createRouterTransport(
+        ({ service }) => {
+          service(SpineRead, {
+            compare: (_req, ctx) => {
+              spine.push(new Headers(ctx.requestHeader));
+              return ok();
+            },
+          });
+        },
+        { transport: { interceptors: [traceparentClientInterceptor()] } },
+      ),
+    );
+    const forged = propagation.setBaggage(
+      context.active(),
+      propagation.createBaggage({ 'fc.run_id': { value: PHONE_RUN }, tier: { value: 'server' } }),
+    );
+
+    await context.with(forged, () =>
+      client.compare({ seed: { case: 'gtin14', value: '04573102591234' }, nowIso: NOW_ISO }),
+    );
+
+    expect(spine[0]?.get('baggage')).toBe('tier=server');
+  });
+
+  it('sends no traceparent and no baggage to a host that is not on the propagation allowlist', async () => {
+    // The allowlist is what keeps a trace id and a run id inside the cluster.
+    // Restarted WITHOUT the in-memory host, so the same hop is now off-list.
+    await telemetry.shutdown();
+    telemetry = startTelemetry({ env: {}, serviceName: 'fc-coordinator-test', exporter });
+    const r = relay({ serverRun: SERVER_RUN });
+
+    await compareFrom(r, { traceparent: phoneTraceparent() });
+
+    expect(r.outbound).toHaveLength(1);
+    expect(r.outbound[0]?.get('traceparent')).toBeNull();
+    expect(r.outbound[0]?.get('baggage')).toBeNull();
+    // The request itself is still traced: only the header stays home.
+    expect(r.inHandler[0]?.ids?.traceId).toBe(PHONE_TRACE);
   });
 
   it("does not let a client's not-sampled flag switch the coordinator's spans off", async () => {
@@ -488,11 +563,11 @@ describe('LGMOB C1: a client may set traceparent and nothing else (Connect edge)
     );
   });
 
-  it('a not-sampled request was ALREADY joinable in logs: the sampler is export-time only', async () => {
+  it('a not-sampled request was ALREADY joinable in logs: the sampled override is export-time only', async () => {
     // Red-team finding 11, pinned. fc-shared's getActiveTraceIds reads the span
     // context of a NonRecordingSpan too, so a log line under a flags-00 request
-    // carried the phone's trace id before the sampler existed. This passes with
-    // or without the sampler; it is here so nobody credits it with log joins.
+    // carried the phone's trace id before the override existed. This passes with
+    // or without it; it is here so nobody credits it with log joins.
     const r = relay();
     await compareFrom(r, { traceparent: phoneTraceparent('00') });
 
