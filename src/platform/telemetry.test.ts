@@ -1,20 +1,12 @@
-import { ROOT_CONTEXT, TraceFlags, context, trace, type ContextManager } from '@opentelemetry/api';
-import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
+// startTelemetry over fc-shared's startTracing: the context manager, the state it reports, the
+// redaction it passes on and its lifecycle. What leaves the process (gRPC with an endpoint,
+// nothing without) is in otlp-export.test.ts; the log line's ids are in trace-shape.test.ts.
+import { ROOT_CONTEXT, TraceFlags, context, propagation, trace } from '@opentelemetry/api';
 import { ExportResultCode, type ExportResult } from '@opentelemetry/core';
-import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace-base';
+import type { ReadableSpan, SpanExporter } from '@opentelemetry/sdk-trace';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createStructuredLogger } from './logger.js';
-import { getActiveTraceIds } from './shared.js';
-import {
-  NoopSpanExporter,
-  RedactingSpanExporter,
-  redactSpan,
-  resolveExporterChoice,
-  scrubDisabledExporterEnv,
-  startTelemetry,
-  buildExporter,
-  type Telemetry,
-} from './telemetry.js';
+import { getActiveTraceIds, withPropagationTarget } from './shared.js';
+import { DEFAULT_SERVICE_NAME, SHUTDOWN_TIMEOUT_MS, startTelemetry, type Telemetry } from './telemetry.js';
 
 class CaptureExporter implements SpanExporter {
   readonly spans: ReadableSpan[] = [];
@@ -33,14 +25,14 @@ afterEach(async () => {
   started = undefined;
 });
 
-// A compact JWS — the shape of BOTH the entitlement assertion and the DPoP
+// A compact JWS, the shape of BOTH the entitlement assertion and the DPoP
 // proof (§A.5, "keeping secrets out of spans").
 const JWS = 'eyJhbGciOiJFUzI1NiIsInR5cCI6ImRwb3Arand0In0.eyJzdWIiOiJyb3NzIn0.c2ln';
+const NONCE = 'q8Zr3kVn1xMpLb7TfGhQaWcEdRyUiOpAsDfGhJkLzXcVbNm0';
 
-describe('telemetry — §A.5 rule 1: an async context manager is registered', () => {
+describe('telemetry: §A.5 rule 1, an async context manager is registered', () => {
   it('gives a span a non-zero trace id that survives an await', async () => {
-    const capture = new CaptureExporter();
-    started = startTelemetry({ exporter: capture, env: {} });
+    started = startTelemetry({ exporter: new CaptureExporter(), env: {} });
 
     let inside: string | undefined;
     let afterAwait: string | undefined;
@@ -53,150 +45,132 @@ describe('telemetry — §A.5 rule 1: an async context manager is registered', (
 
     expect(inside).toMatch(/^[0-9a-f]{32}$/);
     expect(inside).not.toMatch(/^0+$/);
-    // The whole point of AsyncLocalStorageContextManager: the SAME span is
+    // The whole point of an AsyncLocalStorage context manager: the SAME span is
     // still active on the far side of the await.
     expect(afterAwait).toBe(inside);
   });
 
-  it('registers the AsyncLocalStorage context manager explicitly, not by default', () => {
-    // Surviving an await is already asserted above, but NodeTracerProvider's own
-    // default would satisfy that too. This pins the §A.5 rule-1 INTENT: the
-    // manager is chosen here, so a future change to that default cannot quietly
-    // swap in a synchronous one.
-    started = startTelemetry({ exporter: new CaptureExporter(), env: {} });
+  it('loses the active span again once it is shut down: the manager was this registration', async () => {
+    const telemetry = startTelemetry({ exporter: new CaptureExporter(), env: {} });
+    await telemetry.shutdown();
 
-    // IDENTITY, not class. A bare provider.register() installs its OWN
-    // AsyncLocalStorageContextManager, so an instanceof check passes either
-    // way. Asserting the globally installed manager IS the instance this
-    // module constructed is what makes the explicit registration load-bearing.
-    // `_getContextManager` is marked private on ContextAPI; it is the only way
-    // to read what is actually registered, and identity is the property here.
-    const installed = (
-      context as unknown as { _getContextManager(): ContextManager }
-    )._getContextManager();
-    expect(installed).toBe(started.contextManager);
-    expect(started.contextManager).toBeInstanceOf(AsyncLocalStorageContextManager);
-  });
-
-  it('puts the canonical trace tag on a log line emitted inside the span', async () => {
-    const lines: string[] = [];
-    started = startTelemetry({ exporter: new CaptureExporter(), env: {} });
-    const log = createStructuredLogger({ name: 'unit', level: 'info', sink: (l) => lines.push(l) });
-
-    await trace.getTracer('test').startActiveSpan('logged', async (span) => {
-      await new Promise((resolve) => setImmediate(resolve));
-      log.info('hello');
+    let inside: unknown = 'unset';
+    trace.getTracer('test').startActiveSpan('unit', (span) => {
+      inside = getActiveTraceIds();
       span.end();
     });
-
-    expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatch(/trace=[0-9a-f]{32} span=[0-9a-f]{16}/);
+    expect(inside).toBeUndefined();
   });
 });
 
-describe("telemetry — LGMOB C1: a client's sampled flag does not decide this service's spans", () => {
+describe('telemetry: sampling follows the parent; the client edge decides what a client may say', () => {
   const TRACE_ID = '4bf92f3577b34da6a3ce929d0e0e4736';
   const parent = (traceFlags: TraceFlags, isRemote: boolean) =>
     trace.setSpanContext(ROOT_CONTEXT, { traceId: TRACE_ID, spanId: '00f067aa0ba902b7', traceFlags, isRemote });
 
-  it('records a span whose REMOTE parent said not-sampled, and marks it sampled', () => {
+  it('records a root span, and a span under a sampled parent', () => {
+    started = startTelemetry({ exporter: new CaptureExporter(), env: {} });
+    const root = trace.getTracer('test').startSpan('root');
+    const child = trace.getTracer('test').startSpan('child', {}, parent(TraceFlags.SAMPLED, true));
+
+    expect(root.isRecording()).toBe(true);
+    expect(child.isRecording()).toBe(true);
+    expect(child.spanContext().traceId).toBe(TRACE_ID);
+    root.end();
+    child.end();
+  });
+
+  it('follows a not-sampled parent, which is why client-trace.ts marks a client parent sampled', () => {
+    // fc-shared's provider has the SDK default sampler. The LGMOB C1 rule (a client's flag does
+    // not switch this service's spans off) therefore lives at the edge: client-trace.test.ts.
     started = startTelemetry({ exporter: new CaptureExporter(), env: {} });
     const span = trace.getTracer('test').startSpan('x', {}, parent(TraceFlags.NONE, true));
 
-    expect(span.isRecording()).toBe(true);
-    expect(span.spanContext().traceId).toBe(TRACE_ID);
-    expect(span.spanContext().traceFlags & TraceFlags.SAMPLED).toBe(TraceFlags.SAMPLED);
-    span.end();
-  });
-
-  it('still follows a LOCAL not-sampled parent: only the remote flag is overridden', () => {
-    started = startTelemetry({ exporter: new CaptureExporter(), env: {} });
-    const span = trace.getTracer('test').startSpan('x', {}, parent(TraceFlags.NONE, false));
-
     expect(span.isRecording()).toBe(false);
+    // The ids are still real, so a log line under it would keep its trace_id.
+    expect(span.spanContext().traceId).toBe(TRACE_ID);
     span.end();
   });
 
-  it('decides sampling in code, so OTEL_TRACES_SAMPLER in the environment is not read', () => {
-    // A consequence of an explicit sampler, pinned so it is a decision and not
-    // an accident. fc-infra sets no OTEL_TRACES_SAMPLER for the coordinator.
-    const saved = process.env['OTEL_TRACES_SAMPLER'];
-    process.env['OTEL_TRACES_SAMPLER'] = 'always_off';
+  it.each([
+    ['OTEL_TRACES_SAMPLER', 'always_off'],
+    ['OTEL_TRACES_EXPORTER', 'none'],
+    ['OTEL_SDK_DISABLED', 'true'],
+  ])('does not let %s=%s in the process environment turn recording off', (name, value) => {
+    // Pinned so it is a decision and not an accident: fc-infra sets none of these for the
+    // coordinator, and a stray one must not silently cost every line its trace_id.
+    const saved = process.env[name];
+    process.env[name] = value;
     try {
-      started = startTelemetry({ exporter: new CaptureExporter(), env: {} });
+      started = startTelemetry({ exporter: new CaptureExporter() });
       const span = trace.getTracer('test').startSpan('root');
       expect(span.isRecording()).toBe(true);
+      expect(span.spanContext().traceId).not.toBe('0'.repeat(32));
       span.end();
     } finally {
-      if (saved === undefined) delete process.env['OTEL_TRACES_SAMPLER'];
-      else process.env['OTEL_TRACES_SAMPLER'] = saved;
+      if (saved === undefined) delete process.env[name];
+      else process.env[name] = saved;
     }
   });
 });
 
-describe('telemetry — §A.5 rule 2: never a no-op provider', () => {
-  it('chooses a real SimpleSpanProcessor + NoopSpanExporter when no collector is configured', () => {
-    expect(resolveExporterChoice({})).toEqual({ kind: 'noop' });
-  });
-
-  it('chooses OTLP when an endpoint is configured, traces-specific winning over generic', () => {
-    expect(resolveExporterChoice({ OTEL_EXPORTER_OTLP_ENDPOINT: 'http://c:4318' })).toEqual({
-      kind: 'otlp',
-      endpoint: 'http://c:4318',
-    });
-    expect(
-      resolveExporterChoice({
-        OTEL_EXPORTER_OTLP_ENDPOINT: 'http://generic:4318',
-        OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'http://traces:4318/v1/traces',
-      }),
-    ).toEqual({ kind: 'otlp', endpoint: 'http://traces:4318/v1/traces' });
-  });
-
-  it('scrubs OTEL_TRACES_EXPORTER=none out of the environment', () => {
-    const env: Record<string, string> = { OTEL_TRACES_EXPORTER: 'none' };
-    expect(scrubDisabledExporterEnv(env)).toBe(true);
-    expect('OTEL_TRACES_EXPORTER' in env).toBe(false);
-    expect(scrubDisabledExporterEnv({ OTEL_TRACES_EXPORTER: 'otlp' })).toBe(false);
-    expect(scrubDisabledExporterEnv({})).toBe(false);
-  });
-
-  it('still produces a non-zero trace id even when the environment asked for exporter=none', async () => {
-    const env: Record<string, string> = { OTEL_TRACES_EXPORTER: 'none' };
-    started = startTelemetry({ exporter: new CaptureExporter(), env });
-
-    let traceId: string | undefined;
-    let recording: boolean | undefined;
-    trace.getTracer('test').startActiveSpan('unit', (span) => {
-      traceId = getActiveTraceIds()?.traceId;
-      recording = span.isRecording();
-      span.end();
-    });
-
-    // The bug this guards: an all-zero id makes fc-shared's trace.ts report
-    // "no span", and every log line silently loses its trace tag.
-    expect(traceId).toMatch(/^[0-9a-f]{32}$/);
-    expect(traceId).not.toMatch(/^0+$/);
-    // A no-op provider hands out NonRecordingSpan. Asserting the span RECORDS
-    // proves a real SDK is registered, which is the property rule 2 protects —
-    // the env scrub alone proves nothing here (see the module header).
-    expect(recording).toBe(true);
-    expect(started.state.exporter).toBe('noop');
-  });
-
-  it('reports its state for /healthz without leaking anything', () => {
-    started = startTelemetry({ exporter: new CaptureExporter(), env: {}, serviceName: 'fc-coordinator' });
+describe('telemetry: the state /healthz and the boot line read', () => {
+  it('names the exporter kind, the service and the version, and nothing else', () => {
+    started = startTelemetry({ env: { SERVICE_VERSION: 'abc1234' } });
     expect(started.state).toEqual({
       registered: true,
       exporter: 'noop',
       serviceName: 'fc-coordinator',
+      version: 'abc1234',
+    });
+    expect(DEFAULT_SERVICE_NAME).toBe('fc-coordinator');
+  });
+
+  it('takes the service name it is given over OTEL_SERVICE_NAME', () => {
+    started = startTelemetry({ env: { OTEL_SERVICE_NAME: 'from-env' }, serviceName: 'fc-coordinator-test' });
+    expect(started.state.serviceName).toBe('fc-coordinator-test');
+  });
+
+  it('says custom under the test seam, whatever endpoint the environment names', () => {
+    started = startTelemetry({
+      exporter: new CaptureExporter(),
+      env: { OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'http://collector.invalid:4317' },
+    });
+    expect(started.state.exporter).toBe('custom');
+    expect(JSON.stringify(started.state)).not.toContain('collector.invalid');
+  });
+
+  it('reads the ambient process environment when none is injected', () => {
+    const saved = process.env['SERVICE_VERSION'];
+    process.env['SERVICE_VERSION'] = 'ambient-revision';
+    try {
+      started = startTelemetry({ exporter: new CaptureExporter() });
+      expect(started.state.version).toBe('ambient-revision');
+      expect(started.state.serviceName).toBe('fc-coordinator');
+    } finally {
+      if (saved === undefined) delete process.env['SERVICE_VERSION'];
+      else process.env['SERVICE_VERSION'] = saved;
+    }
+  });
+
+  it('stamps the service name and the version on the span resource', async () => {
+    const capture = new CaptureExporter();
+    started = startTelemetry({ exporter: capture, env: { SERVICE_VERSION: 'abc1234' } });
+
+    trace.getTracer('test').startActiveSpan('unit', (span) => span.end());
+    await started.forceFlush();
+
+    expect(capture.spans[0]?.resource.attributes).toMatchObject({
+      'service.name': 'fc-coordinator',
+      'service.version': 'abc1234',
     });
   });
 });
 
-describe('telemetry — span attributes are redacted before export', () => {
+describe('telemetry: span attributes are redacted before export', () => {
   it('redacts a compact-JWS attribute on a REAL span before the exporter sees it', async () => {
     const capture = new CaptureExporter();
-    started = startTelemetry({ exporter: new RedactingSpanExporter(capture), env: {} });
+    started = startTelemetry({ exporter: capture, env: {} });
 
     trace.getTracer('test').startActiveSpan('dpop.verify', (span) => {
       span.setAttribute('app.dpop.proof', JWS);
@@ -211,13 +185,12 @@ describe('telemetry — span attributes are redacted before export', () => {
     expect(capture.spans[0]?.name).toBe('dpop.verify');
   });
 
-  it('redacts an OPAQUE dpop nonce attribute, which the value patterns cannot see', async () => {
+  it('redacts an OPAQUE dpop nonce attribute, which only the coordinator key pattern catches', async () => {
     const capture = new CaptureExporter();
-    started = startTelemetry({ exporter: new RedactingSpanExporter(capture), env: {} });
-    const nonce = 'q8Zr3kVn1xMpLb7TfGhQaWcEdRyUiOpAsDfGhJkLzXcVbNm0';
+    started = startTelemetry({ exporter: capture, env: {} });
 
     trace.getTracer('test').startActiveSpan('dpop.verify', (span) => {
-      span.setAttribute('app.dpop_nonce', nonce);
+      span.setAttribute('app.dpop_nonce', NONCE);
       span.end();
     });
     await started.forceFlush();
@@ -225,56 +198,74 @@ describe('telemetry — span attributes are redacted before export', () => {
     expect(capture.spans[0]?.attributes['app.dpop_nonce']).toBe('[REDACTED]');
   });
 
-  it('wraps the PRODUCTION exporter, with nothing injected', async () => {
-    // The other redaction tests construct RedactingSpanExporter themselves and
-    // inject it, so they pass even if startTelemetry stops wrapping. This one
-    // injects NOTHING and asserts what the real exporter is handed. Dropping the
-    // wrapper makes it fail printing the raw JWS — the leak the rule prevents.
-    const shipped = vi.spyOn(NoopSpanExporter.prototype, 'export');
-    try {
-      started = startTelemetry({ env: {} });
-      trace.getTracer('test').startActiveSpan('dpop.verify', (span) => {
-        span.setAttribute('app.dpop.proof', JWS);
-        span.setAttribute('app.dpop.attempts', 1);
-        span.end();
-      });
-      await started.forceFlush();
-
-      const spans = shipped.mock.calls[0]?.[0];
-      expect(spans).toHaveLength(1);
-      expect(spans?.[0]?.attributes['app.dpop.proof']).toBe('[REDACTED]');
-      expect(spans?.[0]?.attributes['app.dpop.attempts']).toBe(1);
-    } finally {
-      shipped.mockRestore();
-    }
-  });
-
-  it('redacts by key name as well as by value shape', () => {
-    const span = {
-      name: 'x',
-      attributes: { authorization: 'opaque-but-sensitive', 'app.ok': true },
-    } as unknown as ReadableSpan;
-    const out = redactSpan(span);
-    expect(out.attributes['authorization']).toBe('[REDACTED]');
-    expect(out.attributes['app.ok']).toBe(true);
-    expect(out.name).toBe('x');
-  });
-
-  it('delegates shutdown and forceFlush, and the noop exporter always succeeds', async () => {
+  it('redacts a span event and strips a URL attribute, which the local exporter did not', async () => {
     const capture = new CaptureExporter();
-    const wrapper = new RedactingSpanExporter(capture);
-    await expect(wrapper.shutdown()).resolves.toBeUndefined();
-    await expect(wrapper.forceFlush()).resolves.toBeUndefined();
+    started = startTelemetry({ exporter: capture, env: {} });
 
-    const noop = new NoopSpanExporter();
-    const results: ExportResult[] = [];
-    noop.export([], (r) => results.push(r));
-    expect(results).toEqual([{ code: ExportResultCode.SUCCESS }]);
-    await expect(noop.shutdown()).resolves.toBeUndefined();
+    trace.getTracer('test').startActiveSpan('outbound', (span) => {
+      span.addEvent('retry', { dpop_nonce: NONCE, attempt: 2 });
+      span.setAttribute('url.full', 'https://fc:hunter2@pg.data.svc/db?sig=opaque-signature#frag');
+      span.end();
+    });
+    await started.forceFlush();
+
+    const span = capture.spans[0]!;
+    expect(span.events[0]?.attributes).toEqual({ dpop_nonce: '[REDACTED]', attempt: 2 });
+    expect(span.attributes['url.full']).toBe('https://pg.data.svc/db');
+  });
+
+  it('keeps the getter-backed fields of the span it hands on', async () => {
+    const capture = new CaptureExporter();
+    started = startTelemetry({ exporter: capture, env: {} });
+
+    trace.getTracer('test').startActiveSpan('unit', (span) => span.end());
+    await started.forceFlush();
+
+    const span = capture.spans[0]!;
+    expect(span.ended).toBe(true);
+    expect(span.spanContext().traceId).toMatch(/^[0-9a-f]{32}$/);
+    expect(Array.isArray(span.duration)).toBe(true);
   });
 });
 
-describe('telemetry — lifecycle', () => {
+describe('telemetry: propagation goes to listed hosts only', () => {
+  const inject = (target: string | undefined): Record<string, string> => {
+    const carrier: Record<string, string> = {};
+    trace.getTracer('test').startActiveSpan('hop', (span) => {
+      const ctx = target === undefined ? context.active() : withPropagationTarget(context.active(), target);
+      propagation.inject(ctx, carrier);
+      span.end();
+    });
+    return carrier;
+  };
+
+  it('injects a traceparent for an in-cluster target, by default', () => {
+    started = startTelemetry({ env: {} });
+    expect(inject('http://ingest-server.fc.svc.cluster.local:50062').traceparent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+  });
+
+  it.each([
+    ['a public host', 'https://auth.mindsignals1.com/application/o/token/'],
+    ['a loopback address', 'http://127.0.0.1:50062'],
+    ['no named target at all', undefined],
+  ])('injects nothing for %s', (_label, target) => {
+    started = startTelemetry({ env: {} });
+    expect(inject(target)).toEqual({});
+  });
+
+  it('adds the hosts it is given to the list', () => {
+    started = startTelemetry({ env: {}, propagateHosts: ['127.0.0.1'] });
+    expect(inject('http://127.0.0.1:50062').traceparent).toBeDefined();
+  });
+
+  it('takes the list from OTEL_PROPAGATION_ALLOWLIST when it is set', () => {
+    started = startTelemetry({ env: { OTEL_PROPAGATION_ALLOWLIST: 'spine.internal' } });
+    expect(inject('http://spine.internal:50062').traceparent).toBeDefined();
+    expect(inject('http://ingest-server.fc.svc.cluster.local:50062')).toEqual({});
+  });
+});
+
+describe('telemetry: lifecycle', () => {
   it('shutdown releases the global provider so a later start is clean', async () => {
     const first = startTelemetry({ exporter: new CaptureExporter(), env: {} });
     await first.shutdown();
@@ -285,55 +276,69 @@ describe('telemetry — lifecycle', () => {
     await started.forceFlush();
     expect(capture.spans).toHaveLength(1);
   });
-});
 
-describe('telemetry — the production wiring, with nothing injected', () => {
-  it('builds a NoopSpanExporter with no collector and an OTLP exporter with one', () => {
-    expect(buildExporter({ kind: 'noop' })).toBeInstanceOf(NoopSpanExporter);
-    const otlp = buildExporter({ kind: 'otlp', endpoint: 'http://collector:4318/v1/traces' });
-    expect(otlp).not.toBeInstanceOf(NoopSpanExporter);
-    expect(typeof otlp.export).toBe('function');
+  it('is one registration per process: a second start reports the running one', () => {
+    started = startTelemetry({ env: {}, serviceName: 'first' });
+    const second = startTelemetry({ env: { SERVICE_VERSION: 'other' }, serviceName: 'second' });
+
+    expect(second.state).toEqual(started.state);
+    expect(second.state.serviceName).toBe('first');
   });
 
-  it('starts with no injected exporter and still yields a non-zero trace id', async () => {
-    const telemetry = startTelemetry({ env: {} });
-    try {
-      expect(telemetry.state).toEqual({
-        registered: true,
-        exporter: 'noop',
-        serviceName: 'fc-coordinator',
-      });
-      let traceId: string | undefined;
-      trace.getTracer('test').startActiveSpan('unwired', (span) => {
-        traceId = getActiveTraceIds()?.traceId;
-        span.end();
-      });
-      expect(traceId).toMatch(/^[0-9a-f]{32}$/);
-      await telemetry.forceFlush();
-    } finally {
-      await telemetry.shutdown();
-    }
-  });
-});
+  it('never rejects from forceFlush or shutdown when the exporter fails', async () => {
+    const failing: SpanExporter = {
+      export: (_spans, done) => done({ code: ExportResultCode.FAILED, error: new Error('collector down') }),
+      shutdown: () => Promise.reject(new Error('collector down')),
+    };
+    const telemetry = startTelemetry({ exporter: failing, env: {} });
+    trace.getTracer('test').startActiveSpan('unit', (span) => span.end());
 
-describe('telemetry — the OTLP path', () => {
-  it('batches spans when a collector endpoint is configured', async () => {
-    const capture = new CaptureExporter();
-    started = startTelemetry({
-      exporter: capture,
-      env: { OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'http://collector:4318/v1/traces' },
+    await expect(telemetry.forceFlush()).resolves.toBeUndefined();
+    await expect(telemetry.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('shutdown stops waiting after its budget, and the flush it left goes on to finish', async () => {
+    const exported: string[] = [];
+    let release: (() => void) | undefined;
+    const stuck: SpanExporter = {
+      export: (spans, done) => {
+        release = () => {
+          exported.push(...spans.map((span) => span.name));
+          done({ code: ExportResultCode.SUCCESS });
+        };
+      },
+      shutdown: () => Promise.resolve(),
+    };
+    const telemetry = startTelemetry({ exporter: stuck, env: {}, serviceName: 'stuck', shutdownTimeoutMs: 50 });
+    trace.getTracer('test').startActiveSpan('queued', (span) => span.end());
+
+    const startedAt = performance.now();
+    await expect(telemetry.shutdown()).resolves.toBeUndefined();
+    const waited = performance.now() - startedAt;
+    expect(waited).toBeGreaterThanOrEqual(45);
+    // The budget it was given, not the default one.
+    expect(waited).toBeLessThan(SHUTDOWN_TIMEOUT_MS - 1_000);
+
+    // Not finished: the export is still in flight and the registration is still the running one.
+    expect(exported).toEqual([]);
+    expect(startTelemetry({ env: {}, serviceName: 'next' }).state.serviceName).toBe('stuck');
+
+    release?.();
+    await vi.waitFor(() => {
+      started = startTelemetry({ env: {}, serviceName: 'next' });
+      expect(started.state.serviceName).toBe('next');
     });
-    expect(started.state.exporter).toBe('otlp');
-
-    trace.getTracer('test').startActiveSpan('batched', (span) => span.end());
-    await started.forceFlush();
-    expect(capture.spans).toHaveLength(1);
+    expect(exported).toEqual(['queued']);
   });
 
-  it('reads the ambient process environment when none is injected', async () => {
-    const capture = new CaptureExporter();
-    started = startTelemetry({ exporter: capture });
-    expect(started.state.exporter).toBe(resolveExporterChoice(process.env).kind);
-    expect(started.state.serviceName).toBe('fc-coordinator');
+  it('shutdown returns as soon as the flush is done, and leaves no timer behind', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const telemetry = startTelemetry({ env: {}, shutdownTimeoutMs: 60_000 });
+      await expect(telemetry.shutdown()).resolves.toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

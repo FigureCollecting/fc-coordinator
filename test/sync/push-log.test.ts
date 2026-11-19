@@ -432,4 +432,42 @@ describe('what a sync line never carries', () => {
       for (const field of Object.keys(line)) expect(LOGGER_FIELDS.has(field) || SYNC_LOG_FIELDS.has(field)).toBe(true);
     }
   });
+
+  it('writes every field as a scalar: ages, reasons and origin_trace are one JSON string each', async () => {
+    // The log shape the estate's store indexes (LG-C1, fc-shared): no nested value on a line. A
+    // reader takes the structure back with `jq '.ages | fromjson'`; log.sync() does the same.
+    const caller = await SyncCaller.enrol(h);
+    const action = randomBytes(16).toString('hex');
+    const mark = log.mark();
+    ok(
+      await caller.push({
+        clientId: randomUUID(),
+        events: [
+          { ...upsert(occFacetKey(randomUUID(), 'status'), mint(caller), status('owned')), originTrace: action },
+          upsert(ufFacetKey(randomUUID(), 'score'), mint(caller, MAX_FUTURE_SKEW_MS + 60_000), JSON.stringify({ score: 8, ...DISPLAY })),
+        ],
+      }),
+    );
+
+    const [written] = log.syncAsWritten(mark);
+    for (const value of Object.values(written!)) expect(value === null || typeof value !== 'object').toBe(true);
+    expect(written!['origin_trace']).toBe(JSON.stringify([action]));
+    expect(written!['reasons']).toBe('{"version_future":1}');
+    const ages = JSON.parse(written!['ages'] as string) as Record<string, number>;
+    expect(ages['ahead']).toBe(1);
+    expect(Object.values(ages).reduce((sum, count) => sum + count, 0)).toBe(2);
+    for (const bucket of Object.keys(ages)) expect(AGE_BUCKETS).toContain(bucket);
+    // The shape's own fields: who wrote the line, and under which request.
+    expect(written).toMatchObject({ service: 'fc-coordinator', event: 'app.log', msg: 'sync.push' });
+    expect(written!['trace_id']).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it('keeps the Connect code of a refused Push in the shape\'s code field', async () => {
+    const caller = await SyncCaller.enrol(h);
+    const mark = log.mark();
+    await caller.push({ clientId: '', events: [upsert(occFacetKey(randomUUID(), 'status'), mint(caller), status('owned'))] });
+
+    const [written] = log.syncAsWritten(mark);
+    expect(written).toMatchObject({ level: 'warn', outcome: 'error', code: 'invalid_argument', events: 1 });
+  });
 });

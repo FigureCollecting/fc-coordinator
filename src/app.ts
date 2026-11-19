@@ -11,7 +11,8 @@
 // CLOSED IN SLICE 1b (was N3): inbound HTTP IS instrumented now.
 // registerHttpTracing adds the onRequest hook that opens a server span from the
 // incoming `traceparent` and keeps it active for the rest of the lifecycle, so
-// every log line from a running request carries `trace=<id> span=<id>`.
+// every log line from a running request carries trace_id and span_id, and its
+// response names the same span in a `traceresponse` header (LG-C1).
 // /healthz is excluded: a liveness probe every second is noise, not a trace.
 // ALSO CLOSED IN SLICE 1b: the traceparent Connect INTERCEPTORS (§A.5 rule 3).
 // src/connect/interceptors.ts carries both halves — the server one continues the
@@ -28,7 +29,7 @@ import { validateRoutePrefix } from './auth/config.js';
 import { registerAuth, type AuthPluginOptions } from './auth/plugin.js';
 import { probeDatabase, type QueryableDb } from './db/pool.js';
 import { registerHttpTracing } from './platform/http-trace.js';
-import { createStructuredLogger, type LogLevel, type LogSink } from './platform/logger.js';
+import { createStructuredLogger, type LogSink } from './platform/logger.js';
 import type { TelemetryState } from './platform/telemetry.js';
 import { registerConnect, type ConnectOptions } from './connect/register.js';
 
@@ -37,7 +38,8 @@ export const SERVICE_NAME = 'fc-coordinator';
 export interface BuildAppOptions {
   db: QueryableDb;
   telemetry?: TelemetryState;
-  logLevel?: LogLevel;
+  /** A log level as an operator may have typed it; one that names no level means info (platform/logger.ts). */
+  logLevel?: string;
   logSink?: LogSink;
   /** Omit to build a health-only app: the edge is not registered at all. */
   auth?: AuthPluginOptions;
@@ -102,7 +104,10 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
 
   const app = Fastify({
     loggerInstance: createStructuredLogger({
-      name: SERVICE_NAME,
+      service: SERVICE_NAME,
+      // The image's revision on every line. From the telemetry state, which read
+      // SERVICE_VERSION once: this factory still reads no environment.
+      ...(options.telemetry !== undefined ? { version: options.telemetry.version } : {}),
       ...(options.logLevel !== undefined ? { level: options.logLevel } : {}),
       ...(options.logSink !== undefined ? { sink: options.logSink } : {}),
     }),

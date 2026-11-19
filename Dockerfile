@@ -62,13 +62,11 @@ FROM node:24.22.1-slim AS production
 ARG CACHE_BUST=2026-10-29-node24.22.1-npm11.19.1
 ARG GITHUB_ORG=FigureCollecting
 ARG GITHUB_REPO=fc-coordinator
-ARG SERVICE_VERSION=0.0.0
 
 LABEL org.opencontainers.image.title="Figure Collector Coordinator"
 LABEL org.opencontainers.image.description="fc-mobile coordinator: OIDC + DPoP edge, entitlements, collections and sync on Postgres"
 LABEL org.opencontainers.image.vendor="Figure Collector Services"
 LABEL org.opencontainers.image.source="https://github.com/${GITHUB_ORG}/${GITHUB_REPO}"
-LABEL org.opencontainers.image.version="${SERVICE_VERSION}"
 
 # Security patches, dumb-init, and the non-root runtime user (uid/gid 1001).
 # npm is pinned here too, then removed further below.
@@ -100,6 +98,16 @@ RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 ENV NODE_ENV=production
 ENV COORDINATOR_PORT=5052
+
+# COMMIT AS VERSION (LG-C1). SERVICE_VERSION is the commit the image was built
+# from (CI passes github.sha), not the package.json semver, which never moved
+# between builds. The service reports it as `version` on every log line and as
+# service.version on every span, so a line names the exact build that wrote it.
+# 'unknown' is what an image built by hand without the build-arg says of itself.
+# Declared HERE, after the install layers: the value changes with every commit,
+# and an ARG declared above them would rebuild them all each time.
+ARG SERVICE_VERSION=unknown
+LABEL org.opencontainers.image.revision="${SERVICE_VERSION}"
 ENV SERVICE_VERSION=${SERVICE_VERSION}
 
 USER fccoord

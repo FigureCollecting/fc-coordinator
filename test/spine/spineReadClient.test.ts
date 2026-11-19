@@ -48,7 +48,9 @@ const ENV_KEYS = ['SPINE_READ_URL', 'SPINE_READ_TIMEOUT_MS'] as const;
 // is all zeroes, the W3C propagator declines to inject them, and every
 // traceparent assertion below would pass or fail for the wrong reason.
 beforeAll(() => {
-  telemetry = startTelemetry({ env: {}, serviceName: 'fc-coordinator-test' });
+  // The fake spine listens on loopback, which the propagation allowlist does not
+  // name by default (in-cluster names only): without it no traceparent is sent.
+  telemetry = startTelemetry({ env: {}, serviceName: 'fc-coordinator-test', propagateHosts: ['127.0.0.1'] });
 });
 
 afterAll(async () => {

@@ -39,14 +39,15 @@ npm start        # node dist/server.js
 | `COORDINATOR_PORT` | `5052` | listen port |
 | `COORDINATOR_HOST` | `0.0.0.0` | listen address |
 | `COORDINATOR_ROUTE_PREFIX` | `/api` | every route except `/healthz` is served under this. Set it to the empty string to serve at the root. **The edge must not rewrite it** — see below |
-| `LOG_LEVEL` | `info` | trace / debug / info / warn / error / fatal / silent |
-| `SERVICE_VERSION` | `unknown` | stamped into the image and reported by `/healthz` |
+| `LOG_LEVEL` | `info` | trace / debug / info / warn / error / fatal / silent, in any case. Any other value logs at `info` and says so once at boot (a `log.level_fallback` warn line) |
+| `SERVICE_VERSION` | `unknown` | the commit the image was built from, stamped by the image build (CI passes `github.sha`); reported as `version` on every log line and `service.version` on every span |
 | `DATABASE_URL` | unset | full DSN; when unset the discrete `PG*` variables are used |
 | `PGHOST` `PGPORT` `PGUSER` `PGPASSWORD` `PGDATABASE` | libpq defaults | discrete connection settings |
 | `PG_POOL_MAX` | `10` | pool size |
 | `PGSSLMODE` | unset | `disable` \| `require` \| `verify-full`; production uses `verify-full` |
 | `PGSSLROOTCERT` | unset | path to the CA PEM for `verify-full` (contents are read, not the path) |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | collector endpoint; falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | the collector's **OTLP gRPC** endpoint (`http://<host>:4317`); falls back to `OTEL_EXPORTER_OTLP_ENDPOINT`. Unset means nothing is exported; spans still record, so log lines keep their `trace_id`. An HTTP collector (`:4318`) is not supported |
+| `OTEL_PROPAGATION_ALLOWLIST` | `*.svc.cluster.local,*.svc,localhost` | hosts an outbound `traceparent` may be sent to; any other host gets none |
 | `SPINE_READ_URL` | unset | ingest-server's **gRPC h2c** read listener, `READ_H2C_PORT` (e.g. `http://ingest-server.<ns>.svc.cluster.local:50062`); **unset means Compare and GetProducts answer `UNAVAILABLE`** and no transport is built. The HTTP/1.1 port `:50052` no longer works with this client |
 | `SPINE_READ_TIMEOUT_MS` | `10000` | per-call deadline on the mesh hop |
 | `IMPORT_OCC_ID_KEY` | unset | the MFC import's occ-id key, 64 hex digits (32 bytes), held by the coordinator alone (import.proto OCCURRENCE IDS). **Unset means ImportMfcExport answers `UNAVAILABLE`**; any other value stops the process at boot without echoing it |
@@ -380,11 +381,33 @@ client pays exactly one extra round trip.
 The port follows the estate scheme: the middle digit encodes the stage, so
 test, dev and local-container are `5072`, `5092` and `5082`.
 
-`OTEL_TRACES_EXPORTER=none` is **removed from the environment at startup**, by
-design. It makes the SDK register a no-op provider whose trace id is all zeroes,
-and fc-shared treats an all-zero id as "no span" — so every log line would
-silently lose its trace tag. With no collector configured the service uses a
-real span processor and a no-op *exporter* instead, which keeps trace ids real.
+`OTEL_TRACES_EXPORTER` is **not read**. Tracing is fc-shared's `startTracing`
+(`src/platform/telemetry.ts`), which builds a tracer provider directly and never
+NodeSDK: under NodeSDK, `OTEL_TRACES_EXPORTER=none` registers a no-op provider
+whose trace id is all zeroes, and every log line silently loses its `trace_id`.
+With no collector endpoint only the span *processor* is a no-op, so trace ids
+stay real and nothing leaves the pod.
+
+### Log lines
+
+One JSON object per line, in the estate's log shape (fc-shared `server/log`,
+`src/platform/logger.ts`): `time level service version event msg`, then
+`trace_id` and `span_id` when a span is active, then the line's own fields.
+Field keys print in snake_case and every value is a scalar: an object or array
+a caller logs is one JSON string on the line (`jq '.ages | fromjson'`).
+Redaction is fc-shared's policy plus this service's DPoP key pattern;
+`src/platform/redaction-keys.test.ts` lists the keys and proves each is masked.
+
+An `error` or `fatal` line that carries an Error (a 500 is one) has `err`
+(`type`, `message`) and `error_stack`: the stack's frames on one line, redacted
+as any field is and cut at 1000 characters. The frames only: the stack's header
+repeats the message, which is `err.message`.
+
+Every response to a traced request carries a W3C `traceresponse` header,
+`00-<trace_id>-<span_id>-<flags>`, naming the same trace its log lines carry
+(the span id is the HTTP request span's; a Connect handler's lines carry the
+Connect span's id), so a client can quote the trace id of a request that went
+wrong. `/healthz` opens no span and carries none.
 
 ### Trace propagation (§A.5 rule 3) — complete
 
@@ -393,8 +416,8 @@ half was the other's "still open".
 
 **Inbound HTTP** (`src/platform/http-trace.ts`). An `onRequest` hook opens a
 `SERVER` span from the incoming `traceparent` and keeps it active for the whole
-request, so every log line a handler emits carries `trace=<id> span=<id>` joined
-to the caller's trace. Spans are named by route TEMPLATE, never by concrete
+request, so every log line a handler emits carries `trace_id` and `span_id`,
+joined to the caller's trace. Spans are named by route TEMPLATE, never by concrete
 path, and `/healthz` opens no span at all — a liveness probe every second is
 noise, not a trace.
 
@@ -402,7 +425,9 @@ noise, not a trace.
 the caller's trace into the RPC handler; the client interceptor opens a `CLIENT`
 span and injects `traceparent` on the outbound SpineRead hop. Both are on by
 default — `SpineReadClient` attaches the client one unless a caller replaces the
-list, so the mesh hop cannot be left untraced by forgetting to wire it.
+list, so the mesh hop cannot be left untraced by forgetting to wire it. The
+header is injected only for a host on the propagation allowlist (in-cluster
+names by default), so a trace id never goes to a host outside the cluster.
 
 The result is one `traceparent` threading fc-mobile, this service and the spine,
 with the coordinator visible in the middle as its own span rather than as a
@@ -529,8 +554,10 @@ read restrictions).
 redaction and logging surface and deliberately omits the legacy axios client,
 fc-mobile's zustand stores and the Mongo-shaped `Figure`/`User` types.
 
-It imports the **1.7.0 stateless subpaths** (`utils/trace`, `utils/sanitize`,
-`utils/logger`), never the barrel. The barrel is a single bundle that also holds
+It imports the **stateless subpaths** (`utils/trace`, `utils/sanitize`,
+`utils/logger`) and the node-only **server subpaths** (`server/log`,
+`server/tracing`, fc-shared 1.10.0, pinned exactly), never the barrel. The
+barrel is a single bundle that also holds
 the axios client for legacy fc-backend and fc-mobile's zustand stores, so taking
 `getTraceContext` from it would load axios, zustand and react into a
 Postgres-only service. `test/import-graph.test.ts` measures the real module

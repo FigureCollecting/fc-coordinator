@@ -1,7 +1,7 @@
 // ============================================================================
 // Inbound HTTP tracing — the gap slice 1a recorded as N3.
 //
-// The logger has always stamped `trace=<id> span=<id>` whenever a span is
+// The logger has always stamped the trace and span ids whenever a span is
 // active, and telemetry has always registered a real SDK with an AsyncLocalStorage
 // context manager. What was missing is the thing that OPENS a span: nothing
 // instrumented inbound HTTP, so a running service emitted no tagged line and
@@ -24,6 +24,19 @@
 // header is copied onto the span. The exception message is handed to
 // recordException (which the redacting exporter also passes over) rather than
 // being set as a bare attribute.
+//
+// TRACERESPONSE (LG-C1): every response to a traced request names the request
+// span in a W3C `traceresponse` header (Trace Context level 2), so a client can
+// read the id its request's log lines carry. It is set on the NODE response in
+// onRequest, not through reply.header(): a header kept on Fastify's reply is
+// sent only by reply.send(), and not every answer goes through it. A hijacked
+// reply does not, and connect-fastify writes the node response itself (2.2.0
+// copies the reply's headers across first; this does not depend on that). Set
+// that early, it is on whatever answers later: the handler, a Connect or
+// gRPC-web answer, the auth hook's 401, the error handler's 500, the 404.
+// NOT covered: an ignored path (/healthz opens no span, so there is no id to
+// name) and a request node or the router refuses before any hook runs (a
+// malformed request line, a URL that does not decode).
 // ============================================================================
 import {
   SpanKind,
@@ -31,6 +44,7 @@ import {
   context,
   trace,
   type Span,
+  type SpanContext,
   type Tracer,
 } from '@opentelemetry/api';
 import {
@@ -50,6 +64,14 @@ export interface HttpTracingOptions {
 
 const TRACER_NAME = 'fc-coordinator/http';
 
+/** The response header that names the request's span (W3C Trace Context level 2). */
+export const TRACE_RESPONSE_HEADER = 'traceresponse';
+
+/** `version-traceid-spanid-flags`, the traceparent layout, for the span that served the request. */
+export function traceResponseOf(span: SpanContext): string {
+  return `00-${span.traceId}-${span.spanId}-${(span.traceFlags & 0xff).toString(16).padStart(2, '0')}`;
+}
+
 export function registerHttpTracing(app: FastifyInstance, options: HttpTracingOptions = {}): void {
   const ignore = new Set(options.ignorePaths ?? []);
   // Resolved per request, not captured here: startTelemetry may register its
@@ -60,7 +82,7 @@ export function registerHttpTracing(app: FastifyInstance, options: HttpTracingOp
 
   const pathOf = (request: FastifyRequest): string => request.url.split('?')[0]!.split('#')[0]!;
 
-  app.addHook('onRequest', (request, _reply, done) => {
+  app.addHook('onRequest', (request, reply, done) => {
     const path = pathOf(request);
     if (ignore.has(path)) {
       done();
@@ -85,6 +107,8 @@ export function registerHttpTracing(app: FastifyInstance, options: HttpTracingOp
       parent,
     );
     spans.set(request, span);
+    // On the node response, so an answer that bypasses reply.send() carries it too: see the header.
+    reply.raw.setHeader(TRACE_RESPONSE_HEADER, traceResponseOf(span.spanContext()));
 
     // `done` is called INSIDE the context: see the header. Do not make this
     // hook async.

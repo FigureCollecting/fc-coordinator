@@ -159,7 +159,22 @@ describe('the audit line, through the real app', () => {
     await client.compare({ seed: { case: 'gtin14', value: GTIN }, nowIso: NOW_ISO });
 
     const audit = auditLines()[0] as Record<string, unknown>;
-    expect(typeof audit['trace']).toBe('string');
+    expect(audit['trace_id']).toMatch(/^[0-9a-f]{32}$/);
+    expect(audit['span_id']).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it('keeps the exact text fc-infra greps the pod log for', async () => {
+    // fc-infra's acceptance-u6.sh (B1-audit) finds this line with plain greps on the pod log:
+    // `entitlement.check`, then `"decision":"allow"` and `"source":"openfga"`. The logger changed
+    // under the line (LG-C1); the text those greps match must not.
+    const client = await start(true);
+    await client.compare({ seed: { case: 'gtin14', value: GTIN }, nowIso: NOW_ISO });
+
+    const written = lines.find((line) => line.includes('entitlement.check'));
+    expect(written).toContain('"event":"entitlement.check"');
+    expect(written).toContain('"decision":"allow"');
+    expect(written).toContain('"source":"openfga"');
+    expect(written).toContain('"msg":"entitlement decision"');
   });
 
   it('does NOT fall back to the console once the host has wired a sink', async () => {

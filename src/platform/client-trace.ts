@@ -21,10 +21,24 @@
 // here. The edge is the one place that knows the caller is a client.
 //
 // The traceparent itself is still parsed by the W3C propagator, which ignores
-// a malformed one (the request then starts a fresh root). Its sampled flag is
-// not trusted either; see the sampler in telemetry.ts.
+// a malformed one (the request then starts a fresh root).
+//
+// ITS SAMPLED FLAG IS NOT TRUSTED EITHER, and this is where that is decided
+// (LG-C1; a sampler in telemetry.ts decided it before). The provider is
+// fc-shared's, whose sampler follows the parent: a phone that sent `-00` would
+// turn this service's spans off and pass the 00 on to the spine. So the
+// extracted parent is marked sampled before any span is started under it. Only
+// a REMOTE parent, the one this extract just read: a span already active in
+// `ctx` is the server's own and keeps its flag.
 // ============================================================================
-import { defaultTextMapGetter, propagation, type Context, type TextMapGetter } from '@opentelemetry/api';
+import {
+  TraceFlags,
+  defaultTextMapGetter,
+  propagation,
+  trace,
+  type Context,
+  type TextMapGetter,
+} from '@opentelemetry/api';
 
 /** The one inbound header a client-facing edge lets the propagator read. */
 export const CLIENT_TRACE_HEADER = 'traceparent';
@@ -41,13 +55,16 @@ export function clientTraceGetter<Carrier>(inner: TextMapGetter<Carrier>): TextM
 
 /**
  * `propagation.extract` for a request from a client: the remote span context
- * from its traceparent and nothing else. Baggage already in `ctx` is the
- * server's own and is kept.
+ * from its traceparent and nothing else, marked sampled whatever its flag said.
+ * Baggage already in `ctx` is the server's own and is kept.
  */
 export function extractClientTrace<Carrier>(
   ctx: Context,
   carrier: Carrier,
   getter: TextMapGetter<Carrier> = defaultTextMapGetter,
 ): Context {
-  return propagation.extract(ctx, carrier, clientTraceGetter(getter));
+  const extracted = propagation.extract(ctx, carrier, clientTraceGetter(getter));
+  const parent = trace.getSpanContext(extracted);
+  if (parent?.isRemote !== true || (parent.traceFlags & TraceFlags.SAMPLED) !== 0) return extracted;
+  return trace.setSpanContext(extracted, { ...parent, traceFlags: parent.traceFlags | TraceFlags.SAMPLED });
 }

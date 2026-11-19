@@ -12,7 +12,7 @@
 //
 //   SERVER  extracts `traceparent` from the incoming request headers into
 //           context, then opens a SERVER span under it. Every line the HANDLER
-//           logs now carries `trace=<id> span=<id>`, and the id is the CALLER's
+//           logs now carries trace_id and span_id, and the id is the CALLER's
 //           trace, so fc-mobile, the coordinator and the spine all join on one
 //           value.
 //
@@ -54,7 +54,7 @@ import {
 } from '@opentelemetry/api';
 import { ConnectError, type Interceptor } from '@connectrpc/connect';
 import { extractClientTrace } from '../platform/client-trace.js';
-import { redactAttributes, type AttributeValue } from '../platform/shared.js';
+import { redactAttributes, withPropagationTarget, type AttributeValue } from '../platform/shared.js';
 
 /** The instrumentation scope these spans are attributed to. */
 export const TRACER_NAME = 'fc-coordinator/connect';
@@ -179,7 +179,13 @@ export function traceparentClientInterceptor(options: { tracer?: Tracer } = {}):
     return context.with(trace.setSpan(context.active(), span), async () => {
       // Injected from the ACTIVE context, which is now this span — so the
       // header names this hop, not its parent.
-      propagation.inject(context.active(), req.header, headersSetter);
+      //
+      // The TARGET is named because the registered propagator (fc-shared's,
+      // platform/telemetry.ts) injects only for a host on the propagation
+      // allowlist, and injects nothing when it cannot tell where a request is
+      // going. The spine is an in-cluster name (*.svc.cluster.local), which
+      // the default list admits; a host that is not on it gets no traceparent.
+      propagation.inject(withPropagationTarget(context.active(), req.url), req.header, headersSetter);
       try {
         const res = await next(req);
         span.setStatus({ code: SpanStatusCode.OK });

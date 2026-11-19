@@ -3,6 +3,8 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from './app.js';
 
 const PASSWORD = 'hunter2';
+/** A commit, as CI stamps it into the image (SERVICE_VERSION). */
+const REVISION = 'f12b8db612256cd714496c6d8b583c1b8eed11b6';
 
 const reachableDb = { query: async () => ({ rows: [{ ok: 1 }] }) };
 const unreachableDb = {
@@ -23,12 +25,13 @@ describe('GET /healthz', () => {
   it('returns 200 and reports db and otel as a STATE, not as detail', async () => {
     app = buildApp({
       db: reachableDb,
-      telemetry: { registered: true, exporter: 'otlp', serviceName: 'fc-coordinator' },
+      telemetry: { registered: true, exporter: 'otlp', serviceName: 'fc-coordinator', version: REVISION },
       logLevel: 'silent',
     });
 
     const res = await app.inject({ method: 'GET', url: '/healthz' });
     expect(res.statusCode).toBe(200);
+    // Still three keys: the one unauthenticated route does not name the build.
     expect(res.json()).toEqual({ status: 'ok', db: 'ok', otel: 'registered' });
   });
 
@@ -71,7 +74,7 @@ describe('GET /healthz', () => {
   it('reports otel as registered even when the exporter is a no-op', async () => {
     app = buildApp({
       db: reachableDb,
-      telemetry: { registered: true, exporter: 'noop', serviceName: 'fc-coordinator' },
+      telemetry: { registered: true, exporter: 'noop', serviceName: 'fc-coordinator', version: REVISION },
       logLevel: 'silent',
     });
     const body = (await app.inject({ method: 'GET', url: '/healthz' })).json() as Record<string, unknown>;
@@ -108,6 +111,51 @@ describe('app boundaries', () => {
     expect(lines.length).toBeGreaterThan(0);
     for (const line of lines) {
       expect(() => JSON.parse(line) as unknown).not.toThrow();
+    }
+  });
+
+  it('reports the image revision as `version` on every line, with the service name (commit as version)', async () => {
+    const lines: string[] = [];
+    app = buildApp({
+      db: reachableDb,
+      telemetry: { registered: true, exporter: 'noop', serviceName: 'fc-coordinator', version: REVISION },
+      logLevel: 'info',
+      logSink: (l) => lines.push(l),
+    });
+    app.log.info('coordinator starting');
+    await app.inject({ method: 'GET', url: '/healthz' });
+
+    expect(lines.length).toBeGreaterThan(1);
+    for (const line of lines) {
+      expect(JSON.parse(line)).toMatchObject({ service: 'fc-coordinator', version: REVISION });
+    }
+  });
+
+  it('says version unknown when no telemetry state names a revision, never a made-up one', async () => {
+    const lines: string[] = [];
+    app = buildApp({ db: reachableDb, logLevel: 'info', logSink: (l) => lines.push(l) });
+    app.log.info('coordinator starting');
+
+    expect(JSON.parse(lines[0]!)).toMatchObject({ service: 'fc-coordinator', version: 'unknown' });
+  });
+
+  it('reads no log setting from the environment: the caller decides the level', async () => {
+    const saved = { level: process.env['LOG_LEVEL'], format: process.env['FC_LOG_FORMAT'], version: process.env['SERVICE_VERSION'] };
+    process.env['LOG_LEVEL'] = 'silent';
+    process.env['FC_LOG_FORMAT'] = 'text';
+    process.env['SERVICE_VERSION'] = 'from-the-environment';
+    try {
+      const lines: string[] = [];
+      app = buildApp({ db: reachableDb, logSink: (l) => lines.push(l) });
+      app.log.info('coordinator starting');
+
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0]!)).toMatchObject({ level: 'info', version: 'unknown' });
+    } finally {
+      for (const [name, value] of [['LOG_LEVEL', saved.level], ['FC_LOG_FORMAT', saved.format], ['SERVICE_VERSION', saved.version]] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
     }
   });
 });
