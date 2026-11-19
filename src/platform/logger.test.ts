@@ -378,6 +378,29 @@ describe('platform/logger: an error line carries the stack', () => {
     expect(first(lines)['error_stack']).toContain(HERE);
   });
 
+  // chal2 S1 / mutant X1: a frame filter of /\bat /, instead of /^\s+at /, lets V8's header line
+  // (the message) into error_stack when the message itself has the word "at" in it.
+  it('keeps the message out of error_stack even when the message contains "at" and a secret', () => {
+    const marker = 'MARKER-SECRET-1';
+    const messages = [
+      `{"password":"${marker}","detail":"parse failed at offset 3"}`,
+      `Authorization: Basic ${marker} rejected at gateway`,
+      `Cookie: sid=${marker}; rejected at edge`,
+      `x-api-key: ${marker} (seen at edge)`,
+    ];
+    for (const message of messages) {
+      const { lines, sink } = capture();
+      createStructuredLogger({ sink }).error(new Error(message));
+
+      const stack = first(lines)['error_stack'];
+      expect(stack, message).toEqual(expect.any(String));
+      expect(stack as string, message).not.toContain(marker);
+      expect(stack as string, message).not.toContain('rejected');
+      expect(stack as string, message).not.toContain('parse failed');
+      expect(stack as string, message).toMatch(/^\s+at /);
+    }
+  });
+
   it('writes it for the shape Fastify logs a 500 in: ({ err, ... }, msg)', () => {
     const { lines, sink } = capture();
     createStructuredLogger({ sink }).error({ err: new TypeError('x is not a function'), reqId: 'r-1' }, 'handler failed');
