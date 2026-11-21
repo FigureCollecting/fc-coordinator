@@ -26,7 +26,7 @@ import { createImportRoutes, type ImportRoutesDeps } from '../import/service.js'
 import { createSpineReadClientFromEnv } from '../spine/spineReadClient.js';
 import { createSyncRoutes, MAX_REQUEST_BYTES, type SyncRoutesDeps } from '../sync/service.js';
 import type { SyncPool } from '../sync/store.js';
-import { createCatalogRoutes, resolveMediaBaseUrl, spineHeadResolver, type CatalogRoutesDeps } from './catalog.js';
+import { createCatalogRoutes, resolveImageTiers, resolveMediaBaseUrl, spineHeadResolver, type CatalogRoutesDeps } from './catalog.js';
 import { createDbDisplayRestrictionSource } from '../display/source.js';
 import { createCompareRoutes, type CompareRoutesDeps } from './compare.js';
 import {
@@ -102,6 +102,7 @@ export function productionConnectOptions(pool: SyncPool, env: NodeJS.ProcessEnv 
     catalog: {
       spineRead,
       mediaBaseUrl: resolveMediaBaseUrl(env),
+      imageTiers: resolveImageTiers(env),
       restrictions: createDbDisplayRestrictionSource({ db: pool, resolveHeads: spineHeadResolver(spineRead) }),
     },
     import: { db: pool, spineRead, occIdKey: resolveImportOccKey(env) },
