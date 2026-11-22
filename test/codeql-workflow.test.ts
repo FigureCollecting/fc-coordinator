@@ -72,4 +72,29 @@ describe('CodeQL workflow', () => {
     expect(code).toMatch(/category: "\/language:javascript-typescript"/);
     expect(code).toMatch(/timeout-minutes: \d+\n/);
   });
+
+  it('has nothing that turns the analysis off, narrows it, or lets it fail silently', () => {
+    // Only the job's own gate may carry an `if:`; no step is skipped.
+    expect(code.match(/^\s*if:/gm)).toHaveLength(1);
+    expect(code).not.toMatch(/continue-on-error|upload:|config|queries|paths-ignore|paths:|packs|external-repository-token/);
+    expect(code).toMatch(/^\s+runs-on: ubuntu-latest$/m);
+    const minutes = Number(/timeout-minutes: (\d+)/.exec(code)?.[1]);
+    expect(minutes).toBeGreaterThanOrEqual(10);
+    // Each action takes exactly the inputs it needs and nothing else.
+    const withKeys = (action: string): string[] => {
+      const at = code.indexOf(`uses: ${action}`);
+      const rest = code.slice(at).split('\n').slice(1);
+      const keys: string[] = [];
+      let inWith = false;
+      for (const l of rest) {
+        if (/^\s*- name:/.test(l)) break;
+        if (/^\s+with:$/.test(l)) inWith = true;
+        else if (inWith) keys.push(l.trim().replace(/:.*$/, ''));
+      }
+      return keys;
+    };
+    expect(withKeys('github/codeql-action/init')).toEqual(['languages']);
+    expect(withKeys('github/codeql-action/analyze')).toEqual(['category']);
+    expect(withKeys('actions/checkout')).toEqual([]);
+  });
 });
