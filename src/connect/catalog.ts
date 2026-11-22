@@ -70,6 +70,19 @@
 // leaves its images' clean copies in the list without their masks, which is
 // how a phone's next owned sync drops the masks it kept. top_margin_frac and
 // the opaque box stay on the spine until CONTRACT-1 gives them fields.
+//
+// TIERS (contract 0.8.0 ImageTier; the spine's `tiers` on an image row and on
+// its mask) HAVE NO STATUS OF THEIR OWN, and get no branch of their own here:
+// an image's tiers are fields of the ProductImage and its mask's tiers fields
+// of the ImageMask, so the decision that withholds either withholds its tiers.
+// A tier is kept on the derivative's terms (a lowercase sha-256 served at
+// exactly <base>/<sha>), as WebP, from 1 to 4,096 px on its long edge and not
+// past the image's own long edge when the image's width and height are both
+// known. One that fails is dropped ALONE: the image, its mask and its other
+// tiers are sent. Each list goes out in ascending order of long edge, one tier
+// per long edge (the first the spine listed), at most MAX_IMAGE_TIERS (the
+// smallest). The address travels as the 32 raw bytes and no URL is sent.
+// Tiers are sent only with MEDIA_IMAGE_TIERS=on; unset, blank or off sends none.
 // ============================================================================
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
 import { decideDisplay, PrimaryPromoter, type DisplayDecision, type ViewerContext } from '../display/restrictions.js';
@@ -83,6 +96,7 @@ import {
   GetProductImagesResponseSchema,
   GetProductsResponseSchema,
   ImageMaskSchema,
+  ImageTierSchema,
   ProductCardSchema,
   ProductImageSchema,
   ProductKind,
@@ -96,6 +110,7 @@ import {
   type GetProductsRequest,
   type GetProductsResponse,
   type ImageMask,
+  type ImageTier,
   type ProductCard,
   type ProductImage,
   type ProductImages,
@@ -203,6 +218,13 @@ const GTIN14 = /^\d{14}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const UINT32_MAX = 4_294_967_295;
 
+/** The most tiers one image, or one mask, is sent with. A parent has at most four today (ImageTier THE LADDER). */
+export const MAX_IMAGE_TIERS = 8;
+/** The contract's cap on a tier's long edge (ImageTier.long_edge_px). */
+export const MAX_TIER_LONG_EDGE_PX = 4096;
+/** The one media type a tier is encoded as (ImageTier WHERE A TIER IS FETCHED). */
+const TIER_CONTENT_TYPE = 'image/webp';
+
 /** The narrow slice of SpineReadClient this service needs; see compare.ts for why it is declared here. */
 export interface SpineCatalog {
   getProducts(
@@ -230,6 +252,8 @@ export interface CatalogRoutesDeps {
   spineRead: SpineCatalog | null;
   /** From resolveMediaBaseUrl. `null` = images off: GetProductImages answers empty. */
   mediaBaseUrl: string | null;
+  /** From resolveImageTiers. `false` = no image tier and no mask tier is sent. Default: not sent. */
+  imageTiers?: boolean;
   /** Injectable for tests. Production uses the ported U6 module, as Compare does. */
   entitlementHeaderFor?: (subject: string) => Promise<string | null>;
   /** The read path's clock: the spine's now_iso is stamped here, never by the client. */
@@ -302,6 +326,19 @@ export function resolveMediaBaseUrl(env: NodeJS.ProcessEnv = process.env): strin
     throw new Error('MEDIA_PUBLIC_BASE_URL must not contain an encoded slash or backslash (%2F, %5C)');
   }
   return base;
+}
+
+/**
+ * Read MEDIA_IMAGE_TIERS: whether GetProductImages sends tiers. Only `on` -> true. Unset, empty,
+ * whitespace-only or `off` -> false: tiers stay off until the app reads them, because they make
+ * every image list bigger. Any other value refuses to start: a switch that guessed would be off
+ * when it was meant on, or on when it was meant off, and nobody would see which.
+ */
+export function resolveImageTiers(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env['MEDIA_IMAGE_TIERS'] ?? '';
+  if (raw === 'on') return true;
+  if (raw.trim() === '' || raw === 'off') return false;
+  throw new Error('MEDIA_IMAGE_TIERS must be on or off');
 }
 
 // ---------------------------------------------------------------------------
@@ -589,8 +626,11 @@ const NO_SURFACE: SurfaceFacts = Object.freeze({ grounding: null, appearance: Ob
  * original's URL is precisely the thing that must never reach a phone. Rows
  * whose image is null still count as rows: a page is cut by its position in
  * the spine's page.
+ *
+ * The image's tiers are read into the image and its mask's into the mask
+ * (tiersOf), unless `sendTiers` is false: then neither carries any.
  */
-export function readImageRows(json: string, mediaBaseUrl: string): ImageRow[] | null {
+export function readImageRows(json: string, mediaBaseUrl: string, sendTiers = false): ImageRow[] | null {
   const products = parseObject(json)?.['products'];
   if (!Array.isArray(products)) return null;
   const out: ImageRow[] = [];
@@ -601,12 +641,15 @@ export function readImageRows(json: string, mediaBaseUrl: string): ImageRow[] | 
     if (headId === null || !Array.isArray(rows)) return null;
     for (const row of rows) {
       const img = asObject(row);
+      // A mask is sized from its derivative, so the derivative's long edge bounds both ladders.
+      const longEdge = knownLongEdge(pixels(img?.['width']), pixels(img?.['height']));
+      const tiers: TierReader = (raw) => (sendTiers ? tiersOf(raw, mediaBaseUrl, longEdge) : []);
       out.push({
         headId,
-        image: img === null ? null : toProductImage(img, mediaBaseUrl),
+        image: img === null ? null : toProductImage(img, mediaBaseUrl, tiers),
         primary: img?.['primary'] === true,
         sources: img === null ? null : sourcesOf(img['sources']),
-        mask: img === null ? null : maskOf(img['mask'], mediaBaseUrl),
+        mask: img === null ? null : maskOf(img['mask'], mediaBaseUrl, tiers),
         own: img === null ? NO_SURFACE : surfaceOf(img),
       });
     }
@@ -614,7 +657,7 @@ export function readImageRows(json: string, mediaBaseUrl: string): ImageRow[] | 
   return out;
 }
 
-function toProductImage(img: Json, mediaBaseUrl: string): ProductImage | null {
+function toProductImage(img: Json, mediaBaseUrl: string, tiers: TierReader): ProductImage | null {
   const id = img['derivativeSha256'];
   if (typeof id !== 'string' || !SHA256_HEX.test(id)) return null;
   const url = `${mediaBaseUrl}/${id}`;
@@ -627,22 +670,74 @@ function toProductImage(img: Json, mediaBaseUrl: string): ProductImage | null {
     width: pixels(img['width']),
     height: pixels(img['height']),
     url,
+    tiers: tiers(img['tiers']),
   });
+}
+
+/** The spine's `tiers` of one parent (an image row or its mask) -> the tiers a client may fetch. */
+type TierReader = (raw: unknown) => ImageTier[];
+
+/** The parent's long edge when its size is known (width and height both above 0, ImageTier WHAT IS ENFORCED), else 0. */
+const knownLongEdge = (width: number, height: number): number => (width > 0 && height > 0 ? Math.max(width, height) : 0);
+
+/** A whole number as a uint32, from the spine's digit token or a JSON number; 0 when it is neither or out of range. */
+const whole = (raw: unknown): number => {
+  const n = typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : -1;
+  return Number.isInteger(n) && n >= 0 && n <= UINT32_MAX ? n : 0;
+};
+
+/**
+ * The tiers the spine sends with an image row or with its mask -> ProductImage.tiers or
+ * ImageMask.tiers: ascending by long edge, one per long edge (the first the spine listed), at most
+ * MAX_IMAGE_TIERS (the smallest: the full picture is always there for a large need). Anything that
+ * is not a list is no tiers; an entry that is not a tier a client may fetch is dropped alone
+ * (toImageTier), before the cap, so a bad entry never crowds out a good one.
+ */
+function tiersOf(raw: unknown, mediaBaseUrl: string, parentLongEdge: number): ImageTier[] {
+  if (!Array.isArray(raw)) return [];
+  const byEdge = new Map<number, ImageTier>();
+  for (const entry of raw) {
+    const tier = toImageTier(asObject(entry), mediaBaseUrl, parentLongEdge);
+    if (tier !== null && !byEdge.has(tier.longEdgePx)) byEdge.set(tier.longEdgePx, tier);
+  }
+  return [...byEdge.values()].sort((a, b) => a.longEdgePx - b.longEdgePx).slice(0, MAX_IMAGE_TIERS);
+}
+
+/**
+ * One tier, or null. Kept on the derivative's terms: its address a lowercase sha-256 and its url
+ * exactly `${mediaBaseUrl}/${sha}`, so a tier can never name anything the derivative rule would
+ * refuse. Kept only as WebP, with a long edge from 1 to MAX_TIER_LONG_EDGE_PX that is not past the
+ * parent's (0 = the parent's size is unknown, and then nothing is promised and nothing is dropped
+ * for it), and with a pixel size. The byte size is 0 when unknown or over a uint32. The address
+ * goes out as its 32 raw bytes: the client builds the URL from the base it already has.
+ */
+function toImageTier(t: Json | null, mediaBaseUrl: string, parentLongEdge: number): ImageTier | null {
+  const id = t?.['sha256'];
+  if (t === null || typeof id !== 'string' || !SHA256_HEX.test(id)) return null;
+  if (t['url'] !== `${mediaBaseUrl}/${id}` || t['contentType'] !== TIER_CONTENT_TYPE) return null;
+  const longEdgePx = whole(t['longEdgePx']);
+  if (longEdgePx === 0 || longEdgePx > MAX_TIER_LONG_EDGE_PX) return null;
+  if (parentLongEdge > 0 && longEdgePx > parentLongEdge) return null;
+  const width = whole(t['width']);
+  const height = whole(t['height']);
+  if (width === 0 || height === 0) return null;
+  return create(ImageTierSchema, { longEdgePx, sha256: new Uint8Array(Buffer.from(id, 'hex')), width, height, bytes: whole(t['bytes']) });
 }
 
 /**
  * The mask the spine sends with a row (fc-aggregation read/products.ts ImageMaskRef), or null. Kept on
  * the derivative's terms: its id a lowercase sha-256 and its url exactly `${mediaBaseUrl}/${id}`, so a
- * mask can never name anything the derivative rule would refuse.
+ * mask can never name anything the derivative rule would refuse. Its tiers are read into the mask
+ * itself and nowhere else, so they are sent exactly when the mask is (presentImage).
  */
-function maskOf(raw: unknown, mediaBaseUrl: string): MaskFacts | null {
+function maskOf(raw: unknown, mediaBaseUrl: string, tiers: TierReader): MaskFacts | null {
   const m = asObject(raw);
   const id = m?.['maskSha256'];
   if (m === null || typeof id !== 'string' || !SHA256_HEX.test(id)) return null;
   const url = `${mediaBaseUrl}/${id}`;
   if (m['url'] !== url) return null;
   return {
-    mask: create(ImageMaskSchema, { maskId: id, contentType: typeof m['contentType'] === 'string' ? m['contentType'] : '', url }),
+    mask: create(ImageMaskSchema, { maskId: id, contentType: typeof m['contentType'] === 'string' ? m['contentType'] : '', url, tiers: tiers(m['tiers']) }),
     ...surfaceOf(m),
   };
 }
@@ -1043,7 +1138,7 @@ export function createCatalogRoutes(deps: CatalogRoutesDeps): (router: ConnectRo
       } catch (err) {
         throw relay(err);
       }
-      const rows = readImageRows(upstream.imagesJson, mediaBaseUrl);
+      const rows = readImageRows(upstream.imagesJson, mediaBaseUrl, deps.imageTiers ?? false);
       if (rows === null) throw unreadable('images');
 
       for (let j = cursor.k; j < rows.length; j += 1) {

@@ -193,6 +193,14 @@ describe('the Connect options the process serves', () => {
     expect(String((query.mock.calls[0] as unknown[] | undefined)?.[0])).toMatch(/FROM display_restriction/);
   });
 
+  it('send image tiers only when MEDIA_IMAGE_TIERS is on, and refuse to start on a value other than on, off or blank', () => {
+    expect(productionConnectOptions(neverPool, {}).catalog?.imageTiers).toBe(false);
+    expect(productionConnectOptions(neverPool, { MEDIA_IMAGE_TIERS: ' ' }).catalog?.imageTiers).toBe(false);
+    expect(productionConnectOptions(neverPool, { MEDIA_IMAGE_TIERS: 'on' }).catalog?.imageTiers).toBe(true);
+    expect(productionConnectOptions(neverPool, { MEDIA_IMAGE_TIERS: 'off' }).catalog?.imageTiers).toBe(false);
+    expect(() => productionConnectOptions(neverPool, { MEDIA_IMAGE_TIERS: 'maybe' })).toThrow(/MEDIA_IMAGE_TIERS/);
+  });
+
   it('refuse to start on a media base that is not https', () => {
     expect(() => productionConnectOptions(neverPool, { MEDIA_PUBLIC_BASE_URL: 'http://images.test/d' })).toThrow(
       /MEDIA_PUBLIC_BASE_URL/,

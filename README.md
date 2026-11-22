@@ -52,6 +52,7 @@ npm start        # node dist/server.js
 | `SPINE_READ_TIMEOUT_MS` | `10000` | per-call deadline on the mesh hop |
 | `IMPORT_OCC_ID_KEY` | unset | the MFC import's occ-id key, 64 hex digits (32 bytes), held by the coordinator alone (import.proto OCCURRENCE IDS). **Unset means ImportMfcExport answers `UNAVAILABLE`**; any other value stops the process at boot without echoing it |
 | `MEDIA_PUBLIC_BASE_URL` | unset | public base of the derivative image path. **Unset means `GetProductImages` returns nothing** and asks no one; set, it must be `https` with no credentials and no `?` or `#`, in canonical URL form exactly as a URL parser writes it (e.g. lower-case host, no default port, no surrounding whitespace, no dot segments), with no encoded slash or backslash (`%2F`, `%5C`), or the process refuses to start without echoing the value. Trailing slashes are trimmed, as the spine trims its copy |
+| `MEDIA_IMAGE_TIERS` | off | `on` sends image tiers and mask tiers from `GetProductImages`. Unset, empty, whitespace-only or `off` sends none; images and masks are sent as before. Any other value stops the process at boot. Off until fc-mobile reads tiers: on makes an image list about 60 to 105 % bigger uncompressed and 130 to 235 % bigger gzipped (measured with 3 to 5 rungs per image, the 128 px rung included) |
 | `OPENFGA_GRPC_URL` `OPENFGA_STORE_ID` | unset | the entitlement Check, which is **gRPC over h2c on port 8081** (e.g. `http://openfga-mc-fc-ha.authz.svc.cluster.local:8081`); **unset means every Check denies** |
 | `OPENFGA_API_URL` | must be unset | the retired HTTP endpoint. **Setting it stops the process at boot**, naming the rename — there is no HTTP path left, so a manifest that still carries it would otherwise redact every read while looking configured |
 | `OPENFGA_MODEL_ID` `OPENFGA_APP_OBJECT` `OPENFGA_TIMEOUT_MS` | unset / `app:figurecollecting` / `2000` | optional Check settings. `OPENFGA_TIMEOUT_MS` becomes the gRPC call deadline. A `0` is refused and falls back: a deadline of zero has already expired when the call starts and would deny every read instantly |
@@ -162,6 +163,14 @@ records the content type and HTTP version of every stream.
   shown it: a withheld mask is not sent, and the grounding and appearance are
   then the derivative's own (no grounding for an opaque one). The spine's
   `topMarginFrac` and opaque box are not sent until CONTRACT-1 adds the fields.
+  An image's tiers (contract 0.8.0 `ImageTier`) go out with the image and its
+  mask's tiers inside the mask, so whatever withholds either withholds its
+  tiers. A tier is kept only when it is WebP, served at exactly
+  `<base>/<tier sha-256>`, from 1 to 4,096 px on its long edge and not past the
+  image's own long edge when the image's width and height are both known; a
+  tier that fails is dropped alone. Each list is sorted by long edge, holds one
+  tier per long edge and at most the 8 smallest. Tiers are sent only with
+  `MEDIA_IMAGE_TIERS=on`; by default none are.
 - **SearchProducts** passes one page through to `SpineRead.SearchProducts`
   (WK-17) with the assertion minted as for GetProducts. The query goes as
   typed; an empty one, or one over 256 code points once NFKC-normalized and
