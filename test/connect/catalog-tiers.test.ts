@@ -63,9 +63,10 @@ const image = (over: Record<string, unknown> = {}): Record<string, unknown> => (
   url: `${MEDIA}/${SHA}`,
   ...over,
 });
-const read = (img: unknown, sendTiers?: boolean) => {
+/** Reads one image row with tiers on, unless told otherwise; 'default' leaves the setting out. */
+const read = (img: unknown, sendTiers: boolean | 'default' = true) => {
   const json = JSON.stringify({ products: [{ productId: CANNED_HEAD_ID, images: [img] }], coverage: {} });
-  const rows = sendTiers === undefined ? readImageRows(json, MEDIA) : readImageRows(json, MEDIA, sendTiers);
+  const rows = sendTiers === 'default' ? readImageRows(json, MEDIA) : readImageRows(json, MEDIA, sendTiers);
   return rows![0]!;
 };
 const edges = (tiers: readonly ImageTier[] | undefined): number[] => (tiers ?? []).map((t) => t.longEdgePx);
@@ -137,6 +138,10 @@ const BAD: [string, SpineTier | unknown][] = [
   ['another tier\'s url', tier(512, { url: `${MEDIA}/${tierSha(256)}` })],
   ['the base with a trailing slash doubled', tier(512, { url: `${MEDIA}//${tierSha(512)}` })],
   ['http instead of https', tier(512, { url: `http://images.figurecollecting.test/d/${tierSha(512)}` })],
+  // The url is compared exactly, never normalised: each of these names the same tier to a lax reader.
+  ['a url with a trailing slash', tier(512, { url: `${MEDIA}/${tierSha(512)}/` })],
+  ['a url with an upper-case host', tier(512, { url: `https://IMAGES.figurecollecting.test/d/${tierSha(512)}` })],
+  ['an upper-case id in the url only', tier(512, { url: `${MEDIA}/${tierSha(512).toUpperCase()}` })],
   ['no url (the spine has no media base)', tier(512, { url: undefined })],
   ['a url that is not text', tier(512, { url: 512 })],
   // the wrong media type
@@ -322,24 +327,29 @@ describe('the setting that drops tiers', () => {
     expect(off).toEqual(on);
   });
 
-  it('sends tiers by default', () => {
-    expect(edges(read(image({ tiers: [tier(256)] })).image?.tiers)).toEqual([256]);
+  it('sends no tier by default: tiers are sent only when turned on', () => {
+    const img = image({ tiers: [tier(256)], mask: spineMask({ tiers: [maskTier(256)] }) });
+    const byDefault = read(img, 'default');
+    expect(byDefault.image?.tiers).toEqual([]);
+    expect(byDefault.mask?.mask.tiers).toEqual([]);
+    expect(byDefault).toEqual(read(img, false));
+  });
+
+  it('MEDIA_IMAGE_TIERS=on sends tiers', () => {
+    expect(resolveImageTiers({ MEDIA_IMAGE_TIERS: 'on' })).toBe(true);
   });
 
   it.each([
     ['unset', {}],
     ['empty', { MEDIA_IMAGE_TIERS: '' }],
     ['blank', { MEDIA_IMAGE_TIERS: '  ' }],
-    ['on', { MEDIA_IMAGE_TIERS: 'on' }],
-  ])('MEDIA_IMAGE_TIERS %s sends tiers', (_label, env) => {
-    expect(resolveImageTiers(env)).toBe(true);
+    ['a tab and a newline', { MEDIA_IMAGE_TIERS: '\t\n' }],
+    ['off', { MEDIA_IMAGE_TIERS: 'off' }],
+  ])('MEDIA_IMAGE_TIERS %s sends none', (_label, env) => {
+    expect(resolveImageTiers(env)).toBe(false);
   });
 
-  it('MEDIA_IMAGE_TIERS=off drops them', () => {
-    expect(resolveImageTiers({ MEDIA_IMAGE_TIERS: 'off' })).toBe(false);
-  });
-
-  it.each(['OFF', 'false', '0', 'no', 'true', ' off', 'off ', 'disabled'])(
+  it.each(['OFF', 'ON', 'false', '0', '1', 'no', 'yes', 'true', ' off', 'off ', ' on', 'on ', 'on\n', 'disabled'])(
     'refuses to start on MEDIA_IMAGE_TIERS=%j rather than guess which way a rollback switch points',
     (raw) => {
       expect(() => resolveImageTiers({ MEDIA_IMAGE_TIERS: raw })).toThrow(/^MEDIA_IMAGE_TIERS must be on or off$/);

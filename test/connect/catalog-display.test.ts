@@ -773,6 +773,7 @@ describe('(i) the golden tier cases, through GetProductImages', () => {
   it.each(cases.map((c) => [c.name, c] as const))('%s', async (_name, c) => {
     const id = (x: string): string => (x === c.image.image_id ? sha('a') : x === 'p-head' ? H1 : x);
     harness = await start({
+      imageTiers: true,
       viewerContext: c.context,
       restrictions: sourceOf(c.restrictions.map((x) => r(x.rule, x.level, id(x.subject), x.scope)), { [H1]: c.image.product_ids.filter((p) => p !== 'p-head') }),
       respondImages: () => page([{
@@ -811,7 +812,7 @@ describe('(i) tiers follow their image and their mask in every viewer context', 
   const sentB = { id: 'b', tiers: wantTiers(B.tiers, 'photo', 1), mask: wantTiers(B.maskTiers, 'mask', 1) };
 
   it('sends both ladders of both images when nothing is restricted', async () => {
-    harness = await start({ restrictions: sourceOf([]), respondImages: twoRows });
+    harness = await start({ imageTiers: true, restrictions: sourceOf([]), respondImages: twoRows });
     expect(tiersSent(await harness.catalog.getProductImages({ headIds: [H1] }))).toEqual([sentA, sentB]);
   });
 
@@ -827,7 +828,7 @@ describe('(i) tiers follow their image and their mask in every viewer context', 
   it.each(IMAGE_SCOPES.flatMap(([scope, from]) => CONTEXTS.map((context) => [scope, context, from.includes(context)] as const)))(
     '%s on one image, %s context: the image, its mask and every tier of both withheld = %s; the other image untouched',
     async (scope, context, withheld) => {
-      harness = await start({ viewerContext: context, restrictions: sourceOf([r('r1', 'image', sha('a'), scope)]), respondImages: twoRows });
+      harness = await start({ imageTiers: true, viewerContext: context, restrictions: sourceOf([r('r1', 'image', sha('a'), scope)]), respondImages: twoRows });
       const res = await harness.catalog.getProductImages({ headIds: [H1] });
       expect(tiersSent(res)).toEqual(withheld ? [sentB] : [sentA, sentB]);
       for (const kind of ['photo', 'mask'] as const) {
@@ -837,7 +838,7 @@ describe('(i) tiers follow their image and their mask in every viewer context', 
   );
 
   it.each(CONTEXTS)('no_mask on one image, %s context: its tiers are sent, its mask and every mask tier are not', async (context) => {
-    harness = await start({ viewerContext: context, restrictions: sourceOf([r('m1', 'image', sha('a'), 'no_mask')]), respondImages: twoRows });
+    harness = await start({ imageTiers: true, viewerContext: context, restrictions: sourceOf([r('m1', 'image', sha('a'), 'no_mask')]), respondImages: twoRows });
     const res = await harness.catalog.getProductImages({ headIds: [H1] });
     expect(tiersSent(res)).toEqual([{ ...sentA, mask: null }, sentB]);
     for (const e of A.maskTiers) expect([e, carries(res, tierHex(e, 'mask', 0))]).toEqual([e, false]);
@@ -846,6 +847,7 @@ describe('(i) tiers follow their image and their mask in every viewer context', 
 
   it('withholds a revoked store\'s mask tiers with its masks (a source no_mask), the photo tiers all kept', async () => {
     harness = await start({
+      imageTiers: true,
       restrictions: sourceOf([r('mask-store:hlj', 'source', 'hlj', 'no_mask')]),
       respondImages: () => page([{ productId: H1, images: [tieredRow(0, { primary: true, sources: ['hlj'], ...A }), tieredRow(1, { sources: ['amiami'], ...B })] }]),
     });
@@ -855,7 +857,7 @@ describe('(i) tiers follow their image and their mask in every viewer context', 
   it('sends no mask tier beside the image when the mask itself is not servable', async () => {
     const row0 = tieredRow(0, { primary: true, ...A });
     (row0['mask'] as Record<string, unknown>)['url'] = `https://images.store.example/d/${sha('0')}`;
-    harness = await start({ restrictions: sourceOf([]), respondImages: () => page([{ productId: H1, images: [row0] }]) });
+    harness = await start({ imageTiers: true, restrictions: sourceOf([]), respondImages: () => page([{ productId: H1, images: [row0] }]) });
     const res = await harness.catalog.getProductImages({ headIds: [H1] });
     expect(tiersSent(res)).toEqual([{ ...sentA, mask: null }]);
     for (const e of A.maskTiers) expect(carries(res, tierHex(e, 'mask', 0))).toBe(false);
@@ -865,6 +867,7 @@ describe('(i) tiers follow their image and their mask in every viewer context', 
     'drops a tier past the parent\'s long edge alone in the %s context (image has a mask: %s)',
     async (context, withMask) => {
       harness = await start({
+        imageTiers: true,
         viewerContext: context,
         restrictions: sourceOf([]),
         respondImages: () => page([{ productId: H1, images: [tieredRow(0, { primary: true, longEdge: 512, tiers: [256, 512, 850, 4000], maskTiers: withMask ? [256, 1024] : null })] }]),
@@ -882,7 +885,7 @@ describe('(i) tiers follow their image and their mask in every viewer context', 
     tiers[1]!['url'] = `https://images.store.example/d/${tierHex(256, 'photo')}`;
     tiers[2]!['contentType'] = 'image/jpeg';
     tiers[3]!['longEdgePx'] = '5000';
-    harness = await start({ restrictions: sourceOf([]), respondImages: () => page([{ productId: H1, images: [row0, tieredRow(1, B)] }]) });
+    harness = await start({ imageTiers: true, restrictions: sourceOf([]), respondImages: () => page([{ productId: H1, images: [row0, tieredRow(1, B)] }]) });
     const res = await harness.catalog.getProductImages({ headIds: [H1] });
     expect(tiersSent(res)).toEqual([{ id: 'a', tiers: wantTiers([2048], 'photo'), mask: wantTiers([256], 'mask') }, sentB]);
     expect(shown(res)).toEqual([{ head: H1, images: ['a*:gallery', 'b:gallery'] }]);
@@ -914,7 +917,7 @@ describe('(i) tiers do not change how a page is cut', () => {
   };
   const run = async (withTiers: boolean) => {
     const pages = spinePages(withTiers);
-    const h = await start({ restrictions: sourceOf([r('r1', 'image', sha('c'), 'no_display')]), respondImages: (call) => pages[call.request.pageToken]! });
+    const h = await start({ imageTiers: true, restrictions: sourceOf([r('r1', 'image', sha('c'), 'no_display')]), respondImages: (call) => pages[call.request.pageToken]! });
     harness = h;
     const out = { 0: await walk(h, 0), 1: await walk(h, 1), 2: await walk(h, 2), 3: await walk(h, 3) };
     const spineCalls = h.spine.imageCalls.map((c) => [c.request.pageSize, c.request.pageToken]);
@@ -957,8 +960,17 @@ describe('(i) the setting that drops tiers', () => {
     expect(carries(res, tierHex(256, 'mask'))).toBe(false);
   });
 
-  it.each([['on', true], ['left at its default', undefined]] as const)('%s: the tiers are sent, and nothing else of the image differs', async (_label, imageTiers) => {
-    harness = await start({ ...(imageTiers === undefined ? {} : { imageTiers }), restrictions: sourceOf([]), respondImages: one });
+  it('left at its default: no tier is sent, exactly as off', async () => {
+    harness = await start({ restrictions: sourceOf([]), respondImages: one });
+    const res = await harness.catalog.getProductImages({ headIds: [H1] });
+    expect(tiersSent(res)).toEqual([{ id: 'a', tiers: [], mask: [] }]);
+    expect(imagesOf(res)).toEqual([whole]);
+    for (const e of [256, 850]) expect(carries(res, tierHex(e, 'photo'))).toBe(false);
+    expect(carries(res, tierHex(256, 'mask'))).toBe(false);
+  });
+
+  it('on: the tiers are sent, and nothing else of the image differs', async () => {
+    harness = await start({ imageTiers: true, restrictions: sourceOf([]), respondImages: one });
     const res = await harness.catalog.getProductImages({ headIds: [H1] });
     expect(tiersSent(res)).toEqual([{ id: 'a', tiers: wantTiers([256, 850], 'photo'), mask: wantTiers([256], 'mask') }]);
     expect(imagesOf(res)).toEqual([whole]);

@@ -82,7 +82,7 @@
 // tiers are sent. Each list goes out in ascending order of long edge, one tier
 // per long edge (the first the spine listed), at most MAX_IMAGE_TIERS (the
 // smallest). The address travels as the 32 raw bytes and no URL is sent.
-// MEDIA_IMAGE_TIERS=off sends no tier at all: the rollback switch.
+// Tiers are sent only with MEDIA_IMAGE_TIERS=on; unset, blank or off sends none.
 // ============================================================================
 import { Code, ConnectError, type ConnectRouter, type HandlerContext } from '@connectrpc/connect';
 import { decideDisplay, PrimaryPromoter, type DisplayDecision, type ViewerContext } from '../display/restrictions.js';
@@ -252,7 +252,7 @@ export interface CatalogRoutesDeps {
   spineRead: SpineCatalog | null;
   /** From resolveMediaBaseUrl. `null` = images off: GetProductImages answers empty. */
   mediaBaseUrl: string | null;
-  /** From resolveImageTiers. `false` = no image tier and no mask tier is sent. Default: sent. */
+  /** From resolveImageTiers. `false` = no image tier and no mask tier is sent. Default: not sent. */
   imageTiers?: boolean;
   /** Injectable for tests. Production uses the ported U6 module, as Compare does. */
   entitlementHeaderFor?: (subject: string) => Promise<string | null>;
@@ -329,15 +329,15 @@ export function resolveMediaBaseUrl(env: NodeJS.ProcessEnv = process.env): strin
 }
 
 /**
- * Read MEDIA_IMAGE_TIERS: whether GetProductImages sends tiers. Unset, blank or `on` -> true;
- * `off` -> false, the switch that takes tiers back out of every list without a deploy of anything
- * else. Any other value refuses to start: a rollback switch that guessed would be off when it was
- * meant on, or on when it was meant off, and nobody would see which.
+ * Read MEDIA_IMAGE_TIERS: whether GetProductImages sends tiers. Only `on` -> true. Unset, empty,
+ * whitespace-only or `off` -> false: tiers stay off until the app reads them, because they make
+ * every image list bigger. Any other value refuses to start: a switch that guessed would be off
+ * when it was meant on, or on when it was meant off, and nobody would see which.
  */
 export function resolveImageTiers(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env['MEDIA_IMAGE_TIERS'] ?? '';
-  if (raw.trim() === '' || raw === 'on') return true;
-  if (raw === 'off') return false;
+  if (raw === 'on') return true;
+  if (raw.trim() === '' || raw === 'off') return false;
   throw new Error('MEDIA_IMAGE_TIERS must be on or off');
 }
 
@@ -630,7 +630,7 @@ const NO_SURFACE: SurfaceFacts = Object.freeze({ grounding: null, appearance: Ob
  * The image's tiers are read into the image and its mask's into the mask
  * (tiersOf), unless `sendTiers` is false: then neither carries any.
  */
-export function readImageRows(json: string, mediaBaseUrl: string, sendTiers = true): ImageRow[] | null {
+export function readImageRows(json: string, mediaBaseUrl: string, sendTiers = false): ImageRow[] | null {
   const products = parseObject(json)?.['products'];
   if (!Array.isArray(products)) return null;
   const out: ImageRow[] = [];
@@ -1138,7 +1138,7 @@ export function createCatalogRoutes(deps: CatalogRoutesDeps): (router: ConnectRo
       } catch (err) {
         throw relay(err);
       }
-      const rows = readImageRows(upstream.imagesJson, mediaBaseUrl, deps.imageTiers ?? true);
+      const rows = readImageRows(upstream.imagesJson, mediaBaseUrl, deps.imageTiers ?? false);
       if (rows === null) throw unreadable('images');
 
       for (let j = cursor.k; j < rows.length; j += 1) {
